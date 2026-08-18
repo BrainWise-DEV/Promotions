@@ -57,4 +57,5 @@ scheduler_events = {
 	],
 }
 
+before_install = "posnext_promotions.install.before_install"
 after_migrate = "posnext_promotions.install.after_migrate"

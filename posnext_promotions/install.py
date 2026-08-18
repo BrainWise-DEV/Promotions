@@ -7,6 +7,19 @@ from __future__ import annotations
 
 import frappe
 
+# Module Def names this app owns. They may already exist on a site that ran
+# staging pos_next (auth gate lived there before the split).
+OWNED_MODULE_DEFS = ("POSNext Promotions", "POS Next Auth Gate")
+
+
+def before_install():
+	"""Reclaim Module Defs left behind by pos_next so install can insert them."""
+	for module in OWNED_MODULE_DEFS:
+		if not frappe.db.exists("Module Def", module):
+			continue
+		frappe.delete_doc("Module Def", module, force=1, ignore_permissions=True)
+
+
 POS_COUPON_EXTRA_FIELDS = [
 	{
 		"dt": "POS Coupon",
