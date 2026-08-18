@@ -1,6 +1,9 @@
 // Copyright (c) 2026, BrainWise and contributors
 // For license information, please see license.txt
 
+// Scope consts inside an IIFE. Frappe concatenates every app's doctype_js into
+// one Function, so a top-level const here would clash with pos_next's copy.
+(function () {
 // Slab fields an Accumulative scheme does not use — its percentage comes from
 // the per-scope rows instead.
 const PN_SLAB_DISCOUNT_FIELDS = ["rate_or_discount", "rate", "discount_amount", "discount_percentage"];
@@ -244,3 +247,4 @@ function pn_toggle_scope_percentage(frm, is_accumulative) {
 			: ""
 	);
 }
+})();

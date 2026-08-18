@@ -1,8 +1,7 @@
 // Copyright (c) 2026, BrainWise and contributors
 // For license information, please see license.txt
 
-
-
+(function () {
 frappe.ui.form.on("User", {
 	refresh(frm) {
 		if (frm.is_new()) {
@@ -113,3 +112,4 @@ function remove_pin(frm) {
 		}
 	);
 }
+})();

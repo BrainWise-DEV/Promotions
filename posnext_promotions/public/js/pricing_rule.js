@@ -1,6 +1,9 @@
 // Copyright (c) 2026, BrainWise and contributors
 // For license information, please see license.txt
 
+// Scope consts inside an IIFE. Frappe concatenates every app's doctype_js into
+// one Function, so a top-level const here would clash with pos_next's copy.
+(function () {
 // Discount-value fields an Accumulative rule does not use. Its percentage comes
 // from the per-scope rows instead, and the engine ignores these outright — see
 // pos_next/overrides/pricing_rule.py#apply_price_discount_rule.
@@ -115,3 +118,4 @@ function pn_toggle_scope_percentage(frm, is_accumulative) {
 			: ""
 	);
 }
+})();

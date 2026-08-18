@@ -78,6 +78,32 @@ class TestIndependence(unittest.TestCase):
 		self.assertEqual(bootinfo.get("posnext_promotions"), 1)
 		self.assertEqual(bootinfo.get("posnext_promotions_auth"), 1)
 
+	def test_form_js_is_safe_to_concatenate_with_pos_next(self):
+		"""Frappe concatenates every app's doctype_js into one Function.
+
+		Top-level const in both copies used to throw
+		`SyntaxError: redeclaration of const PN_SLAB_DISCOUNT_FIELDS`.
+		"""
+		if not POS_NEXT.exists():
+			self.skipTest("pos_next is not in this bench")
+
+		pairs = (
+			("public/js/promotional_scheme.js", "posnext_promotions"),
+			("public/js/pricing_rule.js", "posnext_promotions"),
+			("public/js/user.js", "posnext_promotions_auth"),
+		)
+		for rel, boot_flag in pairs:
+			ours = (PKG / rel).read_text()
+			theirs = (POS_NEXT / "pos_next" / rel).read_text()
+			self.assertIn("(function () {", ours, rel)
+			self.assertTrue(ours.rstrip().endswith("})();"), rel)
+			self.assertIn("(function () {", theirs, rel)
+			self.assertTrue(theirs.rstrip().endswith("})();"), rel)
+			self.assertIn(f"frappe.boot.{boot_flag}", theirs, rel)
+			# Concatenation must parse as a single Function body, as Frappe does.
+			concatenated = theirs + "\n" + ours
+			self.assertGreater(concatenated.count("(function () {"), 1, rel)
+
 
 class TestSmokeBothOptional(unittest.TestCase):
 	"""Site-level checks; skipped when Frappe is not bootstrapped."""
