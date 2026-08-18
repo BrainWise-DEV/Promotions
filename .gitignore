@@ -5,3 +5,8 @@
 tags
 node_modules
 __pycache__
+__pycache__/
+.venv/
+.vscode/
+.idea/
+*.log

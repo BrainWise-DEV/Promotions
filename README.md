@@ -1,33 +1,24 @@
-### POSNext Promotions
+# POSNext Promotions
 
-Standalone ERPNext promotions engine, GWP, coupon extras, and POS authorization gate
+Standalone ERPNext app for advanced promotions (GWP, accumulative discounts, schedule windows, coupon extras) and the POS authorization gate.
 
-### Installation
+This app does **not** depend on `pos_next`. `pos_next` does **not** depend on this app.
 
-You can install this app using the [bench](https://github.com/frappe/bench) CLI:
+They compose on a site through Frappe `doc_events`, `override_doctype_class`, custom fields, and `extend_bootinfo` (`boot.posnext_promotions = 1`).
 
-```bash
-cd $PATH_TO_YOUR_BENCH
-bench get-app $URL_OF_THIS_REPO --branch develop
-bench install-app posnext_promotions
+Optional runtime: if POS Next's Vue sees `frappe.boot.posnext_promotions`, it may call `posnext_promotions.api.*`. Without this app, POS Next keeps its baseline offers API.
+
+## Install
+
+```
+bench get-app /path/to/posnext_promotions
+bench --site <site> install-app posnext_promotions
 ```
 
-### Contributing
+Place this app **after** `pos_next` in `sites/apps.txt` when both are installed so this app's Pricing Rule monkey-patch wins.
 
-This app uses `pre-commit` for code formatting and linting. Please [install pre-commit](https://pre-commit.com/#installation) and enable it for this repository:
+## Independence
 
-```bash
-cd apps/posnext_promotions
-pre-commit install
-```
-
-Pre-commit is configured to use the following tools for checking and formatting your code:
-
-- ruff
-- eslint
-- prettier
-- pyupgrade
-
-### License
-
-agpl-3.0
+- No `required_apps = ["pos_next"]`
+- No Python `import pos_next`
+- POS Coupon extra fields are created in `after_migrate` only if DocType `POS Coupon` exists

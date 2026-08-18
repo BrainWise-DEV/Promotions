@@ -1,249 +1,60 @@
 app_name = "posnext_promotions"
 app_title = "POSNext Promotions"
 app_publisher = "BrainWise"
-app_description = "Standalone ERPNext promotions engine, GWP, coupon extras, and POS authorization gate"
+app_description = "Standalone promotions engine, GWP, coupons extras, and POS authorization gate for ERPNext"
 app_email = "support@brainwise.me"
 app_license = "agpl-3.0"
 
-# Apps
-# ------------------
-
+# Independent of pos_next — do not declare it in required_apps.
 # required_apps = []
 
-# Each item in the list will be shown as an app in the apps page
-# add_to_apps_screen = [
-# 	{
-# 		"name": "posnext_promotions",
-# 		"logo": "/assets/posnext_promotions/logo.png",
-# 		"title": "POSNext Promotions",
-# 		"route": "/posnext_promotions",
-# 		"has_permission": "posnext_promotions.api.permission.has_app_permission"
-# 	}
-# ]
+extend_bootinfo = "posnext_promotions.boot.extend"
 
-# Includes in <head>
-# ------------------
+override_doctype_class = {
+	"Pricing Rule": "posnext_promotions.overrides.custom_pricing_rule.CustomPricingRule",
+}
 
-# include js, css files in header of desk.html
-# app_include_css = "/assets/posnext_promotions/css/posnext_promotions.css"
-# app_include_js = "/assets/posnext_promotions/js/posnext_promotions.js"
+doctype_js = {
+	"Pricing Rule": "public/js/pricing_rule.js",
+	"Promotional Scheme": "public/js/promotional_scheme.js",
+	"User": "public/js/user.js",
+}
 
-# include js, css files in header of web template
-# web_include_css = "/assets/posnext_promotions/css/posnext_promotions.css"
-# web_include_js = "/assets/posnext_promotions/js/posnext_promotions.js"
+doc_events = {
+	"Promotional Scheme": {
+		"before_validate": [
+			"posnext_promotions.promotions.schedule.normalize_schedule_fields",
+			"posnext_promotions.overrides.pricing_rule.normalize_accumulative_scheme",
+		],
+		"validate": [
+			"posnext_promotions.overrides.pricing_rule.enforce_cross_cart_pricing_config",
+			"posnext_promotions.overrides.pricing_rule.validate_unique_promotion_type_per_item",
+		],
+		"on_update": "posnext_promotions.overrides.pricing_rule.sync_promotion_fields_to_pricing_rules",
+	},
+	"Pricing Rule": {
+		"before_validate": "posnext_promotions.promotions.schedule.normalize_schedule_fields",
+		"validate": "posnext_promotions.overrides.pricing_rule.enforce_cross_cart_pricing_config",
+	},
+	"Sales Invoice": {
+		"validate": [
+			"posnext_promotions.overrides.sales_invoice_free_bundle.combine_packed_qty_for_free_product_bundles",
+			"posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts",
+		],
+		"before_submit": "posnext_promotions.authorization.gate.enforce_document",
+		"on_submit": "posnext_promotions.api.one_time_usage.record_one_time_offer_usage",
+		"on_cancel": "posnext_promotions.api.one_time_usage.release_one_time_offer_usage",
+	},
+	"Sales Order": {"validate": "posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts"},
+	"Quotation": {"validate": "posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts"},
+	"Delivery Note": {"validate": "posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts"},
+	"POS Invoice": {"validate": "posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts"},
+}
 
-# include custom scss in every website theme (without file extension ".scss")
-# website_theme_scss = "posnext_promotions/public/scss/website"
+scheduler_events = {
+	"daily": [
+		"posnext_promotions.tasks.cleanup_expired_promotions.cleanup_expired_promotions",
+	],
+}
 
-# include js, css files in header of web form
-# webform_include_js = {"doctype": "public/js/doctype.js"}
-# webform_include_css = {"doctype": "public/css/doctype.css"}
-
-# include js in page
-# page_js = {"page" : "public/js/file.js"}
-
-# include js in doctype views
-# doctype_js = {"doctype" : "public/js/doctype.js"}
-# doctype_list_js = {"doctype" : "public/js/doctype_list.js"}
-# doctype_tree_js = {"doctype" : "public/js/doctype_tree.js"}
-# doctype_calendar_js = {"doctype" : "public/js/doctype_calendar.js"}
-
-# Svg Icons
-# ------------------
-# include app icons in desk
-# app_include_icons = "posnext_promotions/public/icons.svg"
-
-# Home Pages
-# ----------
-
-# application home page (will override Website Settings)
-# home_page = "login"
-
-# website user home page (by Role)
-# role_home_page = {
-# 	"Role": "home_page"
-# }
-
-# Generators
-# ----------
-
-# automatically create page for each record of this doctype
-# website_generators = ["Web Page"]
-
-# Jinja
-# ----------
-
-# add methods and filters to jinja environment
-# jinja = {
-# 	"methods": "posnext_promotions.utils.jinja_methods",
-# 	"filters": "posnext_promotions.utils.jinja_filters"
-# }
-
-# Installation
-# ------------
-
-# before_install = "posnext_promotions.install.before_install"
-# after_install = "posnext_promotions.install.after_install"
-
-# Uninstallation
-# ------------
-
-# before_uninstall = "posnext_promotions.uninstall.before_uninstall"
-# after_uninstall = "posnext_promotions.uninstall.after_uninstall"
-
-# Integration Setup
-# ------------------
-# To set up dependencies/integrations with other apps
-# Name of the app being installed is passed as an argument
-
-# before_app_install = "posnext_promotions.utils.before_app_install"
-# after_app_install = "posnext_promotions.utils.after_app_install"
-
-# Integration Cleanup
-# -------------------
-# To clean up dependencies/integrations with other apps
-# Name of the app being uninstalled is passed as an argument
-
-# before_app_uninstall = "posnext_promotions.utils.before_app_uninstall"
-# after_app_uninstall = "posnext_promotions.utils.after_app_uninstall"
-
-# Desk Notifications
-# ------------------
-# See frappe.core.notifications.get_notification_config
-
-# notification_config = "posnext_promotions.notifications.get_notification_config"
-
-# Permissions
-# -----------
-# Permissions evaluated in scripted ways
-
-# permission_query_conditions = {
-# 	"Event": "frappe.desk.doctype.event.event.get_permission_query_conditions",
-# }
-#
-# has_permission = {
-# 	"Event": "frappe.desk.doctype.event.event.has_permission",
-# }
-
-# DocType Class
-# ---------------
-# Override standard doctype classes
-
-# override_doctype_class = {
-# 	"ToDo": "custom_app.overrides.CustomToDo"
-# }
-
-# Document Events
-# ---------------
-# Hook on document methods and events
-
-# doc_events = {
-# 	"*": {
-# 		"on_update": "method",
-# 		"on_cancel": "method",
-# 		"on_trash": "method"
-# 	}
-# }
-
-# Scheduled Tasks
-# ---------------
-
-# scheduler_events = {
-# 	"all": [
-# 		"posnext_promotions.tasks.all"
-# 	],
-# 	"daily": [
-# 		"posnext_promotions.tasks.daily"
-# 	],
-# 	"hourly": [
-# 		"posnext_promotions.tasks.hourly"
-# 	],
-# 	"weekly": [
-# 		"posnext_promotions.tasks.weekly"
-# 	],
-# 	"monthly": [
-# 		"posnext_promotions.tasks.monthly"
-# 	],
-# }
-
-# Testing
-# -------
-
-# before_tests = "posnext_promotions.install.before_tests"
-
-# Overriding Methods
-# ------------------------------
-#
-# override_whitelisted_methods = {
-# 	"frappe.desk.doctype.event.event.get_events": "posnext_promotions.event.get_events"
-# }
-#
-# each overriding function accepts a `data` argument;
-# generated from the base implementation of the doctype dashboard,
-# along with any modifications made in other Frappe apps
-# override_doctype_dashboards = {
-# 	"Task": "posnext_promotions.task.get_dashboard_data"
-# }
-
-# exempt linked doctypes from being automatically cancelled
-#
-# auto_cancel_exempted_doctypes = ["Auto Repeat"]
-
-# Ignore links to specified DocTypes when deleting documents
-# -----------------------------------------------------------
-
-# ignore_links_on_delete = ["Communication", "ToDo"]
-
-# Request Events
-# ----------------
-# before_request = ["posnext_promotions.utils.before_request"]
-# after_request = ["posnext_promotions.utils.after_request"]
-
-# Job Events
-# ----------
-# before_job = ["posnext_promotions.utils.before_job"]
-# after_job = ["posnext_promotions.utils.after_job"]
-
-# User Data Protection
-# --------------------
-
-# user_data_fields = [
-# 	{
-# 		"doctype": "{doctype_1}",
-# 		"filter_by": "{filter_by}",
-# 		"redact_fields": ["{field_1}", "{field_2}"],
-# 		"partial": 1,
-# 	},
-# 	{
-# 		"doctype": "{doctype_2}",
-# 		"filter_by": "{filter_by}",
-# 		"partial": 1,
-# 	},
-# 	{
-# 		"doctype": "{doctype_3}",
-# 		"strict": False,
-# 	},
-# 	{
-# 		"doctype": "{doctype_4}"
-# 	}
-# ]
-
-# Authentication and authorization
-# --------------------------------
-
-# auth_hooks = [
-# 	"posnext_promotions.auth.validate"
-# ]
-
-# Automatically update python controller files with type annotations for this app.
-# export_python_type_annotations = True
-
-# default_log_clearing_doctypes = {
-# 	"Logging DocType Name": 30  # days to retain logs
-# }
-
-# Translation
-# ------------
-# List of apps whose translatable strings should be excluded from this app's translations.
-# ignore_translatable_strings_from = []
-
+after_migrate = "posnext_promotions.install.after_migrate"
