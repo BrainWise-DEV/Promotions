@@ -131,9 +131,11 @@ class TestSmokeBothOptional(unittest.TestCase):
 		if not getattr(frappe.local, "site", None):
 			self.skipTest("no Frappe site initialized")
 		apps = frappe.get_installed_apps()
-		# Any of the three compositions is valid; assert independence either way.
+		# Any of the three compositions is valid; assert this app never requires pos_next.
 		if "posnext_promotions" in apps:
-			self.assertNotIn("pos_next", frappe.get_hooks("required_apps") or [])
+			from posnext_promotions.hooks import required_apps as promo_required
+
+			self.assertNotIn("pos_next", promo_required)
 		if "pos_next" in apps and "posnext_promotions" in apps:
 			self.assertTrue(frappe.get_hooks("pos_next_loyalty_provider") is not None)
 
