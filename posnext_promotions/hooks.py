@@ -6,7 +6,7 @@ app_email = "support@brainwise.me"
 app_license = "agpl-3.0"
 
 # Independent of pos_next — do not declare it in required_apps.
-# required_apps = []
+required_apps = ["erpnext"]
 
 extend_bootinfo = "posnext_promotions.boot.extend"
 
@@ -51,11 +51,8 @@ doc_events = {
 	"POS Invoice": {"validate": "posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts"},
 }
 
-scheduler_events = {
-	"daily": [
-		"posnext_promotions.tasks.cleanup_expired_promotions.cleanup_expired_promotions",
-	],
-}
+# Daily cleanup stays on pos_next develop so it does not run twice when both apps
+# are installed. Keep the task module for sites that call it explicitly.
 
 before_install = "posnext_promotions.install.before_install"
 after_migrate = "posnext_promotions.install.after_migrate"

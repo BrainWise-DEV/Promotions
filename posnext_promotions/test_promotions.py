@@ -38,16 +38,6 @@ from frappe.utils import add_days, flt, nowdate
 
 import posnext_promotions  # noqa: F401 — ensure app hooks load.
 from posnext_promotions.api.offers import apply_offers
-
-import importlib
-
-try:
-	_pos_invoices = importlib.import_module("pos_next.api.invoices")
-	submit_invoice = _pos_invoices.submit_invoice
-	update_invoice = _pos_invoices.update_invoice
-except ModuleNotFoundError:  # optional: invoice pipeline needs pos_next
-	submit_invoice = None
-	update_invoice = None
 from posnext_promotions.promotions import engine
 from posnext_promotions.promotions.scope import get_scope_keys, item_matches_rule_scope
 
@@ -615,11 +605,25 @@ def _make_pos_coupon(code, **fields):
 	return doc
 
 
+def _pos_invoice_pipeline():
+	"""Optional POS invoice submit/update. Not a package dependency."""
+	import importlib
+
+	if "pos_next" not in frappe.get_installed_apps():
+		return None, None
+	try:
+		mod = importlib.import_module("pos_next.api.invoices")
+	except ModuleNotFoundError:
+		return None, None
+	return mod.submit_invoice, mod.update_invoice
+
+
 def _submit_invoice(ctx, payload, paid_amount):
 	"""Push the payload through update_invoice → submit_invoice and return the final doc."""
 	import json
 	import unittest
 
+	submit_invoice, update_invoice = _pos_invoice_pipeline()
 	if update_invoice is None or submit_invoice is None:
 		raise unittest.SkipTest("pos_next invoice APIs are not installed")
 
