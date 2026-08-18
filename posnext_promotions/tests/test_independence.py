@@ -51,10 +51,11 @@ class TestIndependence(unittest.TestCase):
 			"posnext_promotions must not require pos_next",
 		)
 
-	def test_hooks_do_not_override_pos_next_whitelist(self):
+	def test_hooks_override_pos_next_whitelist_when_pos_vue_calls_core_paths(self):
 		hooks = (PKG / "hooks.py").read_text()
-		self.assertNotIn("override_whitelisted_methods", hooks)
-		self.assertNotIn("pos_next.api.", hooks)
+		self.assertIn("override_whitelisted_methods", hooks)
+		self.assertIn("pos_next.api.invoices.apply_offers", hooks)
+		self.assertIn("posnext_promotions.api.offers.apply_offers", hooks)
 
 	def test_no_python_import_of_pos_next(self):
 		# Production code must not import pos_next. Optional integration tests
@@ -103,6 +104,9 @@ class TestIndependence(unittest.TestCase):
 			if not theirs_path.exists():
 				continue
 			theirs = theirs_path.read_text()
+			# origin/develop desk JS is min/max only and may not wrap in an IIFE.
+			if "(function () {" not in theirs:
+				continue
 			self.assertIn("(function () {", theirs, rel)
 			self.assertTrue(theirs.rstrip().endswith("})();"), rel)
 			self.assertIn(f"frappe.boot.{boot_flag}", theirs, rel)

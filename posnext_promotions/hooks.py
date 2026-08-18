@@ -8,6 +8,31 @@ app_license = "agpl-3.0"
 # Independent of pos_next — do not declare it in required_apps.
 required_apps = ["erpnext"]
 
+# Vanilla develop Vue calls pos_next.api.*; Frappe routes those to this app when installed.
+override_whitelisted_methods = {
+	"pos_next.api.invoices.apply_offers": "posnext_promotions.api.offers.apply_offers",
+	"pos_next.api.offers.get_offers": "posnext_promotions.api.offers.get_offers",
+	"pos_next.api.offers.validate_coupon": "posnext_promotions.api.offers.validate_coupon",
+	"pos_next.api.offers.get_active_coupons": "posnext_promotions.api.offers.get_active_coupons",
+	"pos_next.api.offers.calculate_coupon_discount": "posnext_promotions.api.offers.calculate_coupon_discount",
+	"pos_next.api.offers.item_has_active_promotion": "posnext_promotions.api.offers.item_has_active_promotion",
+	"pos_next.api.offers.get_customer_one_time_redemptions": "posnext_promotions.api.offers.get_customer_one_time_redemptions",
+	"pos_next.api.promotions.get_promotions": "posnext_promotions.api.promotions.get_promotions",
+	"pos_next.api.promotions.get_promotion_details": "posnext_promotions.api.promotions.get_promotion_details",
+	"pos_next.api.promotions.create_promotion": "posnext_promotions.api.promotions.create_promotion",
+	"pos_next.api.promotions.update_promotion": "posnext_promotions.api.promotions.update_promotion",
+	"pos_next.api.promotions.toggle_promotion": "posnext_promotions.api.promotions.toggle_promotion",
+	"pos_next.api.promotions.delete_promotion": "posnext_promotions.api.promotions.delete_promotion",
+	"pos_next.api.promotions.get_item_groups": "posnext_promotions.api.promotions.get_item_groups",
+	"pos_next.api.promotions.get_brands": "posnext_promotions.api.promotions.get_brands",
+	"pos_next.api.promotions.get_coupons": "posnext_promotions.api.promotions.get_coupons",
+	"pos_next.api.promotions.get_coupon_details": "posnext_promotions.api.promotions.get_coupon_details",
+	"pos_next.api.promotions.create_coupon": "posnext_promotions.api.promotions.create_coupon",
+	"pos_next.api.promotions.update_coupon": "posnext_promotions.api.promotions.update_coupon",
+	"pos_next.api.promotions.toggle_coupon": "posnext_promotions.api.promotions.toggle_coupon",
+	"pos_next.api.promotions.delete_coupon": "posnext_promotions.api.promotions.delete_coupon",
+}
+
 extend_bootinfo = "posnext_promotions.boot.extend"
 
 override_doctype_class = {
