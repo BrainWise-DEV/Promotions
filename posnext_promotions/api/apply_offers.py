@@ -10,6 +10,7 @@ import math
 from functools import lru_cache
 
 import frappe
+from erpnext.stock.doctype.batch.batch import get_batch_qty
 from frappe import _
 from frappe.utils import cint, cstr, flt, nowdate, nowtime
 
@@ -539,6 +540,37 @@ def _paid_stock_demand_by_item_warehouse(paid_items, default_warehouse):
 def _free_item_requested_stock_qty(free_item_doc):
 	qty = flt(free_item_doc.get("qty") or free_item_doc.get("quantity") or 0)
 	return qty * flt(free_item_doc.get("conversion_factor") or 1)
+
+
+def _should_block(pos_profile):
+	"""Return True when insufficient stock should omit free gifts.
+
+	Honours Stock Settings, per-profile POS Settings, and the POS Profile
+	custom field used by POS Next. Missing doctypes/fields default to blocking.
+	"""
+	allow_negative = cint(frappe.db.get_single_value("Stock Settings", "allow_negative_stock") or 0)
+	if allow_negative:
+		return False
+
+	if not pos_profile:
+		return True
+
+	try:
+		pos_settings_allow_negative = cint(
+			frappe.db.get_value("POS Settings", {"pos_profile": pos_profile}, "allow_negative_stock") or 0
+		)
+		if pos_settings_allow_negative:
+			return False
+	except Exception:
+		pass
+
+	try:
+		block_sale = cint(
+			frappe.db.get_value("POS Profile", pos_profile, "posa_block_sale_beyond_available_qty") or 1
+		)
+		return bool(block_sale)
+	except Exception:
+		return True
 
 
 def _filter_out_of_stock_free_items(
