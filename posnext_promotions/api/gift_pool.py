@@ -6,7 +6,8 @@
 A Gift Pool scheme targets item groups. Each group has an ordered list of free
 items from that group. Buying any non-pool item in the group grants a total of
 ``free_qty`` free units, spread across those item codes in list order — once
-per cart, not once per paid unit.
+per cart, not once per paid unit. Out-of-stock pool items are skipped so the
+next in-stock code in the list receives the gift instead.
 """
 
 from __future__ import annotations
@@ -57,11 +58,18 @@ def group_gift_pool_free_qty(rows) -> dict[str, int]:
 	return dict(qtys)
 
 
-def allocate_gift_pool_free_items(paid_qty, pool_item_codes: list[str], free_qty=1) -> dict[str, int]:
+def allocate_gift_pool_free_items(
+	paid_qty, pool_item_codes: list[str], free_qty=1, available_qty=None
+) -> dict[str, int]:
 	"""Spread ``free_qty`` units across pool item codes in row order.
 
 	The total granted quantity equals ``free_qty``. Extra units wrap around:
 	qty 3 with A, B, C → ``{A: 1, B: 1, C: 1}``; qty 5 with A, B → ``{A: 3, B: 2}``.
+
+	When ``available_qty`` is a mapping of item_code → remaining stock, pool
+	items with no remaining units are skipped and later codes in list order
+	receive the gift instead. A missing key means unlimited stock (non-stock
+	or negative-stock items).
 	"""
 	paid_qty = max(0, int(flt(paid_qty)))
 	free_qty = cint(free_qty)
@@ -71,9 +79,38 @@ def allocate_gift_pool_free_items(paid_qty, pool_item_codes: list[str], free_qty
 		return {}
 	counts: dict[str, int] = OrderedDict()
 	n = len(pool_item_codes)
-	for i in range(free_qty):
+	if available_qty is None:
+		for i in range(free_qty):
+			code = pool_item_codes[i % n]
+			counts[code] = counts.get(code, 0) + 1
+		return dict(counts)
+
+	leftover = {}
+	for code in pool_item_codes:
+		if code in available_qty:
+			leftover[code] = max(0, int(flt(available_qty[code])))
+		else:
+			leftover[code] = None
+
+	granted = 0
+	stalled = 0
+	i = 0
+	max_steps = free_qty * n
+	while granted < free_qty and i < max_steps:
 		code = pool_item_codes[i % n]
+		stock = leftover[code]
+		if stock is not None and stock < 1:
+			stalled += 1
+			i += 1
+			if stalled >= n:
+				break
+			continue
+		if stock is not None:
+			leftover[code] = stock - 1
 		counts[code] = counts.get(code, 0) + 1
+		granted += 1
+		stalled = 0
+		i += 1
 	return dict(counts)
 
 

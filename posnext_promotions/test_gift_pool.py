@@ -15,7 +15,7 @@ from posnext_promotions.api.gift_pool import (
 	group_gift_pool_free_qty,
 	group_gift_pool_items,
 )
-from posnext_promotions.api.apply_offers import apply_offers
+from posnext_promotions.api.apply_offers import _apply_gift_pool_free_items, apply_offers
 from posnext_promotions.test_promotions import (
 	ITEM_A,
 	ITEM_B,
@@ -59,6 +59,38 @@ class TestGiftPoolHelpers(unittest.TestCase):
 		self.assertEqual(allocate_gift_pool_free_items(1, ["A", "B"], 5), {"A": 3, "B": 2})
 		self.assertEqual(allocate_gift_pool_free_items(1, ["A", "B", "C"], 2), {"A": 1, "B": 1})
 
+	def test_allocate_skips_out_of_stock_and_uses_next(self):
+		self.assertEqual(
+			allocate_gift_pool_free_items(1, ["A", "B", "C"], available_qty={"A": 0, "B": 2, "C": 2}),
+			{"B": 1},
+		)
+		self.assertEqual(
+			allocate_gift_pool_free_items(1, ["A", "B", "C"], available_qty={"A": 0, "B": 0, "C": 5}),
+			{"C": 1},
+		)
+		self.assertEqual(
+			allocate_gift_pool_free_items(1, ["A", "B"], available_qty={"A": 0, "B": 0}),
+			{},
+		)
+
+	def test_allocate_skips_oos_then_spreads_remaining(self):
+		self.assertEqual(
+			allocate_gift_pool_free_items(
+				1, ["A", "B", "C"], 3, available_qty={"A": 0, "B": 10, "C": 10}
+			),
+			{"B": 2, "C": 1},
+		)
+		self.assertEqual(
+			allocate_gift_pool_free_items(1, ["A", "B"], 5, available_qty={"A": 1, "B": 10}),
+			{"A": 1, "B": 4},
+		)
+
+	def test_allocate_missing_stock_key_is_unlimited(self):
+		self.assertEqual(
+			allocate_gift_pool_free_items(1, ["A", "B"], 2, available_qty={"A": 0}),
+			{"B": 2},
+		)
+
 	def test_group_free_qty_uses_first_row(self):
 		self.assertEqual(
 			group_gift_pool_free_qty(
@@ -70,6 +102,92 @@ class TestGiftPoolHelpers(unittest.TestCase):
 			),
 			{"Snacks": 3, "Drinks": 1},
 		)
+
+
+class TestGiftPoolApplyStockFallback(unittest.TestCase):
+	def test_apply_falls_back_when_first_pool_item_oos(self):
+		from unittest.mock import patch
+
+		from posnext_promotions.api import apply_offers as mod
+
+		prepared = [
+			frappe._dict(item_code="PAID", item_group="Snacks", qty=1, is_free_item=0)
+		]
+		free_items_map = {}
+		applied = set()
+		rule_map = {
+			"RULE1": frappe._dict(
+				promotional_scheme="SCHEME",
+				promotion_type=PROMOTION_TYPE_GIFT_POOL,
+			)
+		}
+
+		def fake_free_doc(code, qty, *args, **kwargs):
+			return frappe._dict(item_code=code, qty=qty)
+
+		with (
+			patch.object(mod, "get_scheme_gift_pools", return_value={"Snacks": ["A", "B"]}),
+			patch.object(mod, "get_scheme_gift_pool_qtys", return_value={"Snacks": 1}),
+			patch.object(mod, "expanded_groups", side_effect=lambda group: {group}),
+			patch.object(
+				frappe,
+				"get_cached_doc",
+				return_value=frappe._dict(free_item_uom="Nos", free_item_rate=0),
+			),
+			patch.object(mod, "_gift_pool_available_qty", return_value={"A": 0, "B": 5}),
+			patch.object(mod, "_make_free_item_doc", side_effect=fake_free_doc),
+		):
+			_apply_gift_pool_free_items(
+				prepared,
+				free_items_map,
+				rule_map,
+				applied,
+				warehouse="WH",
+				pos_profile="PROFILE",
+			)
+
+		self.assertEqual(list(free_items_map.keys()), [("B", "RULE1")])
+		self.assertEqual(flt(free_items_map[("B", "RULE1")].qty), 1)
+
+	def test_apply_skips_all_when_pool_is_oos(self):
+		from unittest.mock import patch
+
+		from posnext_promotions.api import apply_offers as mod
+
+		prepared = [
+			frappe._dict(item_code="PAID", item_group="Snacks", qty=1, is_free_item=0)
+		]
+		free_items_map = {}
+		applied = {"RULE1"}
+		rule_map = {
+			"RULE1": frappe._dict(
+				promotional_scheme="SCHEME",
+				promotion_type=PROMOTION_TYPE_GIFT_POOL,
+			)
+		}
+
+		with (
+			patch.object(mod, "get_scheme_gift_pools", return_value={"Snacks": ["A", "B"]}),
+			patch.object(mod, "get_scheme_gift_pool_qtys", return_value={"Snacks": 1}),
+			patch.object(mod, "expanded_groups", side_effect=lambda group: {group}),
+			patch.object(
+				frappe,
+				"get_cached_doc",
+				return_value=frappe._dict(free_item_uom="Nos", free_item_rate=0),
+			),
+			patch.object(mod, "_gift_pool_available_qty", return_value={"A": 0, "B": 0}),
+		):
+			_apply_gift_pool_free_items(
+				prepared,
+				free_items_map,
+				rule_map,
+				applied,
+				warehouse="WH",
+				pos_profile="PROFILE",
+			)
+
+		self.assertEqual(free_items_map, {})
+		self.assertNotIn("RULE1", applied)
 
 
 class TestGiftPoolScheme(FrappeTestCase):
@@ -185,6 +303,52 @@ class TestGiftPoolScheme(FrappeTestCase):
 		self.assertEqual(len(free_items), 1)
 		self.assertEqual(free_items[0].get("item_code"), ITEM_B)
 		self.assertEqual(flt(free_items[0].get("qty")), 1)
+
+	def test_oos_first_pool_item_falls_back_to_next(self):
+		from unittest.mock import patch
+
+		self._make_scheme([ITEM_B, ITEM_C])
+		rule = self._rule_name()
+		payload = _cart_payload(self.ctx, [_line(self.ctx, ITEM_A, qty=1)])
+
+		def stock(item):
+			if item.get("item_code") == ITEM_B:
+				return 0
+			return 100
+
+		with (
+			patch("posnext_promotions.api.apply_offers._should_block", return_value=True),
+			patch("posnext_promotions.api.apply_offers._item_is_stock_item", return_value=True),
+			patch("posnext_promotions.api.apply_offers._get_available_stock", side_effect=stock),
+		):
+			resp = apply_offers(
+				invoice_data=json.dumps(payload),
+				selected_offers=json.dumps([rule]),
+			)
+
+		free_items = resp.get("free_items") or []
+		self.assertEqual(len(free_items), 1)
+		self.assertEqual(free_items[0].get("item_code"), ITEM_C)
+		self.assertEqual(flt(free_items[0].get("qty")), 1)
+
+	def test_all_pool_items_oos_grants_nothing(self):
+		from unittest.mock import patch
+
+		self._make_scheme([ITEM_B, ITEM_C])
+		rule = self._rule_name()
+		payload = _cart_payload(self.ctx, [_line(self.ctx, ITEM_A, qty=1)])
+
+		with (
+			patch("posnext_promotions.api.apply_offers._should_block", return_value=True),
+			patch("posnext_promotions.api.apply_offers._item_is_stock_item", return_value=True),
+			patch("posnext_promotions.api.apply_offers._get_available_stock", return_value=0),
+		):
+			resp = apply_offers(
+				invoice_data=json.dumps(payload),
+				selected_offers=json.dumps([rule]),
+			)
+
+		self.assertEqual(resp.get("free_items") or [], [])
 
 	def test_two_paid_units_still_get_one_free_item(self):
 		self._make_scheme([ITEM_B, ITEM_C])
