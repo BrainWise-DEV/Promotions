@@ -63,6 +63,13 @@ try:
 		compute_product_recursive_free_qty,
 		should_aggregate_product_quantities,
 	)
+	from posnext_promotions.api.gift_pool import (
+		PROMOTION_TYPE_GIFT_POOL,
+		allocate_gift_pool_free_items,
+		expanded_groups,
+		get_scheme_gift_pool_qtys,
+		get_scheme_gift_pools,
+	)
 except Exception:  # pragma: no cover
 	import traceback
 
@@ -74,6 +81,7 @@ except Exception:  # pragma: no cover
 	PROMOTION_TYPE_AUTO = "Auto Discount"
 	PROMOTION_TYPE_ITEM_LEVEL = "Item Level Discount"
 	PROMOTION_TYPE_GWP = "GWP"
+	PROMOTION_TYPE_GIFT_POOL = "Gift Pool"
 	calculate_gwp_discount_amount = None
 	get_gwp_slab_free_qty = None
 	distribute_gwp_free_units_for_basis = None
@@ -88,6 +96,10 @@ except Exception:  # pragma: no cover
 	DISCOUNT_SOURCE_MANUAL = "manual_discount"
 	get_rule_promotion_types = None
 	mark_item_discount_flags = None
+	allocate_gift_pool_free_items = None
+	get_scheme_gift_pools = None
+	get_scheme_gift_pool_qtys = None
+	expanded_groups = None
 
 
 def _item_matches_pricing_rule(item, rule) -> bool:
@@ -198,7 +210,7 @@ def _recompute_recursive_product_free_items(prepared_items, free_items_map, rule
 
 	recursive_rule_names = []
 	for rule_name, details in rule_map.items():
-		if rule_promotion_type(details) == PROMOTION_TYPE_GWP:
+		if rule_promotion_type(details) in (PROMOTION_TYPE_GWP, PROMOTION_TYPE_GIFT_POOL):
 			continue
 		full_rule = frappe.get_cached_doc("Pricing Rule", rule_name)
 		if full_rule.price_or_product_discount != "Product":
@@ -338,7 +350,7 @@ def _apply_bundled_same_item_free_discounts(prepared_items, free_items_map, rule
 		item_code, rule_name = key
 		if rule_name not in rule_map:
 			continue
-		if rule_promotion_type(rule_map[rule_name]) == PROMOTION_TYPE_GWP:
+		if rule_promotion_type(rule_map[rule_name]) in (PROMOTION_TYPE_GWP, PROMOTION_TYPE_GIFT_POOL):
 			continue
 
 		full_rule = frappe.get_cached_doc("Pricing Rule", rule_name)
@@ -455,6 +467,90 @@ def _apply_gwp_line_discounts(prepared_items, free_items_map, rule_map) -> None:
 			)
 			_stamp_gwp_line_discount(item_doc, line_free, price_list_rate)
 			append_pricing_rule(item_doc, rule_name)
+
+
+def _apply_gift_pool_free_items(prepared_items, free_items_map, rule_map, applied_rules=None) -> None:
+	"""Replace ERPNext's single free_item with the ordered Gift Pool.
+
+	For each configured item group: paid units are items in that group that are
+	not in the pool. Any paid quantity grants a total of ``free_qty`` units
+	spread across the pool item codes — not one free unit per paid unit.
+	"""
+	if not allocate_gift_pool_free_items or not get_scheme_gift_pools:
+		return
+
+	gift_pool_rules = [
+		(name, details)
+		for name, details in rule_map.items()
+		if rule_promotion_type(details) == PROMOTION_TYPE_GIFT_POOL
+	]
+	if not gift_pool_rules:
+		return
+
+	for rule_name, details in gift_pool_rules:
+		for key in list(free_items_map.keys()):
+			if key[1] == rule_name:
+				free_items_map.pop(key, None)
+
+		scheme_name = details.get("promotional_scheme") if hasattr(details, "get") else getattr(
+			details, "promotional_scheme", None
+		)
+		pools = get_scheme_gift_pools(scheme_name)
+		qtys = get_scheme_gift_pool_qtys(scheme_name) if get_scheme_gift_pool_qtys else {}
+		if not pools:
+			if applied_rules is not None:
+				applied_rules.discard(rule_name)
+			continue
+
+		full_rule = frappe.get_cached_doc("Pricing Rule", rule_name)
+		promotional_scheme = scheme_name
+		rule_gave_free = False
+
+		for item_group, pool_codes in pools.items():
+			group_set = expanded_groups(item_group) if expanded_groups else {item_group}
+			pool_set = set(pool_codes)
+			matching_lines = []
+			paid_qty = 0
+			for item_doc in prepared_items:
+				if item_doc.get("is_free_item"):
+					continue
+				if cstr(item_doc.get("item_group")) not in group_set:
+					continue
+				if cstr(item_doc.get("item_code")) in pool_set:
+					continue
+				matching_lines.append(item_doc)
+				paid_qty += _floor_free_item_qty(
+					item_doc.get("qty") or item_doc.get("quantity") or 0
+				)
+
+			if paid_qty <= 0 or not matching_lines:
+				continue
+
+			granted = allocate_gift_pool_free_items(
+				paid_qty, pool_codes, qtys.get(item_group, 1)
+			)
+			if not granted:
+				continue
+
+			for item_doc in matching_lines:
+				append_pricing_rule(item_doc, rule_name)
+
+			for gift_code, gift_qty in granted.items():
+				existing = free_items_map.get((gift_code, rule_name))
+				if existing:
+					existing.qty = _floor_free_item_qty(flt(existing.get("qty")) + gift_qty)
+				else:
+					free_items_map[(gift_code, rule_name)] = _make_free_item_doc(
+						gift_code,
+						gift_qty,
+						rule_name,
+						full_rule,
+						promotional_scheme,
+					)
+			rule_gave_free = True
+
+		if not rule_gave_free and applied_rules is not None:
+			applied_rules.discard(rule_name)
 
 
 # ==========================================
@@ -1340,7 +1436,7 @@ def apply_offers(invoice_data, selected_offers=None):
 				rule_name = free_item.get("pricing_rules")
 				if not rule_name or rule_name not in rule_map:
 					continue
-				if rule_promotion_type(rule_map[rule_name]) == PROMOTION_TYPE_GWP:
+				if rule_promotion_type(rule_map[rule_name]) in (PROMOTION_TYPE_GWP, PROMOTION_TYPE_GIFT_POOL):
 					continue
 				free_item_doc = frappe._dict(free_item)
 				free_item_doc.qty = _floor_free_item_qty(free_item_doc.get("qty"))
@@ -1442,6 +1538,7 @@ def apply_offers(invoice_data, selected_offers=None):
 		)
 		_apply_bundled_same_item_free_discounts(prepared_items, free_items_map, rule_map)
 		_apply_gwp_line_discounts(prepared_items, free_items_map, rule_map)
+		_apply_gift_pool_free_items(prepared_items, free_items_map, rule_map, applied_rules)
 
 		if mark_item_discount_flags:
 			# Same neutralised view the pipeline used. With the raw map an

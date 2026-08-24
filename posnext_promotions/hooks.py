@@ -31,6 +31,7 @@ override_whitelisted_methods = {
 	"pos_next.api.promotions.update_coupon": "posnext_promotions.api.promotions.update_coupon",
 	"pos_next.api.promotions.toggle_coupon": "posnext_promotions.api.promotions.toggle_coupon",
 	"pos_next.api.promotions.delete_coupon": "posnext_promotions.api.promotions.delete_coupon",
+	"pos_next.api.gift_pool.gift_pool_item_query": "posnext_promotions.api.gift_pool.gift_pool_item_query",
 }
 
 extend_bootinfo = "posnext_promotions.boot.extend"
@@ -50,10 +51,12 @@ doc_events = {
 		"before_validate": [
 			"posnext_promotions.promotions.schedule.normalize_schedule_fields",
 			"posnext_promotions.overrides.pricing_rule.normalize_accumulative_scheme",
+			"posnext_promotions.overrides.pricing_rule.normalize_gift_pool_scheme",
 		],
 		"validate": [
 			"posnext_promotions.overrides.pricing_rule.enforce_cross_cart_pricing_config",
 			"posnext_promotions.overrides.pricing_rule.validate_unique_promotion_type_per_item",
+			"posnext_promotions.overrides.pricing_rule.validate_gift_pool_scheme",
 		],
 		"on_update": "posnext_promotions.overrides.pricing_rule.sync_promotion_fields_to_pricing_rules",
 	},

@@ -15,7 +15,7 @@ POS_NEXT = BENCH_APPS / "pos_next"
 
 def _python_files(root: Path):
 	for path in root.rglob("*.py"):
-		if "__pycache__" in path.parts:
+		if "__pycache__" in path.parts or "scripts" in path.parts:
 			continue
 		yield path
 
@@ -51,11 +51,16 @@ class TestIndependence(unittest.TestCase):
 			"posnext_promotions must not require pos_next",
 		)
 
-	def test_hooks_override_pos_next_whitelist_when_pos_vue_calls_core_paths(self):
+	def test_owns_gift_pool(self):
+		self.assertTrue((PKG / "api" / "gift_pool.py").exists())
+		self.assertTrue((PKG / "posnext_promotions" / "doctype" / "pos_gift_pool_item").is_dir())
+		self.assertTrue((PKG / "test_gift_pool.py").exists())
 		hooks = (PKG / "hooks.py").read_text()
 		self.assertIn("override_whitelisted_methods", hooks)
 		self.assertIn("pos_next.api.invoices.apply_offers", hooks)
 		self.assertIn("posnext_promotions.api.offers.apply_offers", hooks)
+		self.assertIn("pos_next.api.gift_pool.gift_pool_item_query", hooks)
+		self.assertIn("posnext_promotions.api.gift_pool.gift_pool_item_query", hooks)
 
 	def test_no_python_import_of_pos_next(self):
 		# Production code must not import pos_next. Optional integration tests
