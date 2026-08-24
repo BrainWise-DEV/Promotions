@@ -250,17 +250,42 @@ function pn_open_gift_pool_item_picker(frm) {
 	const prefill_group = rows.find((row) => row.item_group)?.item_group || "";
 
 	let picker;
+	const refresh_picker_results = () => {
+		if (!picker?.dialog) {
+			return;
+		}
+		frappe.flags.auto_scroll = false;
+		picker.page_length = 20;
+		if (typeof picker.empty_list === "function") {
+			picker.empty_list();
+		}
+		picker.get_results();
+	};
+
+	const current_item_group = () =>
+		picker?.dialog?.fields_dict?.item_group?.get_value?.() || "";
+
+	// Use array setters so we can attach onchange. Object-style setters only copy
+	// fieldtype/label/options/default — Link selection does not reliably fire the
+	// dialog's jQuery "change" listener, so the item list stayed stale.
 	picker = new frappe.ui.form.MultiSelectDialog({
 		doctype: "Item",
 		target: frm,
 		add_filters_group: 0,
-		setters: {
-			item_group: prefill_group || null,
-		},
+		setters: [
+			{
+				fieldtype: "Link",
+				options: "Item Group",
+				label: __("Item Group"),
+				fieldname: "item_group",
+				default: prefill_group || undefined,
+				reqd: 1,
+				onchange: refresh_picker_results,
+			},
+		],
 		primary_action_label: __("Add"),
 		get_query() {
-			const item_group =
-				picker?.dialog?.fields_dict?.item_group?.get_value?.() || prefill_group;
+			const item_group = current_item_group();
 			const filters = {
 				disabled: 0,
 				has_variants: 0,
@@ -270,13 +295,12 @@ function pn_open_gift_pool_item_picker(frm) {
 				filters.item_group = item_group;
 			}
 			return {
-				query: "erpnext.controllers.queries.item_query",
+				query: "posnext_promotions.api.gift_pool.gift_pool_item_query",
 				filters,
 			};
 		},
 		action(selections) {
-			const item_group =
-				picker.dialog.fields_dict.item_group.get_value() || prefill_group;
+			const item_group = current_item_group();
 			if (!item_group) {
 				frappe.msgprint(__("Please select an Item Group"));
 				return;
