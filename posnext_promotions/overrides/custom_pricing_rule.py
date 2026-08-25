@@ -35,7 +35,7 @@ class CustomPricingRule(PricingRule):
 			and not self.free_item
 			and (self._is_gwp_promotion() or self._is_gift_pool_promotion())
 		):
-			# GWP discounts the purchased line(s), not a separate free item.
+			# GWP same-SKU grants a separate free row for the extra scanned unit.
 			# Gift Pool grants from an ordered pool, so free_item may be empty
 			# until the scheme's first pool SKU is synced onto the rule.
 			if self._is_gwp_promotion() and not self.mixed_conditions and not self.get("same_item"):

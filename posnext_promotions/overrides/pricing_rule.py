@@ -114,8 +114,9 @@ def sync_promotion_fields_to_pricing_rules(doc, method=None):
 
 	sync_scope_percentages_to_pricing_rules(doc)
 
-	# GWP rules discount the purchased line(s), so same_item must stay 1.
-	# Non-GWP product discounts must keep the slab's same_item / free_item as configured.
+			# GWP same-SKU grants a separate free row (the extra scanned unit),
+			# so same_item must stay 1. Mixed-SKU GWP still discounts paid lines.
+			# Non-GWP product discounts must keep the slab's same_item / free_item as configured.
 	if frappe.db.has_column("Pricing Rule", "gwp_paid_qty_basis"):
 		from posnext_promotions.api.gwp import GWP_BASIS_MAX
 

@@ -10,6 +10,7 @@ from posnext_promotions.api.gwp import (
 	calculate_gwp_discount_percentage,
 	distribute_gwp_free_units_by_price,
 	distribute_gwp_free_units_for_basis,
+	get_gwp_same_item_free_qty,
 	get_gwp_slab_free_qty,
 	is_gwp_total_qty_eligible,
 	item_matches_pricing_rule_apply_on,
@@ -33,6 +34,13 @@ class TestGwpDiscount(unittest.TestCase):
 	def test_slab_free_qty(self):
 		self.assertEqual(get_gwp_slab_free_qty(2, 4, 4, 4), 2)
 		self.assertEqual(get_gwp_slab_free_qty(2, 3, 4, 4), 0)
+
+	def test_same_item_requires_extra_scanned_qty(self):
+		# Buy 2 get 1 free: 2 scans are not enough; 3 scans grant 1 free.
+		self.assertEqual(get_gwp_same_item_free_qty(1, 2, 2, 0), 0)
+		self.assertEqual(get_gwp_same_item_free_qty(1, 3, 2, 0), 1)
+		self.assertEqual(get_gwp_same_item_free_qty(1, 3, 2, 2), 1)
+		self.assertEqual(get_gwp_same_item_free_qty(1, 4, 2, 2), 0)
 
 	def test_distribute_max_basis_on_cheapest(self):
 		self.assertEqual(

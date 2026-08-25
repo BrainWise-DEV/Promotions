@@ -34,7 +34,7 @@ import unittest
 import frappe
 from erpnext.stock.doctype.stock_entry.test_stock_entry import make_stock_entry
 from frappe.tests.utils import FrappeTestCase
-from frappe.utils import add_days, flt, nowdate
+from frappe.utils import add_days, cint, flt, nowdate
 
 import posnext_promotions  # noqa: F401 — ensure app hooks load.
 from posnext_promotions.api.offers import apply_offers
@@ -550,10 +550,28 @@ def _apply_offers_and_stamp(payload, selected_offers):
 			)
 
 	for fi in resp.get("free_items") or []:
+		fq = flt(fi.get("qty") or 0)
+		# Same-SKU GWP free units are extra scanned items: carve them off the paid line
+		# so submit qty stays at 2 paid + 1 free (not 3 paid + 1 free).
+		if cint(fi.get("gwp_same_item_row")) and fq > 0:
+			remaining = fq
+			for target in payload["items"]:
+				if target.get("is_free_item"):
+					continue
+				if target.get("item_code") != fi.get("item_code"):
+					continue
+				paid_qty = flt(target.get("qty") or 0)
+				take = min(paid_qty, remaining)
+				if take <= 0:
+					continue
+				target["qty"] = paid_qty - take
+				remaining -= take
+				if remaining <= 0:
+					break
 		payload["items"].append(
 			{
 				"item_code": fi.get("item_code"),
-				"qty": flt(fi.get("qty") or 0),
+				"qty": fq,
 				"rate": 0,
 				"price_list_rate": 0,
 				"uom": fi.get("uom") or fi.get("stock_uom") or "Nos",
@@ -791,6 +809,54 @@ class TestPromotions(FrappeTestCase):
 		free_lines = [it for it in final.items if it.is_free_item]
 		self.assertEqual(len(free_lines), 1)
 		self.assertEqual(free_lines[0].item_code, ITEM_C)
+
+	def test_gwp_same_item_requires_extra_scan(self):
+		"""Buy 2 get 1 free of the same SKU: 2 scans do not grant; 3 scans add a free row."""
+		import json
+
+		rule = _make_rule(
+			"_PNXT_TEST_GWP_SameItemScan",
+			apply_on="Item Code",
+			items=[{"item_code": ITEM_A}],
+			price_or_product_discount="Product",
+			rate_or_discount="Discount Percentage",
+			same_item=1,
+			min_qty=2,
+			free_qty=1,
+			free_item_uom="Nos",
+			free_item_rate=0,
+			promotion_type="GWP",
+		)
+		two_scans = _cart_payload(self.ctx, [_line(self.ctx, ITEM_A, qty=2)])
+		resp_two = apply_offers(
+			invoice_data=json.dumps(two_scans),
+			selected_offers=json.dumps([rule]),
+		)
+		self.assertEqual(resp_two.get("free_items") or [], [])
+		self.assertEqual(flt(resp_two["items"][0].get("gwp_free_qty") or 0), 0)
+		self.assertNotIn(rule, resp_two.get("applied_pricing_rules") or [])
+
+		three_scans = _cart_payload(self.ctx, [_line(self.ctx, ITEM_A, qty=3)])
+		resp_three = _apply_offers_and_stamp(three_scans, [rule])
+		free_items = resp_three.get("free_items") or []
+		self.assertEqual(len(free_items), 1)
+		self.assertEqual(free_items[0].get("item_code"), ITEM_A)
+		self.assertEqual(flt(free_items[0].get("qty")), 1)
+		self.assertEqual(cint(free_items[0].get("gwp_same_item_row")), 1)
+		self.assertEqual(cint(free_items[0].get("is_free_item")), 1)
+
+		# ITEM_A is 50/unit. 2 paid + 1 free → 100.
+		final = _submit_invoice(self.ctx, three_scans, paid_amount=100)
+		self.assertEqual(final.status, "Paid")
+		self.assertAlmostEqual(flt(final.grand_total), 100, places=2)
+
+		paid_lines = [it for it in final.items if not it.is_free_item and it.item_code == ITEM_A]
+		free_lines = [it for it in final.items if it.is_free_item and it.item_code == ITEM_A]
+		self.assertEqual(len(paid_lines), 1)
+		self.assertAlmostEqual(flt(paid_lines[0].qty), 2, places=2)
+		self.assertEqual(len(free_lines), 1)
+		self.assertAlmostEqual(flt(free_lines[0].qty), 1, places=2)
+		self.assertAlmostEqual(flt(free_lines[0].rate), 0, places=2)
 
 	def test_gwp_many_items_max_basis(self):
 		"""Buy 4 across two items; 2 free on cheapest lines when Max basis."""
@@ -1684,7 +1750,7 @@ class TestPromotions(FrappeTestCase):
 			self.ctx,
 			[
 				_line(self.ctx, ITEM_A, qty=1),
-				_line(self.ctx, ITEM_B, qty=2),
+				_line(self.ctx, ITEM_B, qty=3),
 			],
 		)
 		resp = apply_offers(
@@ -1693,7 +1759,14 @@ class TestPromotions(FrappeTestCase):
 		)
 		self.assertTrue(resp["items"][0].get("is_already_discounted"))
 		item_b = next(it for it in resp["items"] if it.get("item_code") == ITEM_B)
-		self.assertGreater(flt(item_b.get("gwp_free_qty") or item_b.get("discount_amount") or 0), 0)
+		self.assertEqual(flt(item_b.get("gwp_free_qty") or 0), 0)
+		free_b = [
+			row
+			for row in (resp.get("free_items") or [])
+			if row.get("item_code") == ITEM_B
+		]
+		self.assertEqual(len(free_b), 1)
+		self.assertEqual(flt(free_b[0].get("qty")), 1)
 
 
 class TestPromotionMatrix14214(FrappeTestCase):
@@ -1883,7 +1956,7 @@ class TestPromotionMatrix14214(FrappeTestCase):
 			self.ctx,
 			[
 				self._line_14214(MATRIX_ITEM_14214, qty=1),
-				self._line_14214(companion, qty=2),
+				self._line_14214(companion, qty=3),
 			],
 		)
 		resp = apply_offers(
@@ -1892,9 +1965,14 @@ class TestPromotionMatrix14214(FrappeTestCase):
 		)
 		self.assertTrue(resp["items"][0].get("is_already_discounted"))
 		companion_line = next(it for it in resp["items"] if it.get("item_code") == companion)
-		self.assertGreater(
-			flt(companion_line.get("gwp_free_qty") or companion_line.get("discount_amount") or 0), 0
-		)
+		self.assertEqual(flt(companion_line.get("gwp_free_qty") or 0), 0)
+		free_companion = [
+			row
+			for row in (resp.get("free_items") or [])
+			if row.get("item_code") == companion
+		]
+		self.assertEqual(len(free_companion), 1)
+		self.assertEqual(flt(free_companion[0].get("qty")), 1)
 
 
 class TestPricingRuleScope(FrappeTestCase):

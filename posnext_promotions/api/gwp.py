@@ -134,6 +134,30 @@ def get_gwp_slab_free_qty(slab_free_qty, total_qty, min_qty, max_qty):
 	return max(0, int(math.floor(min(free_qty, total_qty))))
 
 
+def get_gwp_same_item_free_qty(slab_free_qty, total_qty, min_qty, max_qty):
+	"""Free units for same-SKU GWP that must be extra scanned, not carved from min_qty.
+
+	Buy 2 get 1 free (min_qty=2, free_qty=1) needs 3 scanned units: 2 paid + 1 free.
+	Paid qty after the gift is granted must stay within [min_qty, max_qty].
+	"""
+	free_qty = max(0, int(math.floor(flt(slab_free_qty))))
+	total_qty = flt(total_qty)
+	min_qty = flt(min_qty)
+	max_qty = flt(max_qty)
+	if free_qty <= 0 or total_qty <= 0:
+		return 0
+	if total_qty < min_qty + free_qty:
+		return 0
+	paid_qty = total_qty - free_qty
+	if paid_qty <= 0:
+		return 0
+	if min_qty > 0 and paid_qty < min_qty:
+		return 0
+	if max_qty > 0 and paid_qty > max_qty:
+		return 0
+	return min(free_qty, int(math.floor(total_qty)))
+
+
 def normalize_gwp_paid_qty_basis(paid_qty_basis):
 	"""Return the canonical basis value, accepting legacy Min/Max Qty labels."""
 	basis = (paid_qty_basis or GWP_BASIS_MAX).strip()

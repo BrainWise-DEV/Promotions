@@ -55,6 +55,7 @@ try:
 		PROMOTION_TYPE_GWP,
 		calculate_gwp_discount_amount,
 		distribute_gwp_free_units_for_basis,
+		get_gwp_same_item_free_qty,
 		get_gwp_slab_free_qty,
 		item_matches_pricing_rule_apply_on,
 		should_aggregate_gwp_quantities,
@@ -84,6 +85,7 @@ except Exception:  # pragma: no cover
 	PROMOTION_TYPE_GIFT_POOL = "Gift Pool"
 	calculate_gwp_discount_amount = None
 	get_gwp_slab_free_qty = None
+	get_gwp_same_item_free_qty = None
 	distribute_gwp_free_units_for_basis = None
 	should_aggregate_gwp_quantities = None
 	item_matches_pricing_rule_apply_on = None
@@ -163,27 +165,27 @@ def _stamp_bundled_same_item_free_discount(item_doc, line_free_qty, price_list_r
 	item_doc.rate = flt(price_list_rate - (line_discount / purchased_qty))
 
 
-def _make_free_item_doc(item_code, qty, rule_name, full_rule, promotional_scheme=None):
+def _make_free_item_doc(item_code, qty, rule_name, full_rule, promotional_scheme=None, **extra):
 	"""Build a free-item payload for ``free_items_map``."""
 	item_data = frappe.get_cached_value(
 		"Item", item_code, ["item_name", "description", "stock_uom"], as_dict=1
 	) or {}
 	uom = full_rule.free_item_uom or item_data.get("stock_uom") or "Nos"
-	return frappe._dict(
-		{
-			"item_code": item_code,
-			"item_name": item_data.get("item_name") or item_code,
-			"description": item_data.get("description"),
-			"qty": _floor_free_item_qty(qty),
-			"pricing_rules": rule_name,
-			"rate": flt(full_rule.free_item_rate or 0),
-			"price_list_rate": flt(full_rule.free_item_rate or 0),
-			"is_free_item": 1,
-			"uom": uom,
-			"stock_uom": item_data.get("stock_uom") or uom,
-			"applied_promotional_scheme": promotional_scheme,
-		}
-	)
+	payload = {
+		"item_code": item_code,
+		"item_name": item_data.get("item_name") or item_code,
+		"description": item_data.get("description"),
+		"qty": _floor_free_item_qty(qty),
+		"pricing_rules": rule_name,
+		"rate": flt(full_rule.free_item_rate or 0),
+		"price_list_rate": flt(full_rule.free_item_rate or 0),
+		"is_free_item": 1,
+		"uom": uom,
+		"stock_uom": item_data.get("stock_uom") or uom,
+		"applied_promotional_scheme": promotional_scheme,
+	}
+	payload.update(extra)
+	return frappe._dict(payload)
 
 
 def _recompute_recursive_product_free_items(prepared_items, free_items_map, rule_map, applied_rules=None) -> None:
@@ -380,12 +382,16 @@ def _apply_bundled_same_item_free_discounts(prepared_items, free_items_map, rule
 			break
 
 
-def _apply_gwp_line_discounts(prepared_items, free_items_map, rule_map) -> None:
-	"""Apply GWP line discounts from slab free_qty and paid-qty basis.
+def _apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_rules=None) -> None:
+	"""Apply GWP: same-SKU gifts as a free row; mixed SKUs as line discounts.
 
-	Multi-item / item-group: total qty must fall between min_qty and max_qty;
-	free_qty is discounted on cheapest (Max Price basis) or most expensive (Min Price basis) lines.
-	Single item code: free_qty applies on that line when qty is in range.
+	Same item (one SKU in the cart): free units must be extra scanned items,
+	not carved from min_qty. Buy 2 get 1 free requires 3 scans — 2 paid + 1
+	free row with a free-item badge.
+
+	Multi-item / item-group with mixed SKUs: total qty must fall between
+	min_qty and max_qty; free_qty is discounted on cheapest (Max Price basis)
+	or most expensive (Min Price basis) lines.
 	"""
 	if not calculate_gwp_discount_amount or not get_gwp_slab_free_qty:
 		return
@@ -407,22 +413,60 @@ def _apply_gwp_line_discounts(prepared_items, free_items_map, rule_map) -> None:
 		aggregate = should_aggregate_gwp_quantities(full_rule.apply_on, scheme_item_count)
 		paid_qty_basis = full_rule.get("gwp_paid_qty_basis") or GWP_BASIS_MAX
 		slab_free_qty = flt(full_rule.free_qty or 0)
+		promotional_scheme = rule_map[rule_name].get("promotional_scheme")
 
-		if aggregate:
-			matching_lines = [
-				item_doc
-				for item_doc in prepared_items
-				if _item_matches_gwp_rule(item_doc, full_rule)
-			]
-			if not matching_lines:
-				continue
+		matching_lines = [
+			item_doc
+			for item_doc in prepared_items
+			if _item_matches_pricing_rule(item_doc, full_rule)
+		]
+		if not matching_lines:
+			continue
 
+		paid_lines = [item_doc for item_doc in matching_lines if not item_doc.get("is_free_item")]
+		if not paid_lines:
+			continue
+
+		item_codes = {cstr(item_doc.get("item_code")) for item_doc in matching_lines if item_doc.get("item_code")}
+		same_item_split = len(item_codes) == 1 and bool(get_gwp_same_item_free_qty)
+
+		if same_item_split:
 			line_qtys = [
 				flt(item_doc.get("qty") or item_doc.get("quantity") or 0) for item_doc in matching_lines
 			]
+			total_qty = sum(line_qtys)
+			total_free = get_gwp_same_item_free_qty(
+				slab_free_qty, total_qty, full_rule.min_qty, full_rule.max_qty
+			)
+			if total_free <= 0:
+				for item_doc in paid_lines:
+					remove_pricing_rule(item_doc, rule_name)
+				if applied_rules is not None:
+					applied_rules.discard(rule_name)
+				continue
+
+			gift_code = next(iter(item_codes))
+			for item_doc in paid_lines:
+				append_pricing_rule(item_doc, rule_name)
+
+			free_items_map[(gift_code, rule_name)] = _make_free_item_doc(
+				gift_code,
+				total_free,
+				rule_name,
+				full_rule,
+				promotional_scheme,
+				discount_source=DISCOUNT_SOURCE_GWP,
+				gwp_same_item_row=1,
+			)
+			continue
+
+		if aggregate:
+			line_qtys = [
+				flt(item_doc.get("qty") or item_doc.get("quantity") or 0) for item_doc in paid_lines
+			]
 			line_prices = [
 				flt(item_doc.get("price_list_rate") or item_doc.get("rate") or 0)
-				for item_doc in matching_lines
+				for item_doc in paid_lines
 			]
 			total_qty = sum(line_qtys)
 			total_free = get_gwp_slab_free_qty(
@@ -434,7 +478,7 @@ def _apply_gwp_line_discounts(prepared_items, free_items_map, rule_map) -> None:
 			free_per_line = distribute_gwp_free_units_for_basis(
 				line_qtys, line_prices, total_free, paid_qty_basis
 			)
-			for item_doc, line_free in zip(matching_lines, free_per_line, strict=False):
+			for item_doc, line_free in zip(paid_lines, free_per_line, strict=False):
 				append_pricing_rule(item_doc, rule_name)
 				if line_free <= 0:
 					continue
@@ -447,11 +491,9 @@ def _apply_gwp_line_discounts(prepared_items, free_items_map, rule_map) -> None:
 		if slab_free_qty <= 0:
 			continue
 
-		for item_doc in prepared_items:
-			if item_doc.get("is_free_item"):
-				continue
-			if not _item_matches_gwp_rule(item_doc, full_rule) and rule_name not in _item_pricing_rule_names(
-				item_doc
+		for item_doc in paid_lines:
+			if rule_name not in _item_pricing_rule_names(item_doc) and not _item_matches_gwp_rule(
+				item_doc, full_rule
 			):
 				continue
 
@@ -722,6 +764,10 @@ def _filter_out_of_stock_free_items(
 			leftover[stock_key] = available - paid_demand.get(stock_key, 0)
 
 		if leftover[stock_key] < requested:
+			# Same-SKU GWP free units are carved from already-scanned paid qty,
+			# so they do not need extra warehouse stock beyond the paid demand.
+			if cint(free_doc.get("gwp_same_item_row")) and paid_demand.get(stock_key, 0) >= requested:
+				continue
 			free_items_map.pop(key, None)
 			skipped.append(
 				{
@@ -1062,7 +1108,7 @@ def apply_offers(invoice_data, selected_offers=None):
 			item_code = item.get("item_code")
 			qty = flt(item.get("qty") or item.get("quantity") or 0)
 
-			if not item_code or qty <= 0 or item.get("is_free_item"):
+			if not item_code or qty <= 0:
 				continue
 
 			# Use batch-fetched item details
@@ -1082,6 +1128,9 @@ def apply_offers(invoice_data, selected_offers=None):
 					item.item_group = cached.item_group
 				if not item.get("brand"):
 					item.brand = cached.brand
+
+			if item.get("is_free_item"):
+				continue
 
 			conversion_factor = flt(item.get("conversion_factor") or 1) or 1
 			price_list_rate = flt(item.get("price_list_rate") or item.get("rate") or 0)
@@ -1537,7 +1586,7 @@ def apply_offers(invoice_data, selected_offers=None):
 			prepared_items, free_items_map, rule_map, applied_rules
 		)
 		_apply_bundled_same_item_free_discounts(prepared_items, free_items_map, rule_map)
-		_apply_gwp_line_discounts(prepared_items, free_items_map, rule_map)
+		_apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_rules)
 		_apply_gift_pool_free_items(prepared_items, free_items_map, rule_map, applied_rules)
 
 		if mark_item_discount_flags:
