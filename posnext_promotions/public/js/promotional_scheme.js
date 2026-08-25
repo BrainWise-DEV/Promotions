@@ -164,7 +164,8 @@ function pn_toggle_gift_pool_fields(frm) {
 			"description",
 			__(
 				"Use <b>Select Multiple Items</b> to pick an item group and several free items at once. " +
-					"<b>Free Qty</b> is the total free units (default 1), spread across those item codes in list order."
+					"<b>Free Qty</b> is the total free units (default 1), spread across those item codes in list order. " +
+					"If the first free item is out of stock, the next in-stock item in the list is given instead."
 			)
 		);
 		frm.set_df_property("apply_on", "read_only", 1);

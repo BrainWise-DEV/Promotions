@@ -511,12 +511,39 @@ def _apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_
 			append_pricing_rule(item_doc, rule_name)
 
 
-def _apply_gift_pool_free_items(prepared_items, free_items_map, rule_map, applied_rules=None) -> None:
+def _gift_pool_available_qty(pool_codes, warehouse, paid_items, pos_profile):
+	"""Remaining warehouse qty per pool item after paid cart demand.
+
+	Returns ``None`` when stock should not constrain gifts (negative stock
+	allowed, or no warehouse). Missing keys mean unlimited stock (non-stock
+	or allow-negative items).
+	"""
+	if not warehouse or not _should_block(pos_profile):
+		return None
+
+	allowed_negative = _get_item_negative_stock_allow_set(
+		[{"item_code": code} for code in pool_codes]
+		+ [{"item_code": item.get("item_code")} for item in (paid_items or [])]
+	)
+	paid_demand = _paid_stock_demand_by_item_warehouse(paid_items, warehouse)
+	available = {}
+	for code in pool_codes:
+		if not code or not _item_is_stock_item(code) or code in allowed_negative:
+			continue
+		stock = _get_available_stock({"item_code": code, "warehouse": warehouse})
+		available[code] = stock - paid_demand.get((code, warehouse), 0)
+	return available
+
+
+def _apply_gift_pool_free_items(
+	prepared_items, free_items_map, rule_map, applied_rules=None, warehouse=None, pos_profile=None
+) -> None:
 	"""Replace ERPNext's single free_item with the ordered Gift Pool.
 
 	For each configured item group: paid units are items in that group that are
 	not in the pool. Any paid quantity grants a total of ``free_qty`` units
 	spread across the pool item codes — not one free unit per paid unit.
+	Out-of-stock pool items are skipped so the next in-stock code is granted.
 	"""
 	if not allocate_gift_pool_free_items or not get_scheme_gift_pools:
 		return
@@ -569,7 +596,12 @@ def _apply_gift_pool_free_items(prepared_items, free_items_map, rule_map, applie
 				continue
 
 			granted = allocate_gift_pool_free_items(
-				paid_qty, pool_codes, qtys.get(item_group, 1)
+				paid_qty,
+				pool_codes,
+				qtys.get(item_group, 1),
+				available_qty=_gift_pool_available_qty(
+					pool_codes, warehouse, prepared_items, pos_profile
+				),
 			)
 			if not granted:
 				continue
@@ -1587,7 +1619,14 @@ def apply_offers(invoice_data, selected_offers=None):
 		)
 		_apply_bundled_same_item_free_discounts(prepared_items, free_items_map, rule_map)
 		_apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_rules)
-		_apply_gift_pool_free_items(prepared_items, free_items_map, rule_map, applied_rules)
+		_apply_gift_pool_free_items(
+			prepared_items,
+			free_items_map,
+			rule_map,
+			applied_rules,
+			warehouse=profile.warehouse,
+			pos_profile=invoice.get("pos_profile"),
+		)
 
 		if mark_item_discount_flags:
 			# Same neutralised view the pipeline used. With the raw map an

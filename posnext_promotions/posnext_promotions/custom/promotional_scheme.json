@@ -846,7 +846,7 @@
    "creation": "2026-08-20 12:00:00.000000",
    "default": null,
    "depends_on": "eval:doc.promotion_type == 'Gift Pool'",
-   "description": "Pick an item group, then add one or more free items from that group. Set Free Qty as the total free units (default 1). They are given in list order across all free item codes.",
+   "description": "Pick an item group, then add one or more free items from that group. Set Free Qty as the total free units (default 1). They are given in list order across all free item codes. If the first free item is out of stock, the next in-stock item in the list is given instead.",
    "docstatus": 0,
    "dt": "Promotional Scheme",
    "fetch_from": null,
