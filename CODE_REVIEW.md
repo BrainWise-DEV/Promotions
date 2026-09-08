@@ -205,8 +205,9 @@ Both contradict the autoname three lines above one of them.
 **Fix:** introduce a single `make_redemption_key(customer, pricing_rule)` helper, stop
 formatting keys at call sites, add a unique database constraint on the semantic fields, treat
 `name` as an implementation detail, correct both docstrings, and add a cross-repository
-contract test. Migration must detect both one- and two-colon historical rows and check for
-duplicates before normalising.
+contract test. Migration enforces uniqueness on `customer + pricing_rule` after checking for semantic
+duplicates. No name normalisation: `frappe/model/naming.py:565-583` proves two-colon names
+cannot be generated.
 
 ### 4b. `record_one_time_offer_usage` is unguarded against a missing DocType
 
@@ -570,102 +571,44 @@ README should say that; a reader provisioning a standalone site is currently mis
 
 ---
 
-## Appendix: using this in NexDine
+## Appendix: NexDine
 
-NexDine runs `pos_next` + `hospitality_core` on ERPNext. Adding `posnext_promotions` to that
-bench introduces the following concrete conflicts. Findings 4, 8, 9 and 14 above all bear on this
-too.
+> **REWRITTEN 2026-09-08.** The original appendix reasoned from the premise that NexDine was
+> `pos_next` + `hospitality_core`. That premise was wrong and every conclusion drawn from it
+> has been removed rather than annotated.
 
-### A. Duplicated `doc_events` with `pos_next`
+`nexdine` is an independent restaurant ERP — **368 tracked Python files, 27,543 lines**
+(`git ls-files '*.py' | xargs cat | wc -l` @ `03ebd4b`), a React 19 / TypeScript POS at `/pos`
+(Zustand, Dexie, Vite, Vitest), a Vue 3 kitchen display, and its own analytics.
+`required_apps = ["hrms"]`. It has **no imports, hooks, declared dependency or runtime calls
+into `pos_next`** — only four files mention it, all in comments or docs.
 
-`pos_next/hooks.py:154-181` already registers:
+**It has no dedicated promotions engine or authoring model.** It does have manual additional
+discounts, a TypeScript totals engine (`pos/src/lib/totals/engine.ts`), an inert Pricing Rule
+offer cache, and offline discount operations.
 
-| Hook | `pos_next` | `posnext_promotions` |
-|---|---|---|
-| Sales Invoice `validate` | `overrides.pricing_rule.apply_min_max_price_discounts` | `overrides.pricing_rule.apply_min_max_price_discounts` |
-| Sales Invoice `on_submit` | `sales_invoice_hooks.record_one_time_offer_usage` | `api.one_time_usage.record_one_time_offer_usage` |
-| Sales Invoice `on_cancel` | `sales_invoice_hooks.release_one_time_offer_usage` | `api.one_time_usage.release_one_time_offer_usage` |
-| SO / Quotation / DN / POS Invoice `validate` | `apply_min_max_price_discounts` | `apply_min_max_price_discounts` |
+**It is POS-Invoice-based** — `git grep -o '"POS Invoice"' -- '*.py'` → 178, against 18 for
+`"Sales Invoice"`.
 
-Frappe merges `doc_events` across apps, so **both** run. The min/max duplication is defused by the
-`"pos_next" in get_installed_apps()` guard (finding 14) — a runtime string test, not a design.
-The one-time-usage pair is not guarded: both handlers insert into the same table on every submit
-(the second is absorbed by `ignore_if_duplicate=True`) and **both delete on cancel**. Redundant
-today, ambiguous ownership tomorrow.
+Four blocking issues govern whether this app can serve it. Full analysis is in
+[`docs/superpowers/specs/2026-09-08-promotions-remediation-design.md`](docs/superpowers/specs/2026-09-08-promotions-remediation-design.md)
+and the cross-repository review and its validation under `pos_next/docs/superpowers/specs/`.
 
-### B. Desk JS collides on shared global function names
+1. **The coupon models are incompatible.** POS Invoice has a **native ERPNext** `coupon_code`
+   (`Link` → `Coupon Code`) that ERPNext validates and counts at `pos_invoice.py:230,252,289`.
+   Sales Invoice has no native field; this app adds `coupon_code` as `Data` holding a
+   `POS Coupon` code. Writing one into the other hands ERPNext an unresolvable link. A
+   canonical coupon ADR must close before any hook work.
+2. **Consolidation, not the POS Invoice, produces the accounting document.** POS Invoice Merge
+   Log creates a Sales Invoice (`pos_invoice_merge_log.py:350`) and zeroes `price_list_rate`
+   (`:237`), destroying discount provenance — and it would re-fire this app's Sales Invoice
+   hooks.
+3. **KOT is generated from the client item list**, not the final invoice rows
+   (`nexdine_order.py:745`), so a promotion-added free dish consumes stock without reaching
+   the kitchen.
+4. **Bill splitting drops promotion provenance.** `_copy_item_fields` (`:1003-1021`) copies no
+   `is_free_item`, `pricing_rules` or discount fields.
 
-Both apps register `doctype_js` for `Pricing Rule` and `Promotional Scheme`, and both files
-declare module-scope globals with the same names:
-
-| Global | `pos_next` | `posnext_promotions` |
-|---|---|---|
-| `pn_toggle_min_max` | `public/js/pricing_rule.js:14` | `public/js/pricing_rule.js` |
-| `pn_sync_min_max` | `public/js/promotional_scheme.js:19` | `public/js/promotional_scheme.js` |
-
-Frappe loads both files into the same form bundle. Two `function pn_sync_min_max(frm)` declarations
-in one scope means the later definition silently wins for **both** apps' `refresh` handlers. Which
-one wins is decided by app order in `sites/apps.txt` — the exact ordering dependency the README
-already asks for. The `pos_next` bodies are not equivalent to the `posnext_promotions` ones, so the
-Promotional Scheme form behaves differently depending on install order.
-
-**Fix before shipping to NexDine:** namespace the functions per app
-(`posnext_promotions_sync_min_max`), or delete the `pos_next` copies as part of adopting this app.
-
-### C. `override_doctype_class` on Pricing Rule is a single slot
-
-`posnext_promotions/hooks.py:39` claims `Pricing Rule`. `pos_next/hooks.py:138` claims
-`Sales Invoice`. No clash today. But the slot is exclusive per doctype across the whole bench: if
-NexDine ever needs its own Pricing Rule controller, or a fourth app claims it, the install fails or
-one override silently loses. Worth recording as an owned resource in the NexDine architecture
-notes.
-
-### D. Free items × `hospitality_core` composite items
-
-`hospitality_core/hooks.py` runs `composite_item_utils.process_composite_items_in_invoice` on both
-`POS Invoice` and `Sales Invoice` `on_submit`. It walks `doc.items`, and for anything with
-`is_composite_item` creates a Material Consumption stock entry for the recipe ingredients.
-
-It does not check `is_free_item`.
-
-> **CORRECTED.** This was originally framed as a `hospitality_core` defect. It is not — a free
-> dish genuinely does consume ingredients and genuinely does incur COGS, so consuming stock at a
-> zero-revenue line is the economically correct behaviour. What is missing is a *stated policy*,
-> not a fix.
-
-The policy is now stated in ADR-4 of the design spec: zero customer revenue, normal stock
-consumption, normal COGS, components expanded exactly once, and `is_free_item` provenance
-propagated for reporting without suppressing stock or accounting entries. The open risks are
-double expansion (both apps walking the same rows) and reversal on return or cancel — both of
-which need tests before Gift Pool or GWP is enabled on a NexDine outlet.
-
-### E. Room-charge posting and header-level discounts
-
-`hospitality_core.api.pos_bridge.process_sales_invoice_room_charge` posts on `Sales Invoice`
-`on_submit`. `apply_offers` returns `additional_discount_percentage` / `discount_amount` /
-`apply_discount_on` (`apply_offers.py:1660-1664`) for the **frontend** to apply to the invoice
-header. If the frontend applies them after the folio amount has been computed, or applies them at
-all on a room-charge invoice, the folio and the invoice disagree. Needs an explicit test on the
-room-charge path with a transaction-scope promotion active.
-
-### F. POS Invoice is the gap
-
-Restating finding 9 in NexDine terms: `hospitality_core` uses **POS Invoice** for stock ERPNext POS
-(its `hooks.py` comment says POS Next uses Sales Invoice, POS Invoice is retained for the other
-path). The authorization gate runs on Sales Invoice `before_submit` only. Any NexDine outlet on the
-POS Invoice path gets promotions and min/max discounts, but **no** approval gate on returns,
-discount overrides or price edits.
-
-### Verdict for NexDine
-
-Usable, but not as-is. In order:
-
-1. Fix findings 1, 2, 3, 4 — the money path. Non-negotiable before any till runs it.
-2. Fix 9 and F — extend the gate to POS Invoice, or state in writing that NexDine is Sales-Invoice-only.
-3. Resolve A and B — pick one owner for the duplicated hooks and namespace the desk JS.
-4. Decide D — the accounting treatment for free composite items.
-5. Then 5, 8 and 10.
-
----
-
-*Review performed against `main` @ `70be440`, 2026-09-08.*
+**What NexDine gets right, and this app does not:** it rebuilds every invoice row from
+server-side `Item Price` lookups (`nexdine_order.py:1395-1425`) and never sets
+`ignore_pricing_rule`. The client-trust problem is `pos_next`-specific.

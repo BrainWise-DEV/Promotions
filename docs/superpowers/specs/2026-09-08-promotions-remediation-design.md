@@ -16,10 +16,20 @@
 > If confirmed undeployed, containment becomes a release gate rather than an emergency patch.
 >
 > **Ownership decision:** ⚠️ **REOPENED by NexDine — see ADR-1.** The prior recommendation
-> (`posnext_promotions` as a `pos_next` companion) is **no longer viable**: `nexdine` is a
-> 43,282-LOC restaurant ERP that does **not** use `pos_next` and has **no** promotions surface
-> of its own. Binding promotions to `pos_next` would force every NexDine outlet to install an
-> entire competing POS to get coupons. Option A is eliminated on that ground alone.
+> (`posnext_promotions` as a `pos_next` companion) is **no longer viable**: `nexdine` is an
+> independent restaurant ERP (368 tracked Python files, 27,543 lines) that does **not** use
+> `pos_next` and has **no dedicated promotions engine or authoring model**. Binding promotions
+> to `pos_next` would force every NexDine outlet to install an entire competing POS to get
+> coupons. Option A is eliminated on that ground alone.
+>
+> **Recommendation updated 2026-09-08: adopt Option C directly.** The requirement is now
+> explicitly generic across POS products, Desk, and future channels. Performing Option B and
+> repeating its metadata migration as Option C later pays it twice.
+>
+> **Two ADRs block all POS Invoice work:** the canonical coupon model (POS Invoice's
+> `coupon_code` is a native ERPNext `Link`, not this app's `Data` field) and the authoritative
+> document (POS Invoice Merge Log creates the Sales Invoice that actually carries the
+> accounting). See ADR-6 and the cross-repository validation.
 >
 > **Deployment status is no longer unknown for NexDine.** Its README states it has been
 > "running at scale, serving over 10+ outlets for the past 10 months." Phase 0's inventory
@@ -69,21 +79,25 @@ conflating them is what produced the current design.
 ### NexDine changes the target
 
 `nexdine` is not `pos_next` + `hospitality_core`, as an earlier draft of this analysis
-assumed. It is an independent 43,282-LOC restaurant ERP (370 Python files, its own Vue POS at
-`/pos`, kitchen display, analytics) with `required_apps = ["hrms"]` and **exactly one mention
-of `pos_next` anywhere — in a comment.**
+assumed. It is an independent restaurant ERP — **368 tracked Python files, 27,543 lines**
+(`git ls-files '*.py' | xargs cat | wc -l` @ `03ebd4b`), a **React 19 / TypeScript** POS at
+`/pos` (Zustand, Dexie, Vite, Vitest), a Vue 3 kitchen display, its own analytics —
+`required_apps = ["hrms"]`, with **no imports, hooks, declared dependency or runtime calls
+into `pos_next`** (four files mention it, all comments or docs).
 
 Two facts follow, and both are load-bearing:
 
-1. **NexDine has no promotions surface at all.** Zero coupon, offer, promotion or discount
-   DocTypes or modules. That is why promotions is wanted there.
-2. **NexDine is POS Invoice-based** — 163 `POS Invoice` references against 13 for
-   `Sales Invoice`. `posnext_promotions` is built almost entirely around Sales Invoice.
+1. **NexDine has no dedicated promotions engine or authoring model.** No coupon, offer or
+   promotion DocTypes. It *does* have manual additional discounts, a TypeScript totals engine
+   (`pos/src/lib/totals/engine.ts`) and an inert Pricing Rule offer cache.
+2. **NexDine is POS Invoice-based** — `git grep -o '"POS Invoice"' -- '*.py'` → **178**,
+   against **18** for `"Sales Invoice"`. `posnext_promotions` is Sales-Invoice-native.
 
-The consequence is stark. On a NexDine site, `posnext_promotions` registers **one** hook on
-POS Invoice (`apply_min_max_price_discounts` on `validate`), and that hook self-disables via
-`overrides/pricing_rule.py:714` whenever `pos_next` is installed. **On this bench, the
-promotions app does nothing on NexDine at all.**
+The consequence: `posnext_promotions` provides **no complete NexDine transactional promotion
+lifecycle**. It registers one hook on POS Invoice (`apply_min_max_price_discounts` on
+`validate`); with NexDine alone that handler runs, but on a composed site containing
+`pos_next` it is suppressed by `overrides/pricing_rule.py:714`. Its import-time ERPNext patch
+applies either way.
 
 ---
 
@@ -91,7 +105,9 @@ promotions app does nothing on NexDine at all.**
 
 ### Measured facts
 
-Both apps ship a promotions engine. `posnext_promotions` is a strict functional superset.
+Both apps ship a promotions engine. `posnext_promotions` is a **broader implementation that
+appears intended to supersede** the duplicated one — a wider surface, not proven behavioural
+equivalence. **Contract tests are required before deleting anything.**
 
 | Module | `pos_next` | `posnext_promotions` |
 |---|---|---|
@@ -113,13 +129,13 @@ DocType reference counts (excluding each doctype's own directory):
 
 | DocType | Python refs | Vue refs | Status |
 |---|---|---|---|
-| `POS Offer` | 0 | 0 | **dead** |
-| `POS Offer Detail` | 0 | 0 | **dead** |
-| `POS Coupon Detail` | 0 | 0 | **dead** |
+| `POS Offer` | 0 | 0 | **NOT dead** — linked from `pos_coupon.js` and `workspace/posnext/posnext.json`; the original count searched Python and `POS/src` only |
+| `POS Offer Detail` | 0 | 0 | unreferenced; confirm row counts, Dynamic Links, fixtures and reports before removal |
+| `POS Coupon Detail` | 0 | 0 | as above |
 | `POS Coupon` | 22 | 4 | live |
 | `One Time Customer Offer Usage` | 5 | 0 | live |
 
-The four Vue references are `checkPermission("POS Coupon", …)` in
+The four `pos_next` Vue references are `checkPermission("POS Coupon", …)` in
 `POS/src/composables/usePermissions.js:112-147` — permission strings, not schema.
 
 Precedent for re-homing a DocType between these two apps already exists:
@@ -359,7 +375,25 @@ become indirect mutation paths.
 
 ---
 
-## 7. ADR-6 — POS Invoice parity (NexDine blocker)
+## 7. ADR-6 — POS Invoice integration (NexDine blocker)
+
+> **WITHDRAWN AS "HOOK PARITY", 2026-09-08.** Registering this app's Sales Invoice hooks on
+> POS Invoice is **unsafe** until two prior decisions close:
+>
+> - **The coupon models are incompatible.** POS Invoice has a *native ERPNext* `coupon_code`
+>   (`Link` → `Coupon Code`) that ERPNext validates and counts (`pos_invoice.py:230,252,289`).
+>   Sales Invoice has no native field; this app adds `coupon_code` as `Data` holding a
+>   `POS Coupon` code. Writing one into the other hands ERPNext an unresolvable link, and
+>   NexDine would carry two coupon systems on one document. **A canonical coupon ADR must
+>   close first.**
+> - **Consolidation produces the accounting document.** POS Invoice Merge Log creates a
+>   Sales Invoice (`pos_invoice_merge_log.py:350`), so this app's Sales Invoice hooks re-fire
+>   over already-priced rows, and `price_list_rate` is zeroed at `:237`, destroying discount
+>   provenance. **An authoritative-document ADR must close first.**
+>
+> The gap table below remains accurate as a statement of *what is missing*. The remedy is an
+> **adapter contract**, not hook parity.
+
 
 `posnext_promotions` is Sales-Invoice-native. NexDine is POS-Invoice-native. Today the app
 registers **one** hook on POS Invoice, and it self-disables.
