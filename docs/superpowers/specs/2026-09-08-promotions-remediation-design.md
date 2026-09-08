@@ -15,9 +15,11 @@
 > proves nothing. **Treat as potentially deployed until every environment is inventoried.**
 > If confirmed undeployed, containment becomes a release gate rather than an emergency patch.
 >
-> **Ownership decision:** ⚠️ **OPEN — see ADR-1.** Evidence gathered after the initial
-> recommendation materially changed its inputs. Two options remain live; the decision is
-> a business call about whether a POS with no promotions is a product you ship.
+> **Ownership decision:** `pos_next` continues to own its existing coupon and redemption
+> DocTypes. `posnext_promotions` is an explicit companion for the first production release.
+> A neutral `promotion_core` extraction is revisited only after the money path is tested and
+> stable. **See ADR-1** — the measured duplication (39 duplicated functions, 2,201 LOC)
+> strengthens the eventual case for consolidation without changing this sequencing.
 >
 > **Trust-boundary decision:** `pos_next` owns invoice pricing acceptance.
 > `posnext_promotions` may provide promotion calculations but cannot independently make a
@@ -62,7 +64,7 @@ conflating them is what produced the current design.
 
 ---
 
-## 2. ADR-1 — DocType ownership and dependency direction (OPEN)
+## 2. ADR-1 — DocType ownership and dependency direction
 
 ### Measured facts
 
@@ -133,12 +135,20 @@ base POS product to an optional promotions engine."* The measurement above shows
 is **not optional to `pos_next`** — `pos_next` ships its own. The real choice is **one engine
 or two**, and two is the direct cause of every cross-app defect found.
 
-### Decision criterion
+### Standing recommendation, and what the measurement changes
 
-**Do you ship a till with no discounts, coupons or offers at all?**
+**Option A for the first production release**, with consolidation revisited once the money
+path is tested and stable. Consolidation needs a coordinated two-repo release and live
+metadata migration; that is not a first production fix.
 
-- **Yes** → Option A. The independence is load-bearing and its costs are worth paying.
-- **No** → Option B. The independence is theoretical and is being paid for in defects.
+The measurement does not overturn that sequencing — it corrects its *premise*. The apps
+should not stay separate because promotions is an optional add-on (it is not; `pos_next`
+ships its own engine), but because the migration must follow a stable money path rather than
+precede it. Same destination, honest reason.
+
+**Criterion for the eventual call:** *do you ship a till with no discounts, coupons or offers
+at all?* Yes → Option A permanently, and its costs are worth paying. No → Option B once
+Phase 2 is complete, and the duplication defects are deleted rather than maintained.
 
 ### Deferred: `promotion_core`
 
@@ -328,12 +338,19 @@ Medium and low findings 11–26 carry forward from `CODE_REVIEW.md` unchanged.
 
 **a — make it an invariant, not a fix.** One `make_redemption_key(customer, pricing_rule)`
 helper; no key formatting at call sites; unique DB constraint on semantic fields; treat `name`
-as an implementation detail; migration detection for both one- and two-colon historical rows
-with duplicate checking before normalisation; cross-repository contract tests; and sweep
+as an implementation detail; duplicate checking on the semantic fields before adding the
+constraint; cross-repository contract tests; and sweep
 documentation for copied `::` claims. **The root cause is the docstring at
 `pos_next/api/sales_invoice_hooks.py:119` and the `description` at
 `one_time_customer_offer_usage.json:3`, both of which state the wrong format.** Correct them
 or the next copy repeats the bug.
+
+**Confirmed at framework level, 2026-09-08.** `frappe/model/naming.py:565-583`
+`_format_autoname` strips only the `format:` prefix and substitutes only `{...}` params,
+returning the result verbatim — its docstring states it is *"independent of remaining string
+or separators."* So the name always carries exactly one colon, for every row ever created.
+**Two-colon rows cannot exist**, so migration needs duplicate detection only, not format
+detection.
 
 **b — immutable redemption ledger** (customer, pricing rule, source doctype, source document,
 status, redeemed timestamp, reversed timestamp). `used` becomes a denormalised display value,
@@ -535,7 +552,7 @@ The app may run on a till only when **all** of the following hold:
 
 | # | Decision | Owner | Blocks |
 |---|---|---|---|
-| 1 | **ADR-1** — one engine or two. Criterion: *do you ship a till with no discounts, coupons or offers at all?* | Product | Phase 2 shape; whether defects are fixed or deleted |
+| 1 | **ADR-1** — confirm companion-now / consolidate-later, and the trigger for the latter | Product | Phase 5 shape; whether duplication defects are maintained or deleted |
 | 2 | Deployment inventory | Deployment owner | Phase 0 branch |
 | 3 | Endpoint classification for ADR-5 | Engineering | Authorization hardening scope |
 | 4 | Offline manual-rate-override ceilings and authorization rules | Product + Finance | Phase 3 |
