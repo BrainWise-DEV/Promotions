@@ -4,7 +4,18 @@
 **Date:** 2026-09-08
 **Scope:** `promotion_core` (proposed), `posnext_promotions`, `pos_next`, `nexdine`, `hospitality_core`, ERPNext v15
 **Baselines:** `nexdine@03ebd4b` · `posnext_promotions@70be440` · `pos_next` working tree · ERPNext v15 on bench
+**PR artifact checked:** `BrainWise-DEV/Promotions` PR #1 at `b7ae3b7`
 **Evidence:** static source analysis. **No finding has been reproduced against a live database.** Every figure below carries its reproducing command.
+
+---
+
+## 0. Validation disposition
+
+**Conditionally accepted after correction.** All 19 factual evidence rows in Appendix A were re-derived from the stated source baselines. Architecture recommendations and future-failure scenarios are judgments, not executable facts, and are labelled as decisions, requirements or prospective risks.
+
+Validation changed six material points: NexDine is 42,619 Python LOC rather than 27,543 because the earlier command broke on apostrophe-containing paths; custom one-time recording is not currently performed on POS Invoice, so consolidation double-recording is a naïve-hook-parity risk; Quotation can calculate coupon Pricing Rules but lacks an explicit coupon lifecycle; native `Coupon Code.used` remains the global counter authority; the schema permits shared Pricing Rules while the runtime assumes one coupon per rule; and the inert legacy offline cache should have its NULL predicate fixed but must not be widened into a second contract.
+
+The architecture is ready for decision-making, **not implementation planning**: O1–O7 and the normative-source cleanup in D7 remain explicit gates.
 
 ---
 
@@ -17,22 +28,60 @@
 | **D1** | **Promotions is a generic commercial capability, not a POS feature.** It must serve POS applications, ERPNext Desk documents, APIs, e-commerce and future channels. | NexDine proves the requirement; it is not the centre of it. |
 | **D2** | **No promotions app may depend on a POS application.** Dependencies run from every sales channel *to* the promotions core. | `nexdine` does not use `pos_next` and never will. Binding promotions to `pos_next` would force a competing POS onto every NexDine outlet. |
 | **D3** | **Extract the neutral core directly** as `promotion_core`. Do not re-home DocTypes to `posnext_promotions` first and extract later. | The intermediate step pays the live metadata migration twice. |
-| **D4** | **ERPNext `Coupon Code` is the canonical coupon model.** `POS Coupon` is migrated and retired, not re-homed. | `POS Coupon` duplicates ERPNext concepts — identity, type, customer, validity, usage limits, linked Pricing Rule. Its bridge fields were never maintained. |
+| **D4** | **`promotion_core` owns the coupon model.** A `Promotion Coupon` DocType owned by the core is canonical. ERPNext's native `Coupon Code` is **not** adopted, and its native `coupon_code` field is **never populated** on any document. `POS Coupon` is migrated into `Promotion Coupon` and retired. | Native `Coupon Code` carries three defects the core cannot fix without patching ERPNext (banned by D7-adjacent policy — see F5), wires a lifecycle on only 2 of 5 selling documents, and lacks company, disabled, per-customer limits, scope/exclusions, gift-card balance, stacking and offline-capability semantics. Under any design the redemption ledger is the authority and `used` is a projection, so adopting native bought a code and two dates while inheriting its defects. **No app currently populates native `Coupon Code`, so nothing is lost.** |
 | **D5** | **Free composite/recipe items carry zero revenue, consume stock, and book normal COGS**, with provenance preserved. | Economically correct; `nexdine_recipe_stock` already behaves this way. |
 | **D6** | **Offline: certified-subset only, receipts bind at the collected amount.** Coupons, one-time offers, gift pools, accumulative and stock-dependent gifts are online-only until a reservation design exists. | Preserving a price promised while disconnected is a different invariant from trusting arbitrary browser prices. |
+| **D7** | **This document is the sole normative architecture specification.** | The older `2026-09-08-promotions-remediation-design.md` contains superseded Option B and hook-parity decisions. It must be deleted or reduced to a redirect before PR #1 merges. |
+
+#### D4 invariants
+
+Owning the model is only safe under three rules. Each is a test, not a convention.
+
+**I1 — Never populate native `coupon_code`.** Every ERPNext coupon behaviour is guarded by
+`if self.coupon_code:` (`pos_invoice.py:227,249,286`; `sales_order.py:231,446,480`). Leaving the
+field unset means native validation and counting never fire, so there is exactly one coupon
+system per document. Populating it creates two. Enforce with a validate-time assertion on every
+selling document plus a conformance vector.
+
+**I2 — The core computes coupon discounts; ERPNext's engine will not.**
+`pricing_rule/utils.py:594-602` applies a `coupon_code_based` Pricing Rule **only** when the
+document's native `coupon_code` is set *and* resolves to that exact rule:
+
+```python
+if not d.coupon_code_based:
+    doc.set(field, d.get(pr_field))
+elif doc.get("coupon_code"):
+    coupon_code_pricing_rule = frappe.db.get_value("Coupon Code", doc.get("coupon_code"), "pricing_rule")
+    if coupon_code_pricing_rule == d.name:
+```
+
+Under I1 that branch is unreachable, so coupon-based Pricing Rules are **inert under ERPNext's
+engine by design**. This is a consequence to state, not a defect to fix: the core owns coupon
+calculation end to end (§3.2–3.3). Never set `coupon_code_based = 0` to make the engine apply
+them — the discount would then apply to every cart with no coupon at all.
+
+**I3 — Do not re-implement the defects being avoided.** The three F5 defects are cheap to
+reproduce, and this codebase already reproduced one: `posnext_promotions/api/coupon_engine.py:437`
+carries the identical unlocked read-modify-write. The core must ship an atomic conditional
+`UPDATE` with the ledger as authority, treat `max_uses = 0` as unlimited with an explicit test,
+and enforce customer binding before value is granted.
+
+**Scope of what stays native.** D4 is an exception to §3.6, not a repeal of it. ERPNext keeps
+Pricing Rule and Promotional Scheme for non-coupon promotion mechanics, stock, tax and
+accounting. The exception applies where ERPNext models a **scarce entitlement** — the
+money-critical, concurrency-sensitive part — incompletely.
 
 ### 1.2 Open — in dependency order
 
 | # | Decision | Blocks | Owner |
 |---|---|---|---|
-| **O1** | **Logical transaction identity.** One definition spanning bill splits, POS Invoice consolidation, and the Sales Order → Sales Invoice chain. | F1, F2, F6 — and the redemption ledger's uniqueness key | Engineering |
-| **O2** | **Per-document coupon support matrix.** Which selling documents support coupons; whether Quotation gains enforcement or loses the field. | F3, all adapter work | Product + Engineering |
+| **O1** | **Logical promotion transaction identity and authority.** Define the authoritative Promotion Transaction record spanning bill splits, POS Invoice consolidation, and Sales Order → Sales Invoice; every derived document references it. | F1, F2, F6 — and supplemental redemption uniqueness | Engineering |
+| **O2** | **Per-document coupon lifecycle matrix.** For each selling stage decide resolve, calculate, validate, reserve, consume, reverse, or provenance-only behavior. | F3, all adapter work | Product + Engineering |
 | **O3** | **Coupon → Pricing Rule cardinality**, and the `disabled` mapping that follows from it. | F4, migration safety and runtime cost | Engineering |
-| **O4** | **Authoritative document across consolidation** — which record owns promotion state. | F6, any hook or adapter design | Engineering |
-| **O5** | **Stock-consumption ownership** when NexDine and `hospitality_core` are both installed; whether that combination is a supported product shape. | F7, CI matrix | Product |
-| **O6** | **Deployment inventory.** Which sites run `posnext_promotions`. | containment vs. release-gate sequencing | Deployment owner |
-| **O7** | **Coupon code uniqueness policy** for multi-company sites. | F9, migration | Product |
-| **O8** | **Phase gates and rollback criteria.** | F10, any live migration | Engineering lead |
+| **O4** | **Stock-consumption ownership** when NexDine and `hospitality_core` are both installed; whether that combination is a supported product shape. | F7, CI matrix | Product |
+| **O5** | **Deployment inventory.** Which sites run `posnext_promotions`. | containment vs. release-gate sequencing | Deployment owner |
+| **O6** | **Coupon code uniqueness policy** for multi-company sites. | F9, migration | Product |
+| **O7** | **Phase gates and rollback criteria.** | F10, any live migration | Engineering lead |
 
 **O1 is the keystone.** Three of the highest-severity findings are one missing concept.
 
@@ -40,7 +89,7 @@
 
 Unverified. Repository history cannot establish deployment — Frappe apps are commonly installed from branches, and `posnext_promotions` is absent from this bench's `apps.txt`, which is weak evidence only.
 
-> **Until O6 closes, treat `posnext_promotions` as potentially deployed.**
+> **Until O5 closes, treat `posnext_promotions` as potentially deployed.**
 
 NexDine's README states it has run *"at scale, serving over 10+ outlets for the past 10 months"* — evidence that **NexDine** is live, not that promotions is installed at those outlets.
 
@@ -64,7 +113,7 @@ Two POS products and a promotions engine exist on one bench, with no shared prom
 Measured, with commands:
 
 ```
-nexdine       git ls-files '*.py' | xargs cat | wc -l        →  27,543 across 368 files
+nexdine       git ls-files -z '*.py' | xargs -0 cat | wc -l  →  42,619 across 368 files
 nexdine       git grep -o '"POS Invoice"'   -- '*.py'        →  178
 nexdine       git grep -o '"Sales Invoice"' -- '*.py'        →   18
 duplication   function names present in both pos_next and posnext_promotions  →  39
@@ -164,12 +213,12 @@ posnext_promotions
 
 | Owner | Responsibilities |
 |---|---|
-| **ERPNext** | `Coupon Code` identity, type, customer, validity, `maximum_use`, linked Pricing Rule; Pricing Rule discount mechanics, scope, conditions; POS Invoice's native `coupon_code`; native validation and submit/cancel lifecycle |
-| **`promotion_core`** | eligibility and calculation semantics; immutable entitlement ledger; quote/reserve/consume/reverse; offline bundle contracts; explanation traces and calculation-version persistence; authoring permissions and audit; **extensions to native DocTypes only where ERPNext lacks a capability** |
+| **ERPNext** | Pricing Rule and Promotional Scheme mechanics for **non-coupon** promotions; scope and conditions; stock, tax and accounting. **Native `Coupon Code` and the native `coupon_code` fields are unused under D4/I1** |
+| **`promotion_core`** | **`Promotion Coupon` definition and lifecycle (D4)**; **coupon discount calculation (I2)**; eligibility and calculation semantics; immutable entitlement ledger; quote/reserve/consume/reverse; offline bundle contracts; explanation traces and calculation-version persistence; authoring permissions and audit; extensions to native DocTypes only where ERPNext lacks a capability |
 | **ERPNext adapters** | Quotation, Sales Order, Delivery Note, Sales Invoice, POS Invoice lifecycle translation; document normalization and persistence checks; submit/cancel/amend/return → entitlement events; **consolidation provenance and hook suppression (F6)** |
 | **`pos_next`** | Vue checkout; Sales Invoice construction and authoritative acceptance; **remediation of `ignore_pricing_rule` and frontend price trust**; offline queue and device policy; cart → provider translation |
 | **`nexdine`** | React checkout; POS Invoice construction and authoritative acceptance; branch/order-type/table/room/add-on/aggregator context; KOT from final authoritative lines; recipe stock; split allocation; offline queue and conflict UI |
-| **`hospitality_core`** | hotel composite consumption, subject to O5 |
+| **`hospitality_core`** | hotel composite consumption, subject to O4 |
 
 Neither POS application depends on or imports the other. The core imports neither.
 
@@ -184,9 +233,23 @@ use native ERPNext behavior unchanged
   → add a supplemental record only for a capability ERPNext truly does not model
 ```
 
-The burden of proof falls on every new coupon-related table, field, endpoint and counter. A supplemental `Promotion Redemption` record is permitted **only** for per-customer uniqueness, logical-order and split identity, idempotency and cross-document audit. It is **prohibited** from becoming a second coupon definition or a second mutable usage counter.
+The burden of proof falls on every new table, field, endpoint and counter. Most of the domain
+satisfies this rule natively: Pricing Rule and Promotional Scheme keep non-coupon promotion
+mechanics; stock, tax and accounting stay entirely ERPNext's.
 
-Using ERPNext natively does not mean inheriting its defects — see F5.
+**The rule has one declared exception: scarce entitlements (D4).** Where ERPNext models a
+money-critical, concurrency-sensitive entitlement *incompletely*, reuse imports defects that
+cannot be fixed without patching core. Coupons are the only current instance, and they fail the
+reuse test on four counts — three unfixable defects (F5), lifecycle on 2 of 5 documents (F3),
+missing company/disabled/per-customer/scope/balance/stacking semantics, and no offline
+capability marker.
+
+**The test for any future exception:** does ERPNext model the concept completely enough that
+extension fields suffice, and are its defects fixable without patching core? If either answer
+is no, the core owns it. Otherwise it reuses.
+
+Using ERPNext natively does not mean inheriting its defects — and choosing to own something
+does not license re-implementing them (I3, F5).
 
 ---
 
@@ -198,14 +261,14 @@ Severity-ranked. Every finding carries evidence, the failure it produces, and th
 |---|---|---|---|
 | F1 | No logical transaction identity — splits, consolidation and SO→SI all lose or double-count entitlements | **HIGH** | O1 |
 | F2 | Adapter contract missing; KOT is built from the client item list | **HIGH** | O1, O2 |
-| F3 | Native coupon support covers 2 of 5 selling documents; Quotation is decorative | **HIGH** | O2 |
-| F4 | Coupon → Pricing Rule cardinality unstated; migration can share rules destructively | **HIGH** | O3 |
-| F5 | ERPNext's native coupon services carry three defects | **HIGH** | — |
-| F6 | Consolidation destroys discount provenance and re-fires hooks | **HIGH** | O1, O4 |
-| F7 | Recipe/composite stock-consumption ownership undefined | **HIGH** | O5 |
+| F3 | Coupon lifecycle must be built on all 5 selling documents — native wires only 2 | **HIGH** | O2 |
+| F4 | Coupon → Pricing Rule cardinality — **downgraded to MEDIUM by D4**; now a cost/usability choice, not a migration-safety blocker | MEDIUM | O3 |
+| F5 | Three defects in ERPNext's coupon services — **no longer inherited under D4**; retained as I3 acceptance criteria | **HIGH** | — |
+| F6 | Consolidation destroys discount provenance and can re-fire promotion hooks | **HIGH** | O1 |
+| F7 | Recipe/composite stock-consumption ownership undefined | **HIGH** | O4 |
 | F8 | Currency precision and split allocation unspecified | MEDIUM | O1 |
-| F9 | `coupon_code` is globally unique with no company scope | MEDIUM | O7 |
-| F10 | No phase gates or rollback criteria | MEDIUM | O8 |
+| F9 | `coupon_code` is globally unique with no company scope | MEDIUM | O6 |
+| F10 | No phase gates or rollback criteria | MEDIUM | O7 |
 | F11 | NexDine offline offer cache: NULL dates excluded, no eligibility scope | LOW | — |
 | F12 | `Coupon Code` carries `amended_from` but is not submittable | LOW | — |
 
@@ -219,19 +282,19 @@ Defects internal to `posnext_promotions` are catalogued separately in `CODE_REVI
 
 **(a) Bill splitting.** `nexdine_order.py:1003-1021` `_copy_item_fields` copies 15 fields — `item_code, item_name, qty, rate, price_list_rate, base_price_list_rate, comment, custom_course, cost_center, custom_is_addon, custom_addon_group_id, custom_addon_group, custom_addon_group_name, custom_addon_surcharge, custom_is_default_selection`. **None** is `is_free_item`, `pricing_rules`, `discount_percentage` or `discount_amount`. Splitting destroys promotion provenance; two siblings may each attempt to consume a one-use coupon.
 
-**(b) POS Invoice consolidation.** POS Invoice Merge Log creates a Sales Invoice (`pos_invoice_merge_log.py:350`, recorded at `:160`). `posnext_promotions` registers `record_one_time_offer_usage` on Sales Invoice `on_submit`, so a redemption is recorded at POS Invoice submit **and again** at consolidation. Idempotent today only by accident — composite autoname plus `ignore_if_duplicate=True`.
+**(b) POS Invoice consolidation.** POS Invoice Merge Log creates a Sales Invoice (`pos_invoice_merge_log.py:350`, recorded at `:160`). Today, `posnext_promotions` registers its custom one-time recorder only on Sales Invoice; it does **not** record that ledger on POS Invoice submit. The consolidated Sales Invoice can therefore become the first custom-ledger event if the required provenance survives the merge. Separately, for native-coupon flows, `Coupon Code` consumption occurs on the source POS Invoice. A naïve "hook parity" adapter would add the custom recorder to POS Invoice and then run it again at consolidation. The double-recording claim is therefore a **prospective failure of naïve parity**, not a verified current event.
 
-**(c) Sales Order → Sales Invoice.** ERPNext's Sales Order already increments `used` on submit (`sales_order.py:448`) and decrements on cancel (`:482`). Adding Sales Invoice counting, as §3.5 requires, double-counts:
+**(c) Sales Order → Sales Invoice.** ERPNext's Sales Order already increments `used` on submit (`sales_order.py:448`) and decrements on cancel (`:482`). Blindly adding equivalent Sales Invoice counting during adapter expansion would double-count:
 
-| Flow | Consumption events |
+| Flow | Events under a naïve document-hook adapter |
 |---|---|
 | Quotation → SO → SI | SO submit + SI submit = **2** for one sale |
 | Direct SI, no SO | 1 |
-| POS Invoice → Merge Log → consolidated SI | **2** |
+| POS Invoice → Merge Log → consolidated SI | source consumption + re-fired consolidated-document hook |
 
-ERPNext has no answer because it never implemented Sales Invoice.
+ERPNext's native document hooks do not encode this cross-document identity because Sales Invoice has no coupon lifecycle.
 
-**Required.** Consumption keys on the **logical transaction**, never on a document. Define once: a logical promotion transaction id created at first evaluation, carried onto every derived document, with the redemption ledger unique on `(coupon, logical_transaction)`. Then:
+**Required.** Consumption keys on the **logical transaction**, never on a document. Define once: a logical promotion transaction id created at first evaluation, carried onto every derived document, with supplemental redemption uniqueness on `(entitlement_key, logical_transaction)`. Then:
 
 - Evaluate against the logical original order before a split commits; freeze the calculation and allocate its monetary and free-item effects to siblings.
 - Consume coupon, one-time, gift-pool and cross-cart entitlements **once per logical transaction**.
@@ -252,7 +315,7 @@ The defect is the last step. `nexdine_order.py:745`:
 _run_kot_with_failure_surface(inv, customer, table, items, past_item, comments)
 ```
 
-`items` is the **client** list, passed alongside the authoritative `inv`. A promotion-added free dish exists on the invoice and consumes recipe stock but **never reaches the kitchen**. Hook parity cannot reach this — it is a fulfilment defect, not an accounting one.
+`items` is the **client** list, passed alongside the authoritative `inv`. Under a future adapter that adds a free dish to `inv` without also mutating that client list, the dish would consume recipe stock but **never reach the kitchen**. This is a confirmed integration seam and prospective failure, not evidence that NexDine drops promotional dishes today. Hook parity cannot reach it — it is a fulfilment concern, not an accounting one.
 
 **Required NexDine orchestration:**
 
@@ -272,40 +335,55 @@ Adapter context must carry: company, currency, posting time, POS Profile, price 
 
 The core must not import NexDine. NexDine owns the translation.
 
-### F3 — Native coupon support covers 2 of 5 selling documents · HIGH
+### F3 — Native coupon lifecycle is incomplete across selling documents · HIGH
 
-"Use ERPNext where complete" is the right rule. ERPNext is complete on **two** selling documents, absent on two, and **inconsistent on a third**:
+"Use ERPNext where it already owns the concept" is the right rule. ERPNext has explicit coupon lifecycle wiring on **two** selling documents, no coupon field on two, and calculation without an explicit validation/consumption lifecycle on a third:
 
-| DocType | `coupon_code` field | Native validation | Native counting |
-|---|---|---|---|
-| Sales Order | ✅ | ✅ `sales_order.py:233` | ✅ `:448` used / `:482` cancelled |
-| POS Invoice | ✅ | ✅ `pos_invoice.py:230` | ✅ `:252` used / `:289` cancelled |
-| **Quotation** | ✅ | ❌ none | ❌ none |
-| **Sales Invoice** | ❌ | ❌ | ❌ |
-| **Delivery Note** | ❌ | ❌ | ❌ |
+| DocType | `coupon_code` field | Pricing calculation | Explicit lifecycle validation | Native counting |
+|---|---|---|---|---|
+| Sales Order | ✅ | ✅ | ✅ `sales_order.py:233` | ✅ `:448` used / `:482` cancelled |
+| POS Invoice | ✅ | ✅ | ✅ `pos_invoice.py:230` | ✅ `:252` used / `:289` cancelled |
+| **Quotation** | ✅ | ✅ through Pricing Rule arguments | ❌ no `validate_coupon_code` call | ❌ none — appropriate while it remains a quote |
+| **Sales Invoice** | ❌ | coupon-specific lifecycle absent | ❌ | ❌ |
+| **Delivery Note** | ❌ | coupon-specific lifecycle absent | ❌ | ❌ |
 
-Quotation carries the field with no enforcement anywhere — its only occurrence of the word is the type annotation `coupon_code: DF.Link | None` (`quotation.py:62`). A coupon on a Quotation **displays, is never validated, is never counted**. That actively misleads whoever sets it.
+Quotation is not merely decorative: its `coupon_code` can participate in Pricing Rule calculation through the shared pricing-rule arguments (`pricing_rule.py:454-461`, `pricing_rule/utils.py:594-603`). But it has no explicit native coupon validation call, and no declared transition semantics when the quote becomes an order or invoice. It should not consume an allowance while it is only a quote; it should still resolve the code and reject invalid, expired, exhausted, or customer-mismatched coupons before presenting a promotional price.
 
-This is reachable today: `posnext_promotions` already registers `apply_min_max_price_discounts` on Sales Order, Quotation and Delivery Note.
+The wider document-adapter surface already exists today: `posnext_promotions` registers `apply_min_max_price_discounts` on Sales Order, Quotation and Delivery Note. That hook is not itself native coupon lifecycle support.
 
-**Required.** State per selling document whether coupons are supported, and for each supported one whether native services are invoked or the adapter supplies them. Sales Invoice should gain a **Link to `Coupon Code`**, not the current `Data` field. Quotation must gain enforcement or lose the field — leaving it decorative is not a decision.
+**Required.** State per selling document whether the adapter resolves, calculates, validates, reserves, consumes, reverses, or merely carries coupon provenance. Sales Invoice should gain a persisted **Link to `Promotion Coupon`** (D4), never to native `Coupon Code` (I1); `pos_next` currently accepts `coupon_code` in the request and assigns it dynamically at `api/invoices.py:996`, but ships no Sales Invoice coupon field in its tracked customizations. **Under D4 the core builds this lifecycle on all five documents**, so native coverage of two is a reason to own the model rather than a gap to work around. Quotation should resolve, calculate and validate without consuming; the later document consumes exactly once for the logical transaction selected in O1/O2.
 
-### F4 — Coupon → Pricing Rule cardinality unstated · HIGH
+### F4 — Coupon → Pricing Rule cardinality · **downgraded to MEDIUM by D4**
 
-`Coupon Code.pricing_rule` is `Link` → `Pricing Rule`, **`reqd: 1`, `unique: 0`**. N coupons may share one Pricing Rule.
+Native `Coupon Code.pricing_rule` is `Link` → `Pricing Rule`, **`reqd: 1`, `unique: 0`**, so N
+coupons may share one rule. Native `Coupon Code` has **no `company` and no `disabled` field** —
+full list: `coupon_name, coupon_type, customer, coupon_code, pricing_rule, valid_from,
+valid_upto, maximum_use, used, description, amended_from`. Under the superseded native-adoption
+plan both had to map onto the Pricing Rule, so disabling one coupon disabled every coupon
+sharing its rule and per-coupon company scope was impossible.
 
-`Coupon Code` has **no `company` and no `disabled` field** — full field list: `coupon_name, coupon_type, customer, coupon_code, pricing_rule, valid_from, valid_upto, maximum_use, used, description, amended_from`. So both must map onto the Pricing Rule, and migration step "create **or match** its native Pricing Rule" **shares** it. Then:
+**D4 dissolves the hazard.** `Promotion Coupon` owns `disabled` and company scope as first-class
+fields, so disabling one coupon is local to it regardless of rule sharing.
 
-- Disabling one migrated coupon **disables every coupon sharing that rule**.
-- Company scope is shared, so two coupons cannot target different companies on one rule.
+**What remains** — if `Promotion Coupon` still links a Pricing Rule for discount mechanics,
+state the cardinality anyway:
 
-Creating one rule per coupon avoids that but yields a **Pricing Rule explosion** — N legacy coupons become N rules, each evaluated by ERPNext's engine on every cart, on a live system.
+- **Per-coupon rules.** Simple, but N legacy coupons become N Pricing Rules, each evaluated by
+  ERPNext's engine on every cart on a live system. Report the resulting rule count and its
+  evaluation cost before migrating.
+- **Shared rules.** Scales, and is now safe for `disabled` and company scope, but editing a rule
+  changes every coupon pointing at it — needs an explicit change-impact warning when authoring.
+- **Core-owned discount definition, no Pricing Rule.** Most consistent with I2, since
+  coupon-based Pricing Rules are inert anyway. Removes the question at the cost of a second
+  discount-definition surface.
 
-**Required.** State the cardinality. If rules are shared, `disabled` cannot map to `Pricing Rule.disable` and needs a small `Coupon Code` extension field. If per-coupon, the migration must report the resulting rule count and its evaluation cost before it runs.
+O3 decides this. It is no longer a migration-safety blocker — only a cost and usability choice.
 
-### F5 — ERPNext's native coupon services carry three defects · HIGH
+### F5 — Three defects in ERPNext's coupon services · **reclassified by D4**
 
-Adopting the native model (D4) is correct. Inheriting its defects is not.
+These are **no longer inherited** — under D4/I1 native services never run. They stay in the
+register for two reasons: they are the evidence base for D4, and I3 forbids re-implementing
+them. This codebase already re-implemented one.
 
 **(a) Lost update.** `erpnext/accounts/doctype/pricing_rule/utils.py:756-772`:
 
@@ -316,7 +394,7 @@ if coupon.used < coupon.maximum_use:
     coupon.save(ignore_permissions=True)
 ```
 
-Read-modify-write, no `for_update`, no atomic conditional `UPDATE`. Two tills redeeming the final allowance both read the same value and write the same increment. **This is the counter NexDine relies on today**, so the same defect exists in three implementations — the dead copy at `posnext_promotions/api/coupon_engine.py:437`, the live one at `pos_next/.../pos_coupon.py:181`, and ERPNext core.
+Read-modify-write, no `for_update`, no atomic conditional `UPDATE`. Two tills redeeming the final allowance both read the same value and write the same increment. This is the native counter any NexDine POS Invoice carrying `coupon_code` would invoke. The same lost-update pattern also exists in two custom implementations — the uncalled copy at `posnext_promotions/api/coupon_engine.py:437` and the live `pos_next/.../pos_coupon.py:181` path.
 
 Secondary: `used` is declared `read_only` yet written via `coupon.save()`, running full document validation and `on_update` hooks on every redemption. An atomic conditional `UPDATE` removes that cost too.
 
@@ -333,11 +411,25 @@ else:
 
 The cashier is told the coupon is valid, then the sale fails at submit. **Late failure is the defect**, not the rejection itself.
 
-**(c) Gift Card customer binding is never enforced — and adopting native is a regression.** `validate_coupon_code` (`utils.py:746-753`) checks only `valid_from`, `valid_upto` and `maximum_use`. `Coupon Code.customer` exists and is **never read**. A Gift Card assigned to Customer A is redeemable by Customer B.
+**(c) Gift Card customer binding is never enforced — and adopting native is a regression.** `validate_coupon_code` (`utils.py:746-753`) checks only `valid_from`, `valid_upto` and `maximum_use`. `Coupon Code.customer` exists and is **never read** by that service. Native coupon validation therefore does not stop Customer B from presenting a Gift Card assigned to Customer A; only an independently customer-scoped Pricing Rule could happen to reject it.
 
-> `posnext_promotions/api/coupon_engine.py:48-51` **enforces this today.** Migrating to native `Coupon Code` therefore **removes an existing control**. This is a regression to prevent, not merely a native gap to fill.
+> `posnext_promotions/api/coupon_engine.py:48-51` **enforces this today.** Under D4 the core keeps that control and carries it to every document — but it must be carried deliberately, since the surrounding code is being rewritten. Under the superseded native-adoption plan this control would have been silently lost; that near-miss is part of why D4 was reversed.
 
-**Required.** Atomic conditional `UPDATE` with the redemption ledger as authority and `used` demoted to a projection; characterize and correct `maximum_use = 0`; enforce customer binding in the adapter before value is granted.
+**Required, as I3 acceptance criteria for the core's own implementation.** The global allowance
+now lives on `Promotion Coupon`, hardened from the start rather than patched into ERPNext:
+
+| Native defect | Core requirement | Conformance test |
+|---|---|---|
+| (a) unlocked read-modify-write | atomic conditional `UPDATE` or row lock; the `Promotion Redemption` ledger is the authority and the counter is a projection reconcilable from it | two concurrent redemptions of the final allowance → exactly one winner |
+| (b) `maximum_use = 0` validates then throws at submit | `0` means **unlimited**, consistently at every stage | a `max_uses = 0` coupon redeems repeatedly without error |
+| (c) customer binding never checked | enforced before value is granted, on every supported document | Gift Card bound to A is rejected for B |
+
+The ledger enforces idempotency, per-customer uniqueness, logical-transaction allocation and
+cross-document audit. It must never become a second mutable global counter.
+
+The trap is (a): `posnext_promotions/api/coupon_engine.py:437` already contains the identical
+defect. Owning the model removes the obligation to inherit these — not the temptation to
+rewrite them.
 
 ### F6 — Consolidation destroys discount provenance and re-fires hooks · HIGH
 
@@ -358,7 +450,7 @@ Hook re-firing is covered in F1(b). Third effect: `apply_min_max_price_discounts
 
 ### F7 — Recipe/composite stock-consumption ownership undefined · HIGH
 
-`nexdine_recipe_stock.before_submit` is **not** a component expander — it creates a separate Material Issue Stock Entry for recipe ingredients. `hospitality_core` uses a different mechanism. Calling both "expanders" hides the real risk.
+`nexdine_recipe_stock.before_submit` is **not** a component expander — it creates one aggregated Material Issue Stock Entry from `NexDine Recipe`. `hospitality_core` also creates submitted stock entries, but resolves a BOM and creates a Material Consumption entry per composite invoice row. If the same sellable item is configured in both systems, both hooks can consume ingredients. Calling both "expanders" hides the actual duplicate-consumption risk.
 
 **Required, as stock-consumption ownership:** which app owns consumption per sellable item; whether one item can be configured in both systems; how exactly one owner is selected when both are installed; whether NexDine + `hospitality_core` is a supported shape or merely possible; how free-promotion provenance reaches Stock Entry rows and profitability reporting; how return, cancellation and failed-submit reversals stay idempotent; how serial, batch, UOM, warehouse and negative-stock policies are preserved.
 
@@ -386,11 +478,11 @@ The delivery plan defines a destination and a sequence but not what makes a phas
 
 ### F11 — NexDine offline offer cache · LOW
 
-`nexdine/nexdine/api/nexdine_offline.py:357-377` `_fetch_active_offers` filters `valid_from <= today AND valid_upto >= today`, so a Pricing Rule with `NULL valid_upto` — an open-ended promotion, the common case — is silently excluded. The payload also returns only `name, title, apply_on, rate_or_discount, discount_percentage, rate`: no item, group, brand, customer, company, quantity, amount, stacking or schedule scope, so no scoped rule can be evaluated offline.
+`nexdine/nexdine/api/nexdine_offline.py:357-377` `_fetch_active_offers` filters `valid_from <= today AND valid_upto >= today`, so a Pricing Rule with either NULL boundary — including the common open-ended `valid_upto = NULL` case — is silently excluded. The selected payload returns only `name, title, apply_on, rate_or_discount, discount_percentage, rate`: no validity fields, item, group, brand, customer, company, quantity, amount, stacking or schedule scope. `preload.ts` nevertheless attempts to store `o.valid_upto`, which is absent from that payload. No scoped rule can be evaluated faithfully offline.
 
-**Latent, not a live checkout defect.** `db.offers` is inert — `pos/src/lib/offline/preload.ts:319-328` only `clear()`s and `bulkPut()`s it; the sole other references are schema declarations at `pos/src/lib/offline/db.ts:160,247,327`. No read consumer exists.
+**Latent, not a verified live checkout defect.** `pos/src/lib/offline/preload.ts:319-328` only `clear()`s and `bulkPut()`s `db.offers`. Outside that preload path, production references are schema declarations at `pos/src/lib/offline/db.ts:160,247,327`; tests also mention the table. Static search finds no production retrieval consumer, but cannot exclude an external consumer.
 
-**Consequence: these are free to fix now.** Correcting the filter and widening the payload cannot regress behaviour nothing consumes. Schedule in Phase 2, not behind the offline-bundle design.
+**Required.** Correct the NULL-bound date predicate now. Do **not** widen this legacy payload into a second, uncertified promotion contract: static absence of an in-repository reader does not prove that no external consumer exists, and a richer cache would create an unsafe transitional surface. Deprecate the cache and introduce complete eligibility scope only through the versioned certified offline bundle (§5.2).
 
 **Do not** wire `posnext_promotions.api.offers.get_offers` straight into this cache — it would cache rules D6 declares online-only. Publish a certified bundle instead (§5.2).
 
@@ -402,26 +494,31 @@ The delivery plan defines a destination and a sequence but not what makes a phas
 
 ## 5. Coupon migration
 
-### 5.1 Legacy `POS Coupon` → native `Coupon Code`
+### 5.1 Legacy `POS Coupon` → `Promotion Coupon`
 
-Map each concept to its existing native owner. Do not copy native fields into a new DocType.
+Migration is now core-owned (D4), which simplifies it: there is **no native coupon data to
+preserve** — no app on this bench populates native `Coupon Code` — so this is a single-source
+migration, not a reconciliation between two live models.
+
+Map each concept to the core model, keeping non-coupon mechanics on Pricing Rule per §3.6.
 
 | Legacy `POS Coupon` | Native destination |
 |---|---|
-| `coupon_name`, `coupon_code`, `coupon_type`, `customer` | `Coupon Code` |
-| `valid_from`, `valid_upto`, `maximum_use`, `used` | `Coupon Code` |
-| `pricing_rule` | `Coupon Code.pricing_rule` |
-| `disabled` | Pricing Rule `disable` — **or a `Coupon Code` extension, per O3** |
+| `coupon_name`, `coupon_code`, `coupon_type`, `customer` | `Promotion Coupon` |
+| `valid_from`, `valid_upto`, `maximum_use` | `Promotion Coupon` |
+| `used` | **not migrated as authority** — reconciled from submitted documents into the ledger; retained only as a projection (I3) |
+| `pricing_rule` | `Promotion Coupon.pricing_rule`, or the core's own discount definition |
+| `disabled` | **`Promotion Coupon.disabled`** — a first-class field the core owns, which dissolves F4's shared-rule hazard |
 | `company`, `campaign` | Linked Pricing Rule applicability |
 | `discount_type`, percentage, amount | Linked Pricing Rule rate/discount fields |
 | `min_amount`, `max_amount`, `apply_on` | Linked Pricing Rule thresholds |
-| `one_use` | Small `Coupon Code` extension + redemption-ledger uniqueness |
+| `one_use`, per-customer limits | `Promotion Coupon` fields + redemption-ledger uniqueness |
 | referral relationship | Generic referral integration or consumer adapter — not Coupon Code duplication |
 | excluded items/groups/brands | Pricing Rule scope/exclusion extensions |
 
 Per legacy coupon:
 
-1. Create or match one native `Coupon Code` via a deterministic migration key.
+1. Create one `Promotion Coupon` per legacy row via a deterministic migration key.
 2. Create or match its Pricing Rule — **subject to O3; matching shares the rule (F4)**.
 3. Map percentage/amount and eligibility onto the Pricing Rule, not onto Coupon Code.
 4. Map customer-bound gift cards to native `customer` and `coupon_type`.
@@ -431,13 +528,19 @@ Per legacy coupon:
 8. Run in shadow/read compatibility mode for one release if deployed data requires it.
 9. Remove legacy write paths, then remove `POS Coupon`, its controller, API CRUD, permission strings, fixtures and workspace links after the rollback window closes.
 
-One coupon table and one coupon definition remain: ERPNext `Coupon Code`.
+One coupon table and one coupon definition remain: `Promotion Coupon`, owned by the core. Native `Coupon Code` is left untouched and unused (I1).
 
 **Before removing anything from `pos_next`:** `POS Offer` is **not** dead — it is referenced from `pos_next/pos_next/doctype/pos_coupon/pos_coupon.js` and `pos_next/pos_next/workspace/posnext/posnext.json`. `POS Offer Detail` and `POS Coupon Detail` appear unreferenced but still require row counts, Dynamic Links, fixtures, reports, exports, integrations and customer scripts to be checked first.
 
 ### 5.2 Coupon identity at API boundaries
 
-ERPNext names a `Coupon Code` document from `coupon_name` (`autoname: field:coupon_name`, **UNIQUE reqd**), while the human-entered or scanned value lives in a separate **UNIQUE** `coupon_code` field. Existing ERPNext tests commonly make these identical. **Adapters must never assume it.**
+ERPNext's `Coupon Code` names the document from `coupon_name` (`autoname: field:coupon_name`,
+**UNIQUE reqd**) while the scanned value lives in a separate **UNIQUE** `coupon_code` field —
+two distinct unique keys that tests commonly make identical. `Promotion Coupon` should **not**
+repeat that design: name the document from a system-generated id and keep the scanned code as
+one unique field, so document name and user-facing code never diverge.
+
+The resolution rule below applies regardless.
 
 - Document fields and ledger references carry the native **document name**.
 - One public `resolve_coupon(code, context)` service accepts the scanned code, finds the unique document, and returns its name **only after native validation plus the customer-binding check F5(c) requires**.
@@ -484,9 +587,9 @@ It retires the question of **how to construct** a harness. It does not retire th
 | ERPNext + core + `pos_next` | Sales Invoice consumer |
 | ERPNext + HRMS + core + `nexdine` | POS Invoice consumer |
 | Upgrade: `pos_next`-owned metadata → core-owned | Re-home safety |
-| Upgrade: legacy coupon data → native `Coupon Code` | Migration safety |
+| Upgrade: legacy `POS Coupon` → `Promotion Coupon` | Migration safety |
 | Both POS apps | Only if officially supported |
-| `nexdine` + `hospitality_core` | Only if O5 declares it supported |
+| `nexdine` + `hospitality_core` | Only if O4 declares it supported |
 
 Do not combine the 59-file formatting cleanup with money-path changes. Establish a formatting baseline separately, then enforce it.
 
@@ -520,7 +623,10 @@ Do not combine the 59-file formatting cleanup with money-path changes. Establish
 | Disabling one migrated coupon disables no other coupon | F4 |
 | A `maximum_use = 0` coupon behaves consistently at validation **and** submit | F5(b) |
 | A Gift Card bound to Customer A is rejected for Customer B on every supported document | F5(c) |
-| A coupon applied to POS Invoice does not collide with native `Coupon Code` validation | F3, F5 |
+| Native `coupon_code` is **never set** on any selling document, on any path | **I1** |
+| A coupon applied to POS Invoice does not trigger native validation or counting | I1, F5 |
+| A `coupon_code_based` Pricing Rule is not silently expected to self-apply | **I2** |
+| The core's own counter is atomic under concurrent redemption — the F5(a) defect is not re-implemented | **I3** |
 | The consolidated Sales Invoice can still explain every discount despite `price_list_rate = 0` | F6 |
 | A return or group cancellation reverses the entitlement and recipe stock exactly once | F1, F7 |
 | Split sibling totals reconcile to the parent to the last minor unit in a 3-decimal currency | F8 |
@@ -541,8 +647,8 @@ Parallel workstreams, not a linear sequence. **Every phase carries the gates F10
 |---|---|---|
 | **0 — Facts and containment** | Inventory every managed and customer-managed site: installed apps, commit SHAs, promotion settings, coupon data, submitted promotion-bearing invoices, real consumer paths. If promotions is live, disable coupons, one-time offers, gift pools and free gifts until server enforcement exists; otherwise gate them for release. | — |
 | **1 — Harness and characterization** | Adapt NexDine's CI. Publish exact test counts. Characterize current Sales Invoice and POS Invoice behaviour before refactoring. Add failing tests for confirmed fail-open defects. | **nothing — start now** |
-| **2 — Independent containment fixes** | One-time key lookup and semantic uniqueness; remove client-named rule readmission; coupon/redemption failures deny value; submit-time gift-stock validation; PIN lockout fails closed; replace destructive install behaviour; make the ERPNext patch observable; extend authorization to POS Invoice where the action model is clear; **fix F11 now — the offer cache has no read consumer**. | Phase 1 |
-| **3 — Close the ADRs** | O1–O5, O7. Establish `promotion_core` and its boundary directly. Design versioned metadata and data migrations. | Phase 1 |
+| **2 — Independent containment fixes** | One-time key lookup and semantic uniqueness; remove client-named rule readmission; coupon/redemption failures deny value; submit-time gift-stock validation; PIN lockout fails closed; replace destructive install behaviour; make the ERPNext patch observable; extend authorization to POS Invoice where the action model is clear; fix F11's NULL-date predicate and deprecate the legacy cache without widening its contract. | Phase 1 |
+| **3 — Close the ADRs** | O1–O4 and O6–O7. Establish `promotion_core` and its boundary directly. Design versioned metadata and data migrations. O5 independently decides whether Phase 0 is containment or a release gate. | Phase 1 |
 | **4 — Provider and ledger** | One authoritative evaluator; calculation identity and explanation trace; quote/reserve/consume/reverse/offline-bundle; atomic constraints and idempotency keys. **This repairs the live ERPNext counter defect (F5a), not merely `pos_next`'s.** Remove import-time monkey-patching and installed-app branching. | Phase 3 |
 | **5 — Consumer adapters** | Generic ERPNext document adapters. `pos_next` Sales Invoice adapter **including its `ignore_pricing_rule` remediation**. NexDine POS Invoice adapter — **does not depend on the `pos_next` trust-boundary work and may run in parallel**. KOT, recipe, add-on, split, return, cancel and authorization behaviour. Remove duplicate endpoints, hooks, globals and engine code from `pos_next`. | Phase 4 |
 | **6 — Offline certified subset** | Versioned snapshots and shared conformance vectors. Only explicitly certified deterministic classes. Quarantine mismatches; preserve the amount collected. Expand one capability at a time. | Phase 5 |
@@ -558,14 +664,15 @@ Temporary fixes may live in two repositories only while the duplicated implement
 - [x] Neutral core ownership and package boundary accepted, no deferred re-home — **D3**
 - [x] Composite/recipe free-item accounting policy — **D5**
 - [x] Offline capability and commercial-binding policy — **D6**
+- [x] Sole normative architecture specification identified — **D7**
 - [ ] **Logical transaction identity defined once, covering split, consolidation and SO→SI — O1**
 - [ ] Per-document coupon support declared; Quotation resolved — **O2**
 - [ ] Coupon → Pricing Rule cardinality declared, with the `disabled` mapping that follows — **O3**
-- [ ] Authoritative document across consolidation — **O4**
-- [ ] Recipe/composite stock-consumption ownership and supported combinations — **O5**
-- [ ] Deployment inventory determines containment vs. release gate — **O6**
-- [ ] Coupon code uniqueness policy for multi-company — **O7**
-- [ ] Phase gates and rollback criteria — **O8**
+- [ ] Recipe/composite stock-consumption ownership and supported combinations — **O4**
+- [ ] Deployment inventory determines containment vs. release gate — **O5**
+- [ ] Coupon code uniqueness policy for multi-company — **O6**
+- [ ] Phase gates and rollback criteria — **O7**
+- [ ] Superseded remediation spec deleted or reduced to a non-normative redirect — **D7**
 - [ ] Generic input, output, lifecycle, capability and port contracts accepted — §3.2–3.4
 - [ ] Standard ERPNext document-adapter coverage accepted — §3.5
 - [ ] NexDine pricing/KOT/recipe orchestration contract accepted — F2
@@ -579,11 +686,11 @@ Implementation plans then split into **core**, **migration** and **consumer-adap
 
 ## Appendix A — Evidence catalogue
 
-Every non-obvious claim, with its source. Commands are reproducible on this bench.
+Every non-obvious claim, with its source. The 19 rows below were re-derived on 2026-09-08. Repository-prefixed commands are run from that repository's root; exact counts are baseline-specific. “Verified” here means source-confirmed, not live-database-confirmed.
 
 | Claim | Source |
 |---|---|
-| `nexdine` size | `git ls-files '*.py' \| xargs cat \| wc -l` → 27,543 / 368 files |
+| `nexdine` size | `git ls-files -z '*.py' \| xargs -0 cat \| wc -l` → 42,619 LOC; `git ls-files -z '*.py' \| tr -cd '\0' \| wc -c` → 368 files. NUL delimiters are required because tracked paths include `today's_sales`. |
 | `nexdine` invoice bias | `git grep -o '"POS Invoice"' -- '*.py'` → 178; `'"Sales Invoice"'` → 18 |
 | `nexdine` independence | `nexdine/hooks.py:11-12` `required_apps = ["hrms"]`; 4 files mention `pos_next`, none an import, hook or dependency |
 | `nexdine` frontend | `pos/package.json` react ^19.0.0, zustand ^5.0.6, dexie ^4.4.2, vite ^6.2.0, vitest ^3, typescript ~5.7.2; `kotdisplay/package.json` vue ^3.3.4 |
@@ -591,25 +698,42 @@ Every non-obvious claim, with its source. Commands are reproducible on this benc
 | `pos_next` client trust | `pos_next/api/invoices.py:786` `ignore_pricing_rule = 1`; `:839` "Trust frontend's price_list_rate" |
 | Duplication | 39 shared function names; 2,201 LOC in `pos_next/api/offers.py`, `api/promotions.py`, `overrides/pricing_rule.py`, `doctype/pos_coupon/pos_coupon.py` |
 | `Coupon Code` schema | `autoname: field:coupon_name`; `coupon_name` UNIQUE reqd; `coupon_code` UNIQUE; `pricing_rule` Link reqd **not unique**; no `company`, no `disabled`; `is_submittable: 0` with `amended_from` |
-| Native coupon coverage | SO `sales_order.py:233,448,482`; POS Invoice `pos_invoice.py:230,252,289`; Quotation field only (`quotation.py:62`); Sales Invoice `grep -c coupon` → 0; Delivery Note no field |
+| Native coupon coverage | SO `sales_order.py:233,448,482`; POS Invoice `pos_invoice.py:230,252,289`; Quotation field plus shared Pricing Rule calculation (`quotation.py:62`, `pricing_rule.py:454-461`, `pricing_rule/utils.py:594-603`) but no explicit validation/counting; Sales Invoice and Delivery Note have no coupon field or lifecycle |
 | Native counter defects | `pricing_rule/utils.py:746-753` validation, `:756-772` counting |
 | Existing customer-binding control | `posnext_promotions/api/coupon_engine.py:48-51` |
 | Consolidation | `pos_invoice_merge_log.py:160,234-238,350` |
 | KOT from client list | `nexdine_order.py:745` |
 | Split field copying | `nexdine_order.py:1003-1021` |
-| Offline cache inert | `pos/src/lib/offline/preload.ts:319-328`; `pos/src/lib/offline/db.ts:160,247,327` |
-| Offline NULL-date filter | `nexdine/nexdine/api/nexdine_offline.py:357-377` |
+| Offline cache has no in-repository production reader | preload writes at `pos/src/lib/offline/preload.ts:319-328`; remaining production references are schema declarations at `pos/src/lib/offline/db.ts:160,247,327`; repository-wide TS/TSX search finds no retrieval path |
+| Offline NULL-date/filter payload defects | `nexdine/nexdine/api/nexdine_offline.py:357-377` requires both nullable boundaries and does not select either validity field; `preload.ts:325` reads absent `o.valid_upto` |
 | `POS Offer` still referenced | `pos_next/.../pos_coupon/pos_coupon.js`; `pos_next/pos_next/workspace/posnext/posnext.json` |
 | Redemption autoname | `one_time_customer_offer_usage.json:3` `format:{customer}:{pricing_rule}`; `frappe/model/naming.py:565-583` returns the formatted name verbatim |
-| NexDine CI | `.github/workflows/ci.yml`; `git log -1 --date=iso 03ebd4b` → 2026-07-08 14:53:31 +0300 |
+| Coupon-based Pricing Rules need the native field | `pricing_rule/utils.py:594-602` — applies a `coupon_code_based` rule only when `doc.coupon_code` is set and resolves to that rule (I2) |
+| Native coupon behaviour is field-guarded | `pos_invoice.py:227,249,286`; `sales_order.py:231,446,480` — all guarded by `if self.coupon_code:` (I1) |
+| No native coupon data exists to preserve | no app on this bench writes native `Coupon Code`; only `POS Coupon` is populated |
+| NexDine CI | `.github/workflows/ci.yml`; GitHub Actions run `28940529115` completed successfully for full SHA `03ebd4b8a9b6259d0e139003fff57f50779f522d`; `git log -1 --date=iso 03ebd4b` → 2026-07-08 14:53:31 +0300 |
 
 ## Appendix B — Review provenance
 
-This document supersedes the review-and-rebuttal exchange it grew from. Recorded so conclusions can be audited.
+This document supersedes the review-and-rebuttal exchange it grew from. Recorded so conclusions can be audited. Appendix A contains **19 claim rows**, several of which deliberately group multiple related source anchors; “20 evidence anchors” is therefore not used as a formal completeness count.
+
+**Revision-size provenance.** The predecessor committed in PR #1 at `365793…` is 1,045 lines and this revision began at 618 lines. The reported 1,299-line predecessor was an uncommitted intermediate not recoverable from the reviewed Git history, so that exact before/after claim is not independently verifiable.
+
+**Normative-source cleanup.** PR #1 still contains `2026-09-08-promotions-remediation-design.md`, whose Option B/Option C and hook-parity conclusions conflict with this document. D7 is not operationally complete until that file is deleted or replaced by a short redirect.
 
 **Corrections applied to `BrainWise-DEV/Promotions` PR #1.** NexDine's POS is React/TypeScript, not Vue. LOC and invoice-reference figures were produced by a broken command (`find … -print -exec cat`, feeding filenames into the count, no `node_modules` exclusion) and are replaced by the published-method values in Appendix A. "Exactly one mention of `pos_next`" → "no imports, hooks, declared dependency or runtime calls". "No promotions surface at all" → "no dedicated promotions engine or authoring model". "Does nothing on NexDine" → "provides no complete NexDine transactional promotion lifecycle; on a composed site containing `pos_next`, even its sole POS Invoice calculation hook is suppressed". "Strict functional superset" → "broader implementation apparently intended to supersede the duplicated engine; contract tests required before deletion". `POS Offer` was wrongly marked dead — the reference count omitted desk JS and workspace JSON. The one-time key migration contradiction resolved to: enforce uniqueness on `customer + pricing_rule`, no name normalization. The stale NexDine appendix in `CODE_REVIEW.md` was rewritten, not annotated. **ADR-6 "hook parity" was withdrawn** — F3 and F6 make it unsafe.
 
 **Corrections applied to the intermediate review.** Its replacement LOC (42,912) and invoice-reference (405/77) figures were as unreproducible as the ones they corrected; Appendix A supersedes both. Its "near-zero cost" characterization of the harness was PR #1's claim and is corrected in §7.1. Its treatment of NexDine's server-authoritative pricing as a passing observation is promoted to a scope decision in §2, because it removes NexDine from the critical path of `pos_next`'s trust-boundary work.
+
+**D4 reversed after the rewrite.** An earlier revision made ERPNext `Coupon Code` canonical. That
+was reversed: under any design the redemption ledger is the authority and `used` is a projection,
+so adopting native bought a code and two dates while inheriting three defects unfixable without
+patching core, a lifecycle covering 2 of 5 documents, and no company/disabled/per-customer/scope/
+balance/stacking/offline semantics. No app populates native `Coupon Code`, so nothing was lost by
+declining it. The reversal is safe because ERPNext's coupon behaviour is entirely guarded by
+`if self.coupon_code:` — leaving that field unset (I1) yields exactly one coupon system per
+document. Its cost is stated as I2: coupon-based Pricing Rules become inert under ERPNext's
+engine, and the core owns coupon calculation end to end.
 
 **Findings added during validation:** F1(b) and F1(c), F3, F4, F5(a)–(c), F6, F8, F9, F10, F12, and the F11 reclassification.
 
