@@ -1,7 +1,7 @@
 # Promotions Remediation — Cross-Repository Architecture Design
 
 **Date:** 2026-09-08 · **Baseline:** `posnext_promotions` @ `70be440`, `pos_next` @ working tree
-**Scope:** `posnext_promotions`, `pos_next`, `hospitality_core` (NexDine composition)
+**Scope:** `posnext_promotions`, `pos_next`, `nexdine`, `hospitality_core`
 **Companion:** [`CODE_REVIEW.md`](../../../CODE_REVIEW.md) — the 26-finding review this derives from
 
 ---
@@ -15,11 +15,15 @@
 > proves nothing. **Treat as potentially deployed until every environment is inventoried.**
 > If confirmed undeployed, containment becomes a release gate rather than an emergency patch.
 >
-> **Ownership decision:** `pos_next` continues to own its existing coupon and redemption
-> DocTypes. `posnext_promotions` is an explicit companion for the first production release.
-> A neutral `promotion_core` extraction is revisited only after the money path is tested and
-> stable. **See ADR-1** — the measured duplication (39 duplicated functions, 2,201 LOC)
-> strengthens the eventual case for consolidation without changing this sequencing.
+> **Ownership decision:** ⚠️ **REOPENED by NexDine — see ADR-1.** The prior recommendation
+> (`posnext_promotions` as a `pos_next` companion) is **no longer viable**: `nexdine` is a
+> 43,282-LOC restaurant ERP that does **not** use `pos_next` and has **no** promotions surface
+> of its own. Binding promotions to `pos_next` would force every NexDine outlet to install an
+> entire competing POS to get coupons. Option A is eliminated on that ground alone.
+>
+> **Deployment status is no longer unknown for NexDine.** Its README states it has been
+> "running at scale, serving over 10+ outlets for the past 10 months." Phase 0's inventory
+> must cover those outlets.
 >
 > **Trust-boundary decision:** `pos_next` owns invoice pricing acceptance.
 > `posnext_promotions` may provide promotion calculations but cannot independently make a
@@ -62,6 +66,25 @@ frontend `price_list_rate` moves the trust boundary by exactly one endpoint and 
 preserving a price promised while disconnected.** Those are different invariants, and
 conflating them is what produced the current design.
 
+### NexDine changes the target
+
+`nexdine` is not `pos_next` + `hospitality_core`, as an earlier draft of this analysis
+assumed. It is an independent 43,282-LOC restaurant ERP (370 Python files, its own Vue POS at
+`/pos`, kitchen display, analytics) with `required_apps = ["hrms"]` and **exactly one mention
+of `pos_next` anywhere — in a comment.**
+
+Two facts follow, and both are load-bearing:
+
+1. **NexDine has no promotions surface at all.** Zero coupon, offer, promotion or discount
+   DocTypes or modules. That is why promotions is wanted there.
+2. **NexDine is POS Invoice-based** — 163 `POS Invoice` references against 13 for
+   `Sales Invoice`. `posnext_promotions` is built almost entirely around Sales Invoice.
+
+The consequence is stark. On a NexDine site, `posnext_promotions` registers **one** hook on
+POS Invoice (`apply_min_max_price_discounts` on `validate`), and that hook self-disables via
+`overrides/pricing_rule.py:714` whenever `pos_next` is installed. **On this bench, the
+promotions app does nothing on NexDine at all.**
+
 ---
 
 ## 2. ADR-1 — DocType ownership and dependency direction
@@ -103,61 +126,78 @@ Precedent for re-homing a DocType between these two apps already exists:
 `posnext_promotions/patches/v2_3_0/rehome_gift_pool_item_doctype.py` moved
 `POS Gift Pool Item` off `pos_next`.
 
-### Option A — Companion (`posnext_promotions` requires `pos_next`)
+### The NexDine constraint
 
-`pos_next` keeps `POS Coupon` and `One Time Customer Offer Usage`. Promotions declares
-`required_apps = ["erpnext", "pos_next"]` and the README stops claiming independence.
+`nexdine` does not use `pos_next` and never will — it is a competing POS, not a layer on one.
+It needs promotions. Therefore:
 
-- **For:** smallest immediate diff; `pos_next` stays independently installable; no
-  coordinated release; no metadata migration.
-- **Against:** the 2,201 LOC duplicate engine and all 39 duplicated functions remain. Every
-  cross-app defect in the review is a duplication artefact and must be *fixed* in two places
-  rather than deleted once. Ongoing synchronisation cost is permanent.
+> **Any option that makes `posnext_promotions` depend on `pos_next` makes promotions
+> unavailable to NexDine without installing a second, competing POS app.**
+
+That eliminates Option A. It is recorded below so the reasoning is not lost.
+
+### ~~Option A — Companion (`posnext_promotions` requires `pos_next`)~~ — ELIMINATED
+
+Promotions declares `required_apps = ["erpnext", "pos_next"]`; `pos_next` keeps `POS Coupon`
+and `One Time Customer Offer Usage`.
+
+- **For:** smallest diff; no coordinated release; no metadata migration.
+- **Against — fatal:** NexDine must install `pos_next` to get coupons. A 43k-LOC restaurant
+  ERP pulling in an entire competing POS for two DocTypes is not a shippable architecture.
+  The 2,201-LOC duplicate engine and 39 duplicated functions also remain, so every cross-app
+  defect is fixed in two places rather than deleted once.
 
 ### Option B — Consolidation (`pos_next` requires `posnext_promotions`)
 
-Promotions takes `POS Coupon` and `One Time Customer Offer Usage` via two re-home patches.
-`pos_next` deletes its duplicate engine, its promotion doctypes, its duplicate `doc_events`
-and its `pn_*` JS globals. The three dead doctypes are dropped.
+Promotions takes `POS Coupon` and `One Time Customer Offer Usage` via two re-home patches
+(precedent: `patches/v2_3_0/rehome_gift_pool_item_doctype.py`). `pos_next` deletes its
+duplicate engine, its promotion DocTypes, its duplicate `doc_events` and its `pn_*` JS
+globals. The three dead DocTypes are dropped.
 
-- **For:** −2,201 LOC. One engine, one coupon table, one truth. These review findings and
-  NexDine conflicts resolve **by deletion, not by new code**: the `::` bug's second call
-  site, duplicated `record_one_time_offer_usage`, the `pn_sync_min_max` / `pn_toggle_min_max`
-  global collision, the `apps.txt` ordering requirement, the
-  `"pos_next" in frappe.get_installed_apps()` branch, and the split-brain coupon counter.
-- **Against:** `pos_next` can no longer be installed without promotions. Requires a
-  coordinated two-repo release and live metadata migration.
+- **For:** −2,201 LOC. One engine, one coupon table, one truth. **NexDine installs promotions
+  alone and gets everything**, with no `pos_next`. These conflicts resolve *by deletion*: the
+  `::` bug's second call site, duplicated `record_one_time_offer_usage`, the `pn_*` global
+  collision, the `apps.txt` ordering requirement, the `"pos_next" in get_installed_apps()`
+  branch, and the split-brain coupon counter.
+- **Against:** `pos_next` can no longer be installed alone. Coordinated two-repo release and
+  live metadata migration. Promotions must additionally become POS-Invoice-native — see
+  **ADR-6**, which it is not today.
 
-### The premise to re-examine
+### Option C — `promotion_core` extracted now, not deferred
 
-The original recommendation for A reasoned that *"reversing the dependency would couple the
-base POS product to an optional promotions engine."* The measurement above shows promotions
-is **not optional to `pos_next`** — `pos_next` ships its own. The real choice is **one engine
-or two**, and two is the direct cause of every cross-app defect found.
+A third neutral app owning coupons, redemption and the eligibility/calculation engine.
+`pos_next`, `posnext_promotions` and `nexdine` all depend on it.
 
-### Standing recommendation, and what the measurement changes
+- **For:** no app depends on a competing POS; each consumer takes only what it needs; the
+  cleanest boundary, and the one that survives a fourth POS product.
+- **Against:** the largest migration — moving live metadata between modules while preserving
+  table names, updating hooks/fixtures/roles/workspaces, defining which app installs and
+  uninstalls the shared core, and testing removal and reinstall across app combinations.
+  Three repos released in step rather than two.
 
-**Option A for the first production release**, with consolidation revisited once the money
-path is tested and stable. Consolidation needs a coordinated two-repo release and live
-metadata migration; that is not a first production fix.
+### Recommendation
 
-The measurement does not overturn that sequencing — it corrects its *premise*. The apps
-should not stay separate because promotions is an optional add-on (it is not; `pos_next`
-ships its own engine), but because the migration must follow a stable money path rather than
-precede it. Same destination, honest reason.
+**Option B now, with Option C as the declared destination** — noting that B and C are the
+same metadata migration performed once or twice. If a fourth consumer of promotions is
+foreseeable, do **C directly and skip B**: the incremental cost over B is mostly naming and
+one extra repository, whereas redoing B as C later pays the migration twice.
 
-**Criterion for the eventual call:** *do you ship a till with no discounts, coupons or offers
-at all?* Yes → Option A permanently, and its costs are worth paying. No → Option B once
-Phase 2 is complete, and the duplication defects are deleted rather than maintained.
+NexDine's existence is itself evidence that a fourth consumer is plausible.
 
-### Deferred: `promotion_core`
+### Sequencing
 
-A third neutral app owning coupons, redemption and the eligibility/calculation engine, with
-all three apps depending on it, is the clean long-term shape. It is a migration project —
-moving live metadata between modules, preserving table names, updating hooks/fixtures/roles/
-workspaces, defining which app installs and uninstalls the shared core, and testing removal
-and reinstall. **Revisit only after the money path is tested and stable.** Not a first
-production fix.
+Neither B nor C is a first production fix. Phase 1's harness and Phase 2's fail-open defects
+precede it. What NexDine changes is the *destination*, not the order — Option A can no longer
+be the interim shape, so the interim remains the status quo (promotions installed alongside
+`pos_next`, dependency undeclared) until the migration lands. That is acceptable only because
+Phase 2 removes the exploitable paths first.
+
+### Decision criteria
+
+1. **Is `nexdine` a committed consumer of `posnext_promotions`?**
+   Yes (the premise of this revision) → B or C; A is off the table.
+   No → A becomes viable again and the prior staged recommendation stands.
+2. **Is a third POS product likely to need promotions?** Yes → go straight to C.
 
 ---
 
@@ -269,7 +309,7 @@ distinction must be explicit in the design.
 
 ---
 
-## 5. ADR-4 — Composite free items (`hospitality_core`)
+## 5. ADR-4 — Composite / recipe free items (`hospitality_core` **and** `nexdine`)
 
 > A free composite item has zero customer revenue but remains a real inventory movement and
 > incurs normal COGS. Components expand exactly once, stock is consumed exactly once, and
@@ -287,6 +327,11 @@ serial/batch selection remains mandatory where applicable.
 
 *Correction to the review:* `CODE_REVIEW.md` framed this as a `hospitality_core` defect. It is
 not. It is an unstated policy, now stated.
+
+*Scope correction:* the policy applies to **two** independent expanders —
+`nexdine.nexdine.hooks.nexdine_recipe_stock` and
+`hospitality_core.api.composite_item_utils.process_composite_items_in_invoice`. On a site
+running both, "expanded exactly once" is an integration test, not a unit test.
 
 ---
 
@@ -314,7 +359,60 @@ become indirect mutation paths.
 
 ---
 
-## 7. Defect register
+## 7. ADR-6 — POS Invoice parity (NexDine blocker)
+
+`posnext_promotions` is Sales-Invoice-native. NexDine is POS-Invoice-native. Today the app
+registers **one** hook on POS Invoice, and it self-disables.
+
+| Capability | Sales Invoice | POS Invoice | Effect on NexDine |
+|---|---|---|---|
+| Min/Max cross-cart discounts | `validate` | `validate` — **but returns early when `pos_next` is installed** (`overrides/pricing_rule.py:714`) | **does not run** |
+| Authorization gate | `before_submit` | **absent** | no approval on returns, overrides or price edits |
+| One-time redemption recording | `on_submit` | **absent** | one-time offers never recorded → infinitely reusable |
+| One-time release on cancel | `on_cancel` | **absent** | ledger never reversed |
+| Free-bundle qty combining | `validate` | **absent** | free product bundles mis-priced |
+
+**Net: on a NexDine site with `pos_next` also installed, `posnext_promotions` does nothing.**
+
+### Required
+
+1. **Doctype-agnostic lifecycle registration.** A single table of `(doctype, event, handler)`
+   derived from one source, so Sales Invoice and POS Invoice cannot drift. The current
+   asymmetry exists because each hook was added by hand.
+2. **Delete the `"pos_next" in frappe.get_installed_apps()` branch** (`overrides/pricing_rule.py:714`).
+   Under ADR-1 Option B or C there is exactly one implementation, so the guard has nothing to
+   defer to. It is the reason the one hook NexDine does get is inert.
+3. **POS Invoice free-item and stock semantics** differ from Sales Invoice — POS Invoice
+   carries its own stock and consolidation path via POS Invoice Merge Log. Submit-time gift
+   validation (defect e) must be written against both, not ported.
+4. **NexDine's own recipe expansion.** `nexdine.nexdine.hooks.nexdine_recipe_stock.before_submit`
+   is NexDine's composite/recipe consumption — **separate from `hospitality_core`'s**. ADR-4's
+   free-composite policy applies to it independently, and on a site running both, ADR-4's
+   "expanded exactly once" acceptance condition has two candidate expanders.
+
+### NexDine-side defects found
+
+**N1 — open-ended promotions are invisible offline.** `nexdine/nexdine/api/nexdine_offline.py:356-374`
+`_fetch_active_offers` filters:
+
+```python
+filters={"disable": 0, "valid_from": ["<=", today], "valid_upto": [">=", today]}
+```
+
+A Pricing Rule with a `NULL` `valid_upto` — an open-ended promotion, the common case — fails
+`>= today` and is silently excluded from the offline cache. Same for `NULL valid_from`. Fix:
+`["in", [None, ...]]` handling or an explicit `or_filters` on null.
+
+**N2 — the offline offer payload cannot express eligibility.** The same function returns only
+`name, title, apply_on, rate_or_discount, discount_percentage, rate`. No items, item groups,
+brands, `min_qty` or `min_amt`. Any rule scoped to anything narrower than "everything" cannot
+be evaluated correctly offline from this payload. This is the natural integration seam:
+`posnext_promotions.api.offers.get_offers` already produces the complete, pre-expanded payload
+this needs (ADR-3's offline-safe subset).
+
+---
+
+## 8. Defect register
 
 Severity · exploit prerequisites · confidence · affected flows. **All findings are
 verified-by-reading and static analysis. None has been reproduced against a live database** —
@@ -331,6 +429,9 @@ closing that gap is Phase 1.
 | g | Auth gate on Sales Invoice only; POS Invoice ungated (`hooks.py:67-79`) | High | Site using POS Invoice — **NexDine does** | Confirmed | Returns, overrides | No |
 | h | PIN lockout fails open on cache error (`pin.py:201-227`) | High | Redis degraded | Confirmed | Authorization | No |
 | i | Import-time ERPNext patch, `except Exception: pass` (`__init__.py:43`) | High | Any | Confirmed by probe: patch applies, but failure is indistinguishable from success | All pricing | No |
+| j | **POS Invoice hook gap** — 1 of 5 capabilities registered, and that one self-disables (ADR-6) | Critical **for NexDine** | Site is POS-Invoice-based | Confirmed | Everything, on NexDine | No |
+| N1 | `_fetch_active_offers` excludes `NULL valid_upto` (`nexdine/nexdine/api/nexdine_offline.py:356-374`) | Medium | Open-ended promotion | Confirmed | NexDine offline offers | No |
+| N2 | Offline offer payload carries no eligibility scope (same function) | Medium | Any scoped rule | Confirmed | NexDine offline offers | Partly |
 
 Medium and low findings 11–26 carry forward from `CODE_REVIEW.md` unchanged.
 
@@ -396,21 +497,31 @@ the patch cannot apply, and add an assertion test proving the expected function 
 
 ---
 
-## 8. Harness
+## 9. Harness
 
 Deliberately boring and reproducible. **CI must report exact discovered and executed test
 counts** — "command exited successfully" is insufficient when 227 tests are spread across four
 directories.
 
+**Do not invent this.** `nexdine/.github/workflows/ci.yml` is a complete, working Frappe v15
+harness: MariaDB 10.6 and Redis 7 services, Python 3.12 and Node 20, pip and yarn caching,
+`bench init --frappe-branch version-15`, sequential `bench get-app` / `install-app` for
+payments, erpnext, hrms and the app under test, `bench build`, then
+`bench --site test_site run-tests --app <app>` with `allow_tests true`, plus a separate
+frontend job. Copy it and change the app list per matrix. This retires the largest single
+blocker in the project at near-zero cost.
+
 ### Application matrices
 
 | Matrix | Purpose |
 |---|---|
-| ERPNext + promotions | Proves the standalone claim — **delete this matrix if ADR-1 resolves to A or B**, and change the README rather than building fake optionality |
-| ERPNext + `pos_next` | Protects current POS behaviour |
-| ERPNext + `pos_next` + promotions | Primary composition |
-| ERPNext + `pos_next` + promotions + `hospitality_core` | NexDine integration |
-| Same composed site, alternate app ordering | Detects order-dependent hooks and assets |
+| ERPNext + promotions | Standalone. **Required** under ADR-1 Option B or C — it is the shape NexDine installs |
+| ERPNext + `pos_next` (+ promotions under B/C) | Protects current `pos_next` behaviour |
+| ERPNext + `pos_next` + promotions | Sales Invoice composition |
+| ERPNext + hrms + `nexdine` + promotions | **NexDine composition — POS Invoice path.** The one that matters for this revision |
+| ERPNext + hrms + `nexdine` + `pos_next` + promotions | Both POS products on one site (current bench shape) |
+| ERPNext + `nexdine` + `hospitality_core` + promotions | Two composite/recipe expanders — ADR-4 "expanded exactly once" |
+| Any composed site, alternate `apps.txt` ordering | Detects order-dependent hooks and assets |
 
 ### Layers
 
@@ -442,10 +553,14 @@ formatting baseline in its own commit, then enforce it on new changes.
 
 ---
 
-## 9. NexDine composition
+## 10. Composed-site orchestration
 
-Three apps must not independently attach business logic to invoice events. One orchestrator
-per lifecycle event, each handler idempotent and owning a distinct responsibility:
+Multiple apps must not independently attach business logic to invoice events. On the current
+bench, **`nexdine`, `pos_next`, `hospitality_core` and `posnext_promotions` can all be
+installed together**, and `nexdine` alone registers 8 handlers across POS Invoice's 6 events.
+
+One orchestrator per lifecycle event, each handler idempotent and owning a distinct
+responsibility — and registered for **both** invoice doctypes (ADR-6):
 
 ```
 invoice.validate
@@ -453,27 +568,43 @@ invoice.validate
   → authorize protected actions
   → evaluate promotions
   → validate promotion stock
-  → calculate hospitality consumption
+  → calculate composite / recipe consumption
 
 invoice.on_submit
   → consume coupon / redemption
   → write promotion audit
-  → record hospitality consumption
+  → record composite / recipe consumption
 ```
 
-**JavaScript:** remove the global `pn_*` functions. Use namespaced modules or one form script
-importing registered contributors. Asset inclusion must be explicit through hooks and build
-manifests, **never dependent on `apps.txt` order**.
+**Ordering.** `apps.txt` currently reads `… pos_next, brainwise_fleet, nexdine,
+hospitality_core, payments` — promotions is not installed on this bench at all. Any design
+that depends on that ordering is a defect; ADR-2's provider registration and ADR-6's
+doctype-agnostic table exist to remove the dependency.
 
-**Composite free items:** implement ADR-4.
+**JavaScript.** Remove the global `pn_*` functions. Namespaced modules or one form script
+importing registered contributors. Asset inclusion explicit through hooks and build
+manifests, never `apps.txt` order. NexDine's POS is a separate Vue app at `nexdine/pos` — it
+does not consume `pos_next`'s offer-strategy registry, so `public/pos/offer-strategies.js`
+needs a second, framework-neutral delivery path or NexDine gets no offline promotion logic.
+
+**Composite / recipe expansion.** Two independent expanders exist —
+`nexdine.nexdine.hooks.nexdine_recipe_stock` and
+`hospitality_core.api.composite_item_utils.process_composite_items_in_invoice`. ADR-4's
+"components expanded exactly once" must be tested on a site running both.
 
 ---
 
-## 10. Delivery
+## 11. Delivery
 
 Parallel workstreams, not a linear sequence.
 
 ### Phase 0 — Establish facts; contain if needed
+
+**Partially answered:** NexDine's README states it has been *"running at scale, serving over
+10+ outlets for the past 10 months."* Those outlets are live systems. What remains unknown is
+whether `posnext_promotions` is installed on any of them — it is **not** installed on this
+bench (`sites/apps.txt` does not list it), which is weak evidence it is not yet deployed
+anywhere, but not proof.
 
 Deployment inventory: production and staging site list; `bench --site … list-apps` from every
 managed site; installed app versions and commit hashes; whether any POS Profile has promotions
@@ -531,7 +662,7 @@ one promotion type at a time.
 
 ---
 
-## 11. Definition of production-ready
+## 12. Definition of production-ready
 
 The app may run on a till only when **all** of the following hold:
 
@@ -548,12 +679,14 @@ The app may run on a till only when **all** of the following hold:
 
 ---
 
-## 12. Open decisions
+## 13. Open decisions
 
 | # | Decision | Owner | Blocks |
 |---|---|---|---|
-| 1 | **ADR-1** — confirm companion-now / consolidate-later, and the trigger for the latter | Product | Phase 5 shape; whether duplication defects are maintained or deleted |
-| 2 | Deployment inventory | Deployment owner | Phase 0 branch |
+| 1 | **ADR-1** — Option B or C. Option A is eliminated by NexDine | Product | Everything downstream |
+| 1b | Is a third POS product likely to need promotions? Yes → go straight to C | Product | Whether the metadata migration is paid once or twice |
+| 1c | **ADR-6** — commit to POS Invoice parity | Engineering | Whether NexDine can use the app at all |
+| 2 | Deployment inventory — **NexDine's README claims 10+ outlets for 10 months**, so at least that stack is live; confirm whether promotions is installed on any of them | Deployment owner | Phase 0 branch |
 | 3 | Endpoint classification for ADR-5 | Engineering | Authorization hardening scope |
 | 4 | Offline manual-rate-override ceilings and authorization rules | Product + Finance | Phase 3 |
 | 5 | Rounding-difference tolerance for sync reconciliation | Finance | Phase 3 |
