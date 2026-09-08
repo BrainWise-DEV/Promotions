@@ -7,6 +7,13 @@ security, cross-app safety and dead weight — in that order.
 Every finding below names `file:line` and the concrete way it breaks. Nothing here is
 "consider extracting this".
 
+> **ERRATA — 2026-09-08.** Findings 1 and 4 below are corrected by cross-repository
+> analysis performed after this review was first published. Finding 1 was **overstated**;
+> finding 4 was **understated** and is worse than described. Both corrections are marked
+> inline. The architecture response lives in
+> [`docs/superpowers/specs/2026-09-08-promotions-remediation-design.md`](docs/superpowers/specs/2026-09-08-promotions-remediation-design.md),
+> which supersedes this document where they differ.
+
 **Tooling evidence (run on a clean clone of `main`):**
 
 | Check | Result |
@@ -24,10 +31,10 @@ So the repo's own pre-commit config fails on its own default branch.
 
 | # | Finding | Sev |
 |---|---|---|
-| 1 | `POS Coupon.used` is never incremented — `maximum_use` / `one_use` / gift cards unenforced | Critical |
+| 1 | Coupon redemption lives in `pos_next`'s API layer, not a lifecycle hook; failure is swallowed (**corrected**) | Critical |
 | 2 | `apply_offers` re-admits client-named Pricing Rules past every gate | Critical |
 | 3 | Coupon discount is computed from client-supplied totals | Critical |
-| 4 | `record_one_time_offer_usage` blocks Sales Invoice submit without `pos_next` | Critical |
+| 4 | `::` vs `:` — the server-side one-time gate never fires, in **both** repos (**corrected, worse**) | Critical |
 | 5 | Free-gift stock is checked only in the preview API, never at submit | High |
 | 6 | `increment_coupon_usage` is a lost-update + mid-request `db.commit()` | High |
 | 7 | `before_install` force-deletes Module Defs it does not own | High |
@@ -55,34 +62,33 @@ So the repo's own pre-commit config fails on its own default branch.
 
 ## Critical
 
-### 1. `POS Coupon.used` is never incremented — global coupon limits do not exist
+### 1. Coupon redemption is in the wrong layer, and its failure is swallowed
+
+> **CORRECTED.** This finding originally claimed `POS Coupon.used` is never incremented.
+> That was wrong: `pos_next/api/invoices.py:1391` does increment it. The real defects are
+> narrower and are stated below.
 
 `posnext_promotions/api/coupon_engine.py:437` and `:451` define `increment_coupon_usage` /
-`decrement_coupon_usage`. **Nothing calls them.** There is no `doc_events` entry for coupon
-usage in `hooks.py:49-80`, and `grep -rn "increment_coupon_usage" .` returns only the
-definition.
+`decrement_coupon_usage`. Nothing in this app calls them — no `doc_events` entry exists in
+`hooks.py:49-80`. They are dead code.
 
-Meanwhile the gate at `coupon_engine.py:38` reads that counter:
+Enforcement exists only because `pos_next` supplies it, and it has three problems:
 
-```python
-if coupon.used and coupon.maximum_use and coupon.used >= coupon.maximum_use:
-```
+1. **Wrong layer.** `pos_next/api/invoices.py:1391` increments from the POS API, not from a
+   Sales Invoice lifecycle hook. An invoice submitted from the desk, from a script, or
+   through `hospitality_core`'s flows never increments the counter — the coupon limit
+   silently does not apply to those paths.
+2. **Failure is swallowed.** The caller wraps it in `try/except` that logs and continues, so
+   a failed increment leaves the sale completed and the coupon un-capped.
+3. **Lost update.** `pos_next/pos_next/doctype/pos_coupon/pos_coupon.py:181-201` is
+   read-modify-write with no `for_update`, plus a `frappe.db.commit()` inside the invoice
+   transaction. Two terminals redeeming the final allowance concurrently both read `used = 49`
+   against `maximum_use = 50` and both write 50.
 
-`used` stays at its initial value forever, so the condition is never true.
-
-**Failure scenario.** A "1000 EGP off, `maximum_use = 50`" campaign coupon is issued.
-`used` never leaves 0, so the 51st, 500th and 5000th redemption all pass validation. The
-per-customer path (`_get_customer_coupon_usage_count`, `:78`) still works because it counts
-submitted invoices — but it filters on `customer`, so a coupon with no `customer` set is
-unlimited across distinct customers.
-
-Worse for gift cards: `api/offers.py:987` lists active gift cards with `filters={..., "used": 0}`.
-A gift card is therefore *permanently* "unused" and can be spent an unbounded number of times.
-
-**Fix:** hook `record`/`release` onto `Sales Invoice` `on_submit`/`on_cancel` alongside the
-one-time-usage handlers, and do the increment as an atomic `UPDATE` (see finding 6).
-
----
+**Fix:** replace the mutable counter as the *authority* with an immutable redemption ledger,
+keeping `used` as a denormalised display value; move consumption into the invoice transaction;
+make the limit check atomic; and reverse idempotently on cancel. See ADR-2 and defect (b) in
+the design spec.
 
 ### 2. `apply_offers` re-admits client-named Pricing Rules past every gate
 
@@ -156,39 +162,60 @@ not as input.
 
 ---
 
-### 4. `record_one_time_offer_usage` blocks Sales Invoice submit without `pos_next`
+### 4. `::` vs `:` — the server-side one-time gate never fires, in both repos
 
-`api/one_time_usage.py:26-36` is wired to `Sales Invoice` `on_submit` (`hooks.py:73`):
+> **CORRECTED — worse than originally reported.** This was first written as a fragile
+> assumption about another repo's naming format. It is a live, confirmed defect, and it is
+> present in `pos_next` as well as here.
+
+The DocType's autoname is **one colon**:
+
+```json
+"autoname": "format:{customer}:{pricing_rule}"
+```
+*(`pos_next/pos_next/doctype/one_time_customer_offer_usage/one_time_customer_offer_usage.json:3`)*
+
+Both call sites look up **two colons**:
+
+- `posnext_promotions/api/apply_offers.py:1358`
+- `pos_next/api/invoices.py:3157`
 
 ```python
-frappe.get_doc({"doctype": "One Time Customer Offer Usage", ...}).insert(...)
+frappe.db.exists("One Time Customer Offer Usage", f"{customer}::{record.name}")
 ```
 
-`One Time Customer Offer Usage` is **not shipped by this app** — `posnext_promotions/*/doctype/`
-contains only `pos_gift_pool_item`, `pos_coupon_excluded_brand` and the four auth-gate
-doctypes. It lives in `pos_next`. But `hooks.py:9` declares `required_apps = ["erpnext"]`
-and the README states the app does not depend on `pos_next`.
+That key can never exist, so the check is always falsy.
 
-The asymmetry is the tell: the cancel twin at `:40` guards with
-`frappe.db.exists("DocType", ...)`; the submit path does not.
+**Failure scenario.** A one-time-per-customer offer is redeemed. The server-side gate that is
+supposed to block a second redemption evaluates falsy every time. Only the frontend's cached
+`get_customer_one_time_redemptions` list (`api/offers.py:640`, which uses a proper field
+filter and therefore works) prevents reuse — so any client that does not consult that cache,
+or that is replayed offline, re-redeems freely.
 
-**Failure scenario.** Install `posnext_promotions` on a site without `pos_next`, set
-`pos_applied_one_time_rules` on a Sales Invoice (any code path that writes that custom field),
-and submit. `frappe.get_doc(...).insert()` raises `DoesNotExistError` inside `on_submit`,
-rolling back the submission. The till cannot close the sale.
+**Root cause, and why fixing the two call sites is not enough.** The wrong format originates
+in prose and was copied from it:
 
-`apply_offers.py:1358` has the same unguarded reference:
-`frappe.db.exists("One Time Customer Offer Usage", f"{customer}::{record.name}")`.
+- `one_time_customer_offer_usage.json:3` `description`: *"the document name is the composite
+  key `{customer}::{pricing_rule}`"*
+- `pos_next/api/sales_invoice_hooks.py:119`: *"the doctype's composite name
+  (`{customer}::{pricing_rule}`)"*
 
-That line also hardcodes an assumption about the doctype's autoname format
-(`"{customer}::{rule}"`) that is defined in another repository. If `pos_next` ever changes it
-to `hash`, the check silently returns falsy and one-time offers become infinitely reusable —
-with no error anywhere.
+Both contradict the autoname three lines above one of them.
 
-**Fix:** guard the insert the same way the delete is guarded, and replace the name-format
-lookup with a filter dict (`{"customer": ..., "pricing_rule": ...}`).
+**Fix:** introduce a single `make_redemption_key(customer, pricing_rule)` helper, stop
+formatting keys at call sites, add a unique database constraint on the semantic fields, treat
+`name` as an implementation detail, correct both docstrings, and add a cross-repository
+contract test. Migration must detect both one- and two-colon historical rows and check for
+duplicates before normalising.
 
----
+### 4b. `record_one_time_offer_usage` is unguarded against a missing DocType
+
+Separately from the above: `api/one_time_usage.py:26-36` inserts into
+`One Time Customer Offer Usage` with no existence check, while its cancel twin at `:40`
+guards with `frappe.db.exists("DocType", ...)`. On a site without `pos_next` — which
+`hooks.py:9` (`required_apps = ["erpnext"]`) and the README claim is supported — the insert
+raises inside `on_submit` and the sale cannot be closed. Resolved either by declaring the
+dependency or by consolidating ownership; see ADR-1.
 
 ## High
 
@@ -599,12 +626,18 @@ notes.
 `POS Invoice` and `Sales Invoice` `on_submit`. It walks `doc.items`, and for anything with
 `is_composite_item` creates a Material Consumption stock entry for the recipe ingredients.
 
-It does not check `is_free_item`. So a promotion that grants a free composite dish (Gift Pool, GWP,
-or a product free rule) will consume its full ingredient cost at a zero-revenue line. That is
-arguably correct for stock, but it books the cost against a line with no offsetting revenue and no
-promotional-expense account. In a restaurant, where nearly every sellable item is composite, this is
-the most likely source of margin surprises. Decide the accounting treatment before enabling
-Gift Pool or GWP on NexDine outlets.
+It does not check `is_free_item`.
+
+> **CORRECTED.** This was originally framed as a `hospitality_core` defect. It is not — a free
+> dish genuinely does consume ingredients and genuinely does incur COGS, so consuming stock at a
+> zero-revenue line is the economically correct behaviour. What is missing is a *stated policy*,
+> not a fix.
+
+The policy is now stated in ADR-4 of the design spec: zero customer revenue, normal stock
+consumption, normal COGS, components expanded exactly once, and `is_free_item` provenance
+propagated for reporting without suppressing stock or accounting entries. The open risks are
+double expansion (both apps walking the same rows) and reversal on return or cancel — both of
+which need tests before Gift Pool or GWP is enabled on a NexDine outlet.
 
 ### E. Room-charge posting and header-level discounts
 
