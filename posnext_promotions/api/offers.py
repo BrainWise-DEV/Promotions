@@ -119,6 +119,7 @@ class Offer:
 	min_scopes_required: int = 1
 	gwp_paid_qty_basis: str | None = None
 	gift_pool_items: list[dict] | None = None
+	gwp_free_items: list[dict] | None = None
 
 	def to_dict(self) -> dict:
 		"""Convert to dictionary for API response"""
@@ -617,6 +618,7 @@ def get_offers(pos_profile: str) -> list[dict]:
 		_attach_accumulative_config(offers)
 		_attach_schedule(offers)
 		_attach_gift_pool_config(offers)
+		_attach_gwp_free_items_config(offers)
 
 		return [offer.to_dict() for offer in offers]
 
@@ -730,6 +732,37 @@ def _attach_gift_pool_config(offers: list[Offer]) -> None:
 	for offer in offers:
 		if offer.promotional_scheme in by_scheme:
 			offer.gift_pool_items = by_scheme[offer.promotional_scheme]
+
+
+def _attach_gwp_free_items_config(offers: list[Offer]) -> None:
+	"""Stamp ordered GWP free items onto GWP offers for the POS cart."""
+	scheme_names = [
+		offer.promotional_scheme
+		for offer in offers
+		if offer.promotion_type == PROMOTION_TYPE_GWP and offer.promotional_scheme
+	]
+	if not scheme_names:
+		return
+	if not frappe.db.exists("DocType", "POS GWP Free Item"):
+		return
+
+	rows = frappe.get_all(
+		"POS GWP Free Item",
+		filters={"parent": ["in", scheme_names], "parenttype": "Promotional Scheme"},
+		fields=["parent", "item_code", "item_name", "idx"],
+		order_by="idx asc",
+	)
+	by_scheme: dict[str, list[dict]] = {}
+	for row in rows:
+		by_scheme.setdefault(row.parent, []).append(
+			{
+				"item_code": row.item_code,
+				"item_name": row.item_name,
+			}
+		)
+	for offer in offers:
+		if offer.promotional_scheme in by_scheme:
+			offer.gwp_free_items = by_scheme[offer.promotional_scheme]
 
 
 def _get_promotional_scheme_offers(company: str, date: str) -> list[Offer]:

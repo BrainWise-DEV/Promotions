@@ -57,6 +57,7 @@ try:
 		distribute_gwp_free_units_for_basis,
 		get_gwp_same_item_free_qty,
 		get_gwp_slab_free_qty,
+		get_scheme_gwp_free_items,
 		item_matches_pricing_rule_apply_on,
 		should_aggregate_gwp_quantities,
 	)
@@ -101,6 +102,7 @@ except Exception:  # pragma: no cover
 	allocate_gift_pool_free_items = None
 	get_scheme_gift_pools = None
 	get_scheme_gift_pool_qtys = None
+	get_scheme_gwp_free_items = None
 	expanded_groups = None
 
 
@@ -382,7 +384,14 @@ def _apply_bundled_same_item_free_discounts(prepared_items, free_items_map, rule
 			break
 
 
-def _apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_rules=None) -> None:
+def _apply_gwp_line_discounts(
+	prepared_items,
+	free_items_map,
+	rule_map,
+	applied_rules=None,
+	warehouse=None,
+	pos_profile=None,
+) -> None:
 	"""Apply GWP: same-SKU gifts as a free row; mixed SKUs as line discounts.
 
 	Same item (one SKU in the cart): free units must be extra scanned items,
@@ -425,6 +434,76 @@ def _apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_
 
 		paid_lines = [item_doc for item_doc in matching_lines if not item_doc.get("is_free_item")]
 		if not paid_lines:
+			continue
+
+		pool_codes = (
+			get_scheme_gwp_free_items(promotional_scheme)
+			if get_scheme_gwp_free_items and promotional_scheme
+			else []
+		)
+		if pool_codes and allocate_gift_pool_free_items:
+			item_codes = {cstr(item_doc.get("item_code")) for item_doc in matching_lines if item_doc.get("item_code")}
+			same_item_split = len(item_codes) == 1 and bool(get_gwp_same_item_free_qty)
+			if same_item_split:
+				line_qtys = [
+					flt(item_doc.get("qty") or item_doc.get("quantity") or 0) for item_doc in matching_lines
+				]
+				total_free = get_gwp_same_item_free_qty(
+					slab_free_qty, sum(line_qtys), full_rule.min_qty, full_rule.max_qty
+				)
+			elif aggregate:
+				line_qtys = [
+					flt(item_doc.get("qty") or item_doc.get("quantity") or 0) for item_doc in paid_lines
+				]
+				total_free = get_gwp_slab_free_qty(
+					slab_free_qty, sum(line_qtys), full_rule.min_qty, full_rule.max_qty
+				)
+			else:
+				total_free = 0
+				for item_doc in paid_lines:
+					line_qty = flt(item_doc.get("qty") or item_doc.get("quantity") or 0)
+					total_free += get_gwp_slab_free_qty(
+						slab_free_qty, line_qty, full_rule.min_qty, full_rule.max_qty
+					)
+
+			if total_free <= 0:
+				for item_doc in paid_lines:
+					remove_pricing_rule(item_doc, rule_name)
+				if applied_rules is not None:
+					applied_rules.discard(rule_name)
+				continue
+
+			granted = allocate_gift_pool_free_items(
+				1,
+				pool_codes,
+				total_free,
+				available_qty=_gift_pool_available_qty(
+					pool_codes, warehouse, prepared_items, pos_profile
+				),
+			)
+			if not granted:
+				for item_doc in paid_lines:
+					remove_pricing_rule(item_doc, rule_name)
+				if applied_rules is not None:
+					applied_rules.discard(rule_name)
+				continue
+
+			for item_doc in paid_lines:
+				append_pricing_rule(item_doc, rule_name)
+
+			for gift_code, gift_qty in granted.items():
+				existing = free_items_map.get((gift_code, rule_name))
+				if existing:
+					existing.qty = _floor_free_item_qty(flt(existing.get("qty")) + gift_qty)
+				else:
+					free_items_map[(gift_code, rule_name)] = _make_free_item_doc(
+						gift_code,
+						gift_qty,
+						rule_name,
+						full_rule,
+						promotional_scheme,
+						discount_source=DISCOUNT_SOURCE_GWP,
+					)
 			continue
 
 		item_codes = {cstr(item_doc.get("item_code")) for item_doc in matching_lines if item_doc.get("item_code")}
@@ -1618,7 +1697,14 @@ def apply_offers(invoice_data, selected_offers=None):
 			prepared_items, free_items_map, rule_map, applied_rules
 		)
 		_apply_bundled_same_item_free_discounts(prepared_items, free_items_map, rule_map)
-		_apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_rules)
+		_apply_gwp_line_discounts(
+			prepared_items,
+			free_items_map,
+			rule_map,
+			applied_rules,
+			warehouse=profile.warehouse,
+			pos_profile=invoice.get("pos_profile"),
+		)
 		_apply_gift_pool_free_items(
 			prepared_items,
 			free_items_map,

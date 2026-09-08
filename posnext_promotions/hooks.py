@@ -52,11 +52,13 @@ doc_events = {
 			"posnext_promotions.promotions.schedule.normalize_schedule_fields",
 			"posnext_promotions.overrides.pricing_rule.normalize_accumulative_scheme",
 			"posnext_promotions.overrides.pricing_rule.normalize_gift_pool_scheme",
+			"posnext_promotions.overrides.pricing_rule.normalize_gwp_scheme",
 		],
 		"validate": [
 			"posnext_promotions.overrides.pricing_rule.enforce_cross_cart_pricing_config",
 			"posnext_promotions.overrides.pricing_rule.validate_unique_promotion_type_per_item",
 			"posnext_promotions.overrides.pricing_rule.validate_gift_pool_scheme",
+			"posnext_promotions.overrides.pricing_rule.validate_gwp_scheme",
 		],
 		"on_update": "posnext_promotions.overrides.pricing_rule.sync_promotion_fields_to_pricing_rules",
 	},

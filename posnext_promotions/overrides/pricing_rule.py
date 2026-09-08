@@ -55,7 +55,16 @@ ACCUMULATIVE_MODE = "Accumulative"
 CROSS_CART_MODES = (*MIN_MAX_OPTIONS, ACCUMULATIVE_MODE)
 
 PROMOTION_TYPE_ITEM_LEVEL = "Item Level Discount"
+PROMOTION_TYPE_GWP = "GWP"
 PROMOTION_TYPE_GIFT_POOL = "Gift Pool"
+
+# Scheme-level thresholds projected onto GWP product discount slabs.
+GWP_PARENT_TO_SLAB = {
+	"min_qty": "min_qty",
+	"max_qty": "max_qty",
+	"min_amount": "min_amount",
+	"max_amount": "max_amount",
+}
 
 
 def _has_pos_only_column():
@@ -118,15 +127,16 @@ def sync_promotion_fields_to_pricing_rules(doc, method=None):
 			# so same_item must stay 1. Mixed-SKU GWP still discounts paid lines.
 			# Non-GWP product discounts must keep the slab's same_item / free_item as configured.
 	if frappe.db.has_column("Pricing Rule", "gwp_paid_qty_basis"):
-		from posnext_promotions.api.gwp import GWP_BASIS_MAX
+		from posnext_promotions.api.gwp import GWP_BASIS_MAX, group_gwp_free_items
 
 		is_gwp = doc.get("promotion_type") == "GWP"
+		has_gwp_pool = bool(group_gwp_free_items(doc.get("gwp_free_items") or []))
 		for slab in doc.get("product_discount_slabs") or []:
 			values = {
 				"gwp_paid_qty_basis": slab.get("gwp_paid_qty_basis") or GWP_BASIS_MAX,
 			}
 			if is_gwp:
-				values["same_item"] = 1
+				values["same_item"] = 0 if has_gwp_pool else 1
 			frappe.db.set_value(
 				"Pricing Rule",
 				{"promotional_scheme_id": slab.name},
@@ -463,6 +473,63 @@ def validate_gift_pool_scheme(doc, method=None):
 					).format(item_code, item_group),
 					title=_("Gift Pool"),
 				)
+
+
+def normalize_gwp_scheme(doc, method=None):
+	"""Project scheme-level GWP thresholds and free-item config onto product slabs.
+
+	ERPNext generates Pricing Rules from product discount slabs, so min/max qty
+	and amount live on the scheme for authoring but must be copied to each slab
+	before validate. When ``gwp_free_items`` is configured the engine grants from
+	that ordered pool instead of same-SKU / line-discount paths; the first pool
+	SKU is synced onto ``free_item`` so ERPNext's product discount row validates.
+	"""
+	if doc.doctype != "Promotional Scheme":
+		return
+	if cstr(doc.get("promotion_type") or "") != PROMOTION_TYPE_GWP:
+		return
+
+	from posnext_promotions.api.gwp import group_gwp_free_items
+
+	pool_codes = group_gwp_free_items(doc.get("gwp_free_items") or [])
+	first_free_item = pool_codes[0] if pool_codes else None
+
+	for slab in doc.get("product_discount_slabs") or []:
+		for parent_field, slab_field in GWP_PARENT_TO_SLAB.items():
+			slab.set(slab_field, doc.get(parent_field) or 0)
+		if pool_codes:
+			slab.same_item = 0
+			if first_free_item:
+				slab.free_item = first_free_item
+		else:
+			slab.same_item = 1
+
+
+def validate_gwp_scheme(doc, method=None):
+	"""Authoring guards for GWP free-item pools."""
+	if doc.doctype != "Promotional Scheme":
+		return
+	if cstr(doc.get("promotion_type") or "") != PROMOTION_TYPE_GWP:
+		return
+	if doc.get("disable"):
+		return
+
+	from posnext_promotions.api.gwp import group_gwp_free_items
+
+	pool_codes = group_gwp_free_items(doc.get("gwp_free_items") or [])
+	if not pool_codes:
+		return
+
+	seen = set()
+	for code in pool_codes:
+		if code in seen:
+			frappe.throw(
+				_("<b>{0}</b> appears more than once in <b>GWP Free Items</b>. Each item should be listed once.").format(
+					code
+				),
+				title=_("GWP"),
+			)
+		seen.add(code)
 
 
 def _resolve_accumulative_slab(doc):

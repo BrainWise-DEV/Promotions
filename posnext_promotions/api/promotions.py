@@ -400,6 +400,17 @@ def create_promotion(data):
 						},
 					)
 
+		if hasattr(scheme, "gwp_free_items"):
+			for row in data.get("gwp_free_items") or []:
+				item_code = row.get("item_code")
+				if item_code:
+					scheme.append(
+						"gwp_free_items",
+						{
+							"item_code": item_code,
+						},
+					)
+
 		# Add discount slab
 		discount_type = data.get("discount_type", "percentage")
 
@@ -506,6 +517,18 @@ def update_promotion(scheme_name, data):
 							"item_group": item_group,
 							"item_code": item_code,
 							"free_qty": row.get("free_qty") or 1,
+						},
+					)
+
+		if "gwp_free_items" in data and hasattr(scheme, "gwp_free_items"):
+			scheme.set("gwp_free_items", [])
+			for row in data.get("gwp_free_items") or []:
+				item_code = row.get("item_code")
+				if item_code:
+					scheme.append(
+						"gwp_free_items",
+						{
+							"item_code": item_code,
 						},
 					)
 

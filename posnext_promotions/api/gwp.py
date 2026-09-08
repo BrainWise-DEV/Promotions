@@ -5,6 +5,7 @@
 
 import math
 
+import frappe
 from frappe.utils import cstr, flt
 
 try:
@@ -204,3 +205,32 @@ def distribute_gwp_free_units_by_price(
 		remaining -= take
 
 	return result
+
+
+def group_gwp_free_items(rows) -> list[str]:
+	"""Return ordered unique free item codes from GWP free-item child rows."""
+	codes: list[str] = []
+	for row in rows or []:
+		item_code = cstr(_row_value(row, "item_code"))
+		if not item_code or item_code in codes:
+			continue
+		codes.append(item_code)
+	return codes
+
+
+def _scheme_gwp_free_item_rows(scheme_name: str):
+	if not scheme_name or not frappe.db.exists("DocType", "POS GWP Free Item"):
+		return []
+	if not frappe.db.exists("Promotional Scheme", scheme_name):
+		return []
+	return frappe.get_all(
+		"POS GWP Free Item",
+		filters={"parent": scheme_name, "parenttype": "Promotional Scheme"},
+		fields=["item_code", "idx"],
+		order_by="idx asc",
+	)
+
+
+def get_scheme_gwp_free_items(scheme_name: str) -> list[str]:
+	"""Load ordered free item codes for a GWP Promotional Scheme."""
+	return group_gwp_free_items(_scheme_gwp_free_item_rows(scheme_name))

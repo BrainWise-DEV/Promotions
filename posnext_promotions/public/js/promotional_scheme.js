@@ -28,6 +28,8 @@ const GWP_HIDDEN_PRODUCT_FIELDS = [
 	"apply_recursion_over",
 ];
 
+const GWP_SLAB_THRESHOLD_FIELDS = ["min_qty", "max_qty", "min_amount", "max_amount"];
+
 frappe.ui.form.on("Promotional Scheme", {
 	refresh(frm) {
 		pn_sync_min_max(frm);
@@ -101,14 +103,29 @@ function pn_toggle_gwp_fields(frm) {
 	const is_gwp = frm.doc.promotion_type === PROMOTION_TYPE_GWP;
 
 	frm.toggle_display("price_discount_slabs", !is_gwp);
+	frm.toggle_display("gwp_free_items", is_gwp);
+
+	if (is_gwp) {
+		pn_sync_gwp_mixed_conditions(frm);
+		frm.set_df_property(
+			"gwp_free_items",
+			"description",
+			__(
+				"Use <b>Select Multiple Items</b> to add several free items at once. " +
+					"<b>Free Qty</b> on the product discount slab is the total free units granted, spread across " +
+					"these item codes in list order. If the first free item is out of stock, the next in-stock item is given instead."
+			)
+		);
+		frm.set_df_property("pos_accumulative_section", "label", __("Purchase Thresholds"));
+		pn_setup_gwp_free_item_queries(frm);
+	} else {
+		frm.set_df_property("gwp_free_items", "description", "");
+		frm.set_df_property("pos_accumulative_section", "label", __("Accumulative Discount"));
+	}
 
 	const product_grid = frm.fields_dict.product_discount_slabs?.grid;
 	if (!product_grid) {
 		return;
-	}
-
-	if (is_gwp) {
-		pn_sync_gwp_mixed_conditions(frm);
 	}
 
 	(frm.doc.product_discount_slabs || []).forEach((row) => {
@@ -116,7 +133,16 @@ function pn_toggle_gwp_fields(frm) {
 	});
 
 	if (is_gwp) {
+		for (const fieldname of GWP_SLAB_THRESHOLD_FIELDS) {
+			product_grid.update_docfield_property(fieldname, "hidden", 1);
+			product_grid.update_docfield_property(fieldname, "in_list_view", 0);
+		}
 		product_grid.refresh();
+	} else {
+		for (const fieldname of GWP_SLAB_THRESHOLD_FIELDS) {
+			product_grid.update_docfield_property(fieldname, "hidden", 0);
+			product_grid.update_docfield_property(fieldname, "in_list_view", 1);
+		}
 	}
 }
 
@@ -314,6 +340,110 @@ function pn_open_gift_pool_item_picker(frm) {
 			picker.dialog.hide();
 		},
 	});
+}
+
+function pn_setup_gwp_free_item_queries(frm) {
+	if (!frm.fields_dict.gwp_free_items) {
+		return;
+	}
+
+	frm.set_query("item_code", "gwp_free_items", () => {
+		const filters = {
+			disabled: 0,
+			has_variants: 0,
+			is_sales_item: 1,
+		};
+		if (frm.doc.apply_on === "Item Code") {
+			const item_codes = (frm.doc.items || []).map((row) => row.item_code).filter(Boolean);
+			if (item_codes.length) {
+				filters.name = ["in", item_codes];
+			}
+		} else if (frm.doc.apply_on === "Item Group") {
+			const item_groups = (frm.doc.item_groups || []).map((row) => row.item_group).filter(Boolean);
+			if (item_groups.length) {
+				filters.item_group = ["in", item_groups];
+			}
+		}
+		return { filters };
+	});
+
+	const grid = frm.fields_dict.gwp_free_items.grid;
+	if (grid && !grid._pn_gwp_multi_btn) {
+		grid.add_custom_button(__("Select Multiple Items"), () => {
+			pn_open_gwp_free_item_picker(frm);
+		});
+		grid._pn_gwp_multi_btn = true;
+	}
+}
+
+function pn_open_gwp_free_item_picker(frm) {
+	const existing = new Set(
+		(frm.doc.gwp_free_items || []).map((row) => row.item_code).filter(Boolean)
+	);
+
+	const picker = new frappe.ui.form.MultiSelectDialog({
+		doctype: "Item",
+		target: frm,
+		setters: [],
+		add_filters_group: 0,
+		primary_action_label: __("Add"),
+		get_query() {
+			const filters = {
+				disabled: 0,
+				has_variants: 0,
+				is_sales_item: 1,
+			};
+			if (frm.doc.apply_on === "Item Code") {
+				const item_codes = (frm.doc.items || []).map((row) => row.item_code).filter(Boolean);
+				if (item_codes.length) {
+					filters.name = ["in", item_codes];
+				}
+			} else if (frm.doc.apply_on === "Item Group") {
+				const item_groups = (frm.doc.item_groups || []).map((row) => row.item_group).filter(Boolean);
+				if (item_groups.length) {
+					filters.item_group = ["in", item_groups];
+				}
+			}
+			return { filters };
+		},
+		action(selections) {
+			if (!selections?.length) {
+				frappe.msgprint(__("Please select at least one item"));
+				return;
+			}
+			pn_add_gwp_free_item_selections(frm, selections, existing);
+			picker.dialog.hide();
+		},
+	});
+}
+
+function pn_add_gwp_free_item_selections(frm, item_codes, existing) {
+	frappe.db
+		.get_list("Item", {
+			filters: { name: ["in", item_codes] },
+			fields: ["name", "item_name"],
+			limit: item_codes.length,
+		})
+		.then((items) => {
+			const by_name = Object.fromEntries((items || []).map((item) => [item.name, item]));
+			for (const item_code of item_codes) {
+				if (existing.has(item_code)) {
+					continue;
+				}
+				const empty = (frm.doc.gwp_free_items || []).find((row) => !row.item_code);
+				const values = {
+					item_code,
+					item_name: by_name[item_code]?.item_name || item_code,
+				};
+				if (empty) {
+					frappe.model.set_value(empty.doctype, empty.name, values);
+				} else {
+					frm.add_child("gwp_free_items", values);
+				}
+				existing.add(item_code);
+			}
+			frm.refresh_field("gwp_free_items");
+		});
 }
 
 function pn_add_gift_pool_selections(frm, item_group, item_codes) {

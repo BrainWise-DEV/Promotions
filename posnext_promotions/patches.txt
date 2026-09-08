@@ -6,3 +6,4 @@ posnext_promotions.patches.v2_1_0.remove_duplicate_custom_fields
 posnext_promotions.patches.v2_2_0.rename_gwp_paid_qty_basis_options
 posnext_promotions.patches.v2_3_0.add_gift_pool_promotion_type
 posnext_promotions.patches.v2_3_0.rehome_gift_pool_item_doctype
+posnext_promotions.patches.v2_4_0.add_gwp_free_items
