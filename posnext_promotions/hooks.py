@@ -1,7 +1,7 @@
 app_name = "posnext_promotions"
 app_title = "POSNext Promotions"
 app_publisher = "BrainWise"
-app_description = "Standalone promotions engine, GWP, coupons extras, and POS authorization gate for ERPNext"
+app_description = "Standalone promotions engine, GWP, and coupons extras for ERPNext"
 app_email = "support@brainwise.me"
 app_license = "agpl-3.0"
 
@@ -43,7 +43,6 @@ override_doctype_class = {
 doctype_js = {
 	"Pricing Rule": "public/js/pricing_rule.js",
 	"Promotional Scheme": "public/js/promotional_scheme.js",
-	"User": "public/js/user.js",
 }
 
 doc_events = {
@@ -69,7 +68,6 @@ doc_events = {
 			"posnext_promotions.overrides.sales_invoice_free_bundle.combine_packed_qty_for_free_product_bundles",
 			"posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts",
 		],
-		"before_submit": "posnext_promotions.authorization.gate.enforce_document",
 		"on_submit": "posnext_promotions.api.one_time_usage.record_one_time_offer_usage",
 		"on_cancel": "posnext_promotions.api.one_time_usage.release_one_time_offer_usage",
 	},

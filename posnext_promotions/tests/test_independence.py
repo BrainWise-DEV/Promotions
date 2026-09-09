@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import unittest
 from pathlib import Path
 
@@ -85,7 +86,32 @@ class TestIndependence(unittest.TestCase):
 		bootinfo = {}
 		extend(bootinfo)
 		self.assertEqual(bootinfo.get("posnext_promotions"), 1)
-		self.assertEqual(bootinfo.get("posnext_promotions_auth"), 1)
+		# The authorization gate is owned by pos_next, so this app advertises no
+		# auth flag — the POS client calls pos_next's endpoints directly.
+		self.assertNotIn("posnext_promotions_auth", bootinfo)
+
+	def test_authorization_gate_is_not_shipped_here(self):
+		"""The gate belongs to pos_next: it governs POS actions, not promotions.
+
+		Shipping a second copy re-creates the duplicate `pos_next_auth_gate`
+		module Frappe warns about, and a second before_submit hook on Sales
+		Invoice.
+		"""
+		self.assertFalse((PKG / "authorization").exists())
+		self.assertFalse((PKG / "api" / "authorization.py").exists())
+		self.assertFalse((PKG / "pos_next_auth_gate").exists())
+		self.assertFalse((PKG / "public" / "js" / "user.js").exists())
+
+		modules = (PKG / "modules.txt").read_text()
+		self.assertNotIn("POS Next Auth Gate", modules)
+
+		hooks = (PKG / "hooks.py").read_text()
+		self.assertNotIn("authorization.gate", hooks)
+
+		customization = json.loads((PKG / "posnext_promotions" / "custom" / "sales_invoice.json").read_text())
+		fieldnames = {f["fieldname"] for f in customization["custom_fields"]}
+		self.assertNotIn("custom_authorized_by", fieldnames)
+		self.assertNotIn("custom_authorized_at", fieldnames)
 
 	def test_form_js_is_safe_to_concatenate_with_pos_next(self):
 		"""Frappe concatenates every app's doctype_js into one Function.
@@ -99,7 +125,6 @@ class TestIndependence(unittest.TestCase):
 		pairs = (
 			("public/js/promotional_scheme.js", "posnext_promotions"),
 			("public/js/pricing_rule.js", "posnext_promotions"),
-			("public/js/user.js", "posnext_promotions_auth"),
 		)
 		for rel, boot_flag in pairs:
 			ours = (PKG / rel).read_text()

@@ -9,15 +9,6 @@ except ModuleNotFoundError:  # pragma: no cover
 __version__ = "0.1.0"
 
 
-def _load_authorization_actions():
-	try:
-		from posnext_promotions.authorization.actions import sales_invoice  # noqa: F401
-	except Exception:
-		pass
-
-
-_load_authorization_actions()
-
 # ERPNext copies only a fixed list of slab fields onto generated Pricing Rules.
 try:
 	from erpnext.accounts.doctype.promotional_scheme import promotional_scheme as _promotional_scheme
