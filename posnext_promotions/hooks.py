@@ -63,10 +63,12 @@ doc_events = {
 		"before_validate": "posnext_promotions.promotions.schedule.normalize_schedule_fields",
 		"validate": "posnext_promotions.overrides.pricing_rule.enforce_cross_cart_pricing_config",
 	},
+	"POS Coupon": {"validate": "posnext_promotions.api.coupon_engine.validate_pos_coupon_scope"},
 	"Sales Invoice": {
 		"validate": [
 			"posnext_promotions.overrides.sales_invoice_free_bundle.combine_packed_qty_for_free_product_bundles",
 			"posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts",
+			"posnext_promotions.api.coupon_engine.validate_invoice_coupon_lines",
 		],
 		"on_submit": "posnext_promotions.api.one_time_usage.record_one_time_offer_usage",
 		"on_cancel": "posnext_promotions.api.one_time_usage.release_one_time_offer_usage",
@@ -74,7 +76,12 @@ doc_events = {
 	"Sales Order": {"validate": "posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts"},
 	"Quotation": {"validate": "posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts"},
 	"Delivery Note": {"validate": "posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts"},
-	"POS Invoice": {"validate": "posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts"},
+	"POS Invoice": {
+		"validate": [
+			"posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts",
+			"posnext_promotions.api.coupon_engine.validate_invoice_coupon_lines",
+		]
+	},
 }
 
 # Daily cleanup stays on pos_next develop so it does not run twice when both apps
