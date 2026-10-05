@@ -13,6 +13,11 @@ Conflict rule for PN-126 (full multi-promo comparison is PN-128):
   * Apply F&F when it is strictly larger, or when it ties (F&F wins ties).
   * Leave free-item / GWP stamped lines alone.
 
+Coverage (PN-127): exclusions always win over scope inclusions. When the
+customer is eligible but every paid line is excluded or out of scope, the
+payload carries ``reason=no_covered_items`` and a clear cart-level ``message``.
+Saving Settings clears the singleton cache, so the next apply recalculates.
+
 Callers:
 
   * :func:`compute_friends_and_family_discounts` — pure read for the POS when
@@ -28,8 +33,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import frappe
+from frappe import _
 from frappe.utils import cint, cstr, flt, nowdate
 
+from posnext_promotions.promotions.friends_and_family import (
+	COVER_EXCLUDED_BRAND,
+	COVER_EXCLUDED_ITEM,
+	COVER_EXCLUDED_ITEM_GROUP,
+	COVER_FREE_ITEM,
+	COVER_OK,
+	COVER_OUT_OF_SCOPE,
+)
 from posnext_promotions.promotions.friends_and_family_eligibility import (
 	get_customer_eligibility,
 )
@@ -43,12 +57,68 @@ _PROTECTED_SOURCES = frozenset({"gwp", "free_item"})
 
 REASON_APPLIED = "applied"
 REASON_OUT_OF_SCOPE = "out_of_scope"
+REASON_EXCLUDED = "excluded"
+REASON_NO_COVERED_ITEMS = "no_covered_items"
 REASON_OTHER_BETTER = "other_discount_better"
 REASON_PROTECTED = "protected_line"
 REASON_NOT_DISCOUNTABLE = "not_discountable"
 REASON_INELIGIBLE = "customer_ineligible"
 REASON_PROGRAM_INACTIVE = "program_inactive"
 REASON_STRIPPED = "stripped"
+
+
+def _coverage_message(program, items, applied_count: int, eligibility_message: str) -> str:
+	"""Cart-level note when the customer is eligible but nothing received F&F."""
+	if applied_count > 0:
+		return eligibility_message or (program.user_message if program else "")
+	paid = [
+		i
+		for i in (items or [])
+		if not i.get("is_free_item") and flt(i.get("qty") or i.get("quantity") or 0) > 0
+	]
+	if not paid:
+		return eligibility_message or ""
+
+	excluded = 0
+	out_of_scope = 0
+	for item in paid:
+		cover = program.covers_reason(item)
+		if cover in (COVER_EXCLUDED_ITEM, COVER_EXCLUDED_ITEM_GROUP, COVER_EXCLUDED_BRAND):
+			excluded += 1
+		elif cover == COVER_OUT_OF_SCOPE:
+			out_of_scope += 1
+
+	if excluded == len(paid):
+		return _(
+			"No Friends & Family discount applies — every item in the cart is excluded "
+			"(excluded items, item groups, or brands)."
+		)
+	if excluded or out_of_scope:
+		return _(
+			"No Friends & Family discount applies to this cart — all lines are excluded or out of scope."
+		)
+	return eligibility_message or ""
+
+
+def _attach_coverage_fields(payload, program, items, applied, eligibility) -> None:
+	"""Set cart-level message / reason / exclusion lists after line evaluation."""
+	payload["message"] = _coverage_message(program, items, applied, eligibility.message)
+	if applied == 0 and items:
+		has_uncovered = any(
+			program.covers_reason(i)
+			in (
+				COVER_EXCLUDED_ITEM,
+				COVER_EXCLUDED_ITEM_GROUP,
+				COVER_EXCLUDED_BRAND,
+				COVER_OUT_OF_SCOPE,
+			)
+			for i in items
+		)
+		if has_uncovered:
+			payload["reason"] = REASON_NO_COVERED_ITEMS
+	payload["excluded_items"] = sorted(program.excluded_items)
+	payload["excluded_item_groups"] = sorted(program.excluded_item_groups)
+	payload["excluded_brands"] = sorted(program.excluded_brands)
 
 
 @dataclass(frozen=True)
@@ -211,8 +281,18 @@ def _evaluate_line(item, program, idx: int | None = None) -> FriendsAndFamilyLin
 	if not _is_discountable(item):
 		return _result(False, 0, REASON_NOT_DISCOUNTABLE, rate=flt(item.get("rate") or 0))
 
-	if not program.covers(item):
-		return _result(False, 0, REASON_OUT_OF_SCOPE, rate=flt(item.get("rate") or price_list_rate))
+	cover = program.covers_reason(item)
+	if cover != COVER_OK:
+		reason = (
+			REASON_PROTECTED
+			if cover == COVER_FREE_ITEM
+			else (
+				REASON_EXCLUDED
+				if cover in (COVER_EXCLUDED_ITEM, COVER_EXCLUDED_ITEM_GROUP, COVER_EXCLUDED_BRAND)
+				else REASON_OUT_OF_SCOPE
+			)
+		)
+		return _result(False, 0, reason, rate=flt(item.get("rate") or price_list_rate))
 
 	fnf_pct = flt(program.discount_percentage)
 	# Best-only: F&F applies when larger than the competing %, or on a tie.
@@ -275,6 +355,7 @@ def compute_friends_and_family_discounts(customer=None, items=None, posting_date
 			applied += 1
 		payload["items"].append(result.to_client_payload())
 	payload["applied_count"] = applied
+	_attach_coverage_fields(payload, program, items, applied, eligibility)
 	return payload
 
 
@@ -344,11 +425,9 @@ def apply_friends_and_family_to_items(items, customer=None, posting_date=None) -
 				)
 				applied += 1
 			else:
-				# Covered comparison lost, or out of scope: drop a stale F&F stamp
-				# but keep a competing better discount.
+				# Covered comparison lost, or out of scope / excluded: drop a stale
+				# F&F stamp but keep a competing better discount.
 				_clear_friends_and_family_stamp(item)
-				# If we cleared F&F and there was no competing discount, rates are
-				# already restored by _clear_friends_and_family_stamp.
 				result = FriendsAndFamilyLineResult(
 					item_code=result.item_code,
 					applies=False,
@@ -363,6 +442,8 @@ def apply_friends_and_family_to_items(items, customer=None, posting_date=None) -
 		payload["items"].append(result.to_client_payload())
 
 	payload["applied_count"] = applied
+	if program is not None:
+		_attach_coverage_fields(payload, program, items, applied, eligibility)
 	return payload
 
 

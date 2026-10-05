@@ -53,7 +53,10 @@ class TestFriendsandFamilySettings(FrappeTestCase):
 				"end_date": None,
 				"applicable_brands": [],
 				"applicable_item_groups": [],
+				"applicable_items": [],
 				"excluded_brands": [],
+				"excluded_items": [],
+				"excluded_item_groups": [],
 			}
 		)
 		doc.update(values)
@@ -155,3 +158,61 @@ class TestFriendsandFamilySettings(FrappeTestCase):
 		self.assertEqual(payload["discount_scope"], "Brand")
 		self.assertEqual(payload["brands"], [BRAND])
 		self.assertEqual(payload["end_date"], "2026-10-31")
+
+
+	def test_excluded_item_never_covered(self):
+		item_code = "_Test FF Gift Card"
+		if not frappe.db.exists("Item", item_code):
+			frappe.get_doc(
+				{
+					"doctype": "Item",
+					"item_code": item_code,
+					"item_name": item_code,
+					"item_group": OTHER_GROUP,
+					"brand": BRAND,
+					"stock_uom": "Nos",
+					"is_stock_item": 0,
+				}
+			).insert()
+		self._configure(excluded_items=[{"item_code": item_code}])
+		program = get_active_program("2026-10-05")
+		self.assertFalse(program.covers(_line(item_code=item_code, brand=BRAND, item_group=OTHER_GROUP)))
+		self.assertTrue(program.covers(_line(brand=BRAND, item_group=CHILD_GROUP)))
+		self.assertEqual(program.to_client_payload()["excluded_items"], [item_code])
+
+	def test_excluded_item_group_never_covered(self):
+		self._configure(excluded_item_groups=[{"item_group": OTHER_GROUP}])
+		program = get_active_program("2026-10-05")
+		self.assertFalse(program.covers(_line(item_group=OTHER_GROUP, brand=BRAND)))
+		self.assertTrue(program.covers(_line(item_group=CHILD_GROUP, brand=BRAND)))
+
+	def test_item_code_scope_only_listed_items(self):
+		item_code = "_Test FF Scoped Item"
+		if not frappe.db.exists("Item", item_code):
+			frappe.get_doc(
+				{
+					"doctype": "Item",
+					"item_code": item_code,
+					"item_name": item_code,
+					"item_group": CHILD_GROUP,
+					"brand": BRAND,
+					"stock_uom": "Nos",
+					"is_stock_item": 0,
+				}
+			).insert()
+		self._configure(discount_scope="Item Code", applicable_items=[{"item_code": item_code}])
+		program = get_active_program("2026-10-05")
+		self.assertTrue(program.covers(_line(item_code=item_code)))
+		self.assertFalse(program.covers(_line(item_code="_Test FF Item")))
+
+	def test_enabled_item_code_scope_without_items_raises(self):
+		with self.assertRaises(frappe.ValidationError):
+			self._configure(discount_scope="Item Code")
+
+	def test_exclusion_change_recalculates_on_next_evaluation(self):
+		self._configure()
+		program = get_active_program("2026-10-05")
+		self.assertTrue(program.covers(_line(brand=OTHER_BRAND)))
+		self._configure(excluded_brands=[{"brand": OTHER_BRAND}])
+		program = get_active_program("2026-10-05")
+		self.assertFalse(program.covers(_line(brand=OTHER_BRAND)))

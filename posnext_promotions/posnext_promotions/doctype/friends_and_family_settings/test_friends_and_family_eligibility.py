@@ -99,7 +99,10 @@ class TestFriendsandFamilyEligibility(FrappeTestCase):
 				"end_date": None,
 				"applicable_brands": [],
 				"applicable_item_groups": [],
+				"applicable_items": [],
 				"excluded_brands": [],
+				"excluded_items": [],
+				"excluded_item_groups": [],
 				"eligibility_basis": "Customer Group or Flag",
 				"eligible_customer_groups": [
 					{"customer_group": FF_GROUP},

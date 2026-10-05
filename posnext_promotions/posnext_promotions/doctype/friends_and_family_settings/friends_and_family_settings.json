@@ -24,7 +24,11 @@
   "applicable_brands",
   "item_groups_section",
   "applicable_item_groups",
+  "items_section",
+  "applicable_items",
   "exclusions_section",
+  "excluded_items",
+  "excluded_item_groups",
   "excluded_brands",
   "messages_section",
   "user_message"
@@ -110,8 +114,9 @@
    "fieldname": "discount_scope",
    "fieldtype": "Select",
    "label": "Discount Scope",
-   "options": "Entire Cart\nBrand\nItem Group",
-   "reqd": 1
+   "options": "Entire Cart\nBrand\nItem Group\nItem Code",
+   "reqd": 1,
+   "description": "Which cart lines receive F&F before exclusions. Exclusions always win."
   },
   {
    "depends_on": "eval:doc.discount_scope==\"Brand\"",
@@ -142,18 +147,46 @@
    "options": "Friends and Family Item Group"
   },
   {
-   "depends_on": "eval:doc.discount_scope==\"Entire Cart\"",
-   "description": "Brands listed here stay at standard price even when scope is Entire Cart.",
+   "depends_on": "eval:doc.discount_scope==\"Item Code\"",
+   "description": "F&F applies only to these item codes.",
+   "fieldname": "items_section",
+   "fieldtype": "Section Break",
+   "label": "Applicable Items"
+  },
+  {
+   "depends_on": "eval:doc.discount_scope==\"Item Code\"",
+   "fieldname": "applicable_items",
+   "fieldtype": "Table",
+   "label": "Applicable Items",
+   "options": "Friends and Family Item"
+  },
+  {
+   "description": "Excluded items and item groups never receive F&F, regardless of scope. Excluded brands apply when scope is Entire Cart.",
    "fieldname": "exclusions_section",
    "fieldtype": "Section Break",
-   "label": "Brand Exclusions"
+   "label": "Exclusions"
+  },
+  {
+   "description": "These items never receive Friends & Family (e.g. gift cards), regardless of scope.",
+   "fieldname": "excluded_items",
+   "fieldtype": "Table",
+   "label": "Excluded Items",
+   "options": "Friends and Family Excluded Item"
+  },
+  {
+   "description": "Items in these groups (including child groups) never receive Friends & Family, regardless of scope.",
+   "fieldname": "excluded_item_groups",
+   "fieldtype": "Table",
+   "label": "Excluded Item Groups",
+   "options": "Friends and Family Excluded Item Group"
   },
   {
    "depends_on": "eval:doc.discount_scope==\"Entire Cart\"",
    "fieldname": "excluded_brands",
    "fieldtype": "Table",
    "label": "Excluded Brands",
-   "options": "Friends and Family Excluded Brand"
+   "options": "Friends and Family Excluded Brand",
+   "description": "Brands listed here stay at standard price when scope is Entire Cart."
   },
   {
    "fieldname": "messages_section",
@@ -170,7 +203,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-10-05 16:00:00.000000",
+ "modified": "2026-10-05 17:00:00.000000",
  "modified_by": "Administrator",
  "module": "POSNext Promotions",
  "name": "Friends and Family Settings",

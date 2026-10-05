@@ -15,7 +15,14 @@ class FriendsandFamilySettings(Document):
 		self._validate_percentage()
 		self._validate_dates()
 		self._validate_scope_tables()
+		self._validate_exclusion_tables()
 		self._validate_eligibility()
+
+	def on_update(self):
+		# get_cached_doc is cleared by Document.save; document for callers that
+		# the next apply_offers / apply_friends_and_family_discount call reloads
+		# inclusions and exclusions without a restart.
+		frappe.clear_cache(doctype=friends_and_family.SETTINGS_DOCTYPE)
 
 	def _validate_percentage(self):
 		percentage = self.discount_percentage
@@ -31,11 +38,14 @@ class FriendsandFamilySettings(Document):
 			frappe.throw(_("End Date cannot be before Start Date"))
 
 	def _validate_scope_tables(self):
-		# Clear unused tables when scope changes so saved state stays coherent.
+		# Clear unused inclusion tables when scope changes so saved state stays coherent.
 		if self.discount_scope != friends_and_family.SCOPE_BRAND:
 			self.applicable_brands = []
 		if self.discount_scope != friends_and_family.SCOPE_ITEM_GROUP:
 			self.applicable_item_groups = []
+		if self.discount_scope != friends_and_family.SCOPE_ITEM_CODE:
+			self.applicable_items = []
+		# Brand exclusions only apply to Entire Cart.
 		if self.discount_scope != friends_and_family.SCOPE_ENTIRE_CART:
 			self.excluded_brands = []
 
@@ -45,6 +55,26 @@ class FriendsandFamilySettings(Document):
 			frappe.throw(_("Add at least one Applicable Brand for the Brand scope"))
 		if self.discount_scope == friends_and_family.SCOPE_ITEM_GROUP and not self.applicable_item_groups:
 			frappe.throw(_("Add at least one Applicable Item Group for the Item Group scope"))
+		if self.discount_scope == friends_and_family.SCOPE_ITEM_CODE and not self.applicable_items:
+			frappe.throw(_("Add at least one Applicable Item for the Item Code scope"))
+
+	def _validate_exclusion_tables(self):
+		"""Deduplicate exclusion rows; exclusions win over every scope."""
+		self._dedupe_link_table("excluded_items", "item_code", _("Excluded Item"))
+		self._dedupe_link_table("excluded_item_groups", "item_group", _("Excluded Item Group"))
+		self._dedupe_link_table("excluded_brands", "brand", _("Excluded Brand"))
+		if self.discount_scope == friends_and_family.SCOPE_ITEM_CODE:
+			self._dedupe_link_table("applicable_items", "item_code", _("Applicable Item"))
+
+	def _dedupe_link_table(self, table_field: str, value_field: str, label):
+		seen = set()
+		for row in list(self.get(table_field) or []):
+			value = row.get(value_field)
+			if not value:
+				continue
+			if value in seen:
+				frappe.throw(_("{0} {1} is listed more than once").format(label, frappe.bold(value)))
+			seen.add(value)
 
 	def _validate_eligibility(self):
 		if self.eligibility_basis not in eligibility.BASES:

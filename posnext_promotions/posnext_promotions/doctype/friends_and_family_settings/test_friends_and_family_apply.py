@@ -11,6 +11,8 @@ from posnext_promotions.promotions.friends_and_family_apply import (
 	REASON_APPLIED,
 	REASON_INELIGIBLE,
 	REASON_OTHER_BETTER,
+	REASON_EXCLUDED,
+	REASON_NO_COVERED_ITEMS,
 	REASON_OUT_OF_SCOPE,
 	REASON_PROGRAM_INACTIVE,
 	REASON_PROTECTED,
@@ -113,7 +115,10 @@ class TestFriendsAndFamilyApply(FrappeTestCase):
 				"end_date": None,
 				"applicable_brands": [],
 				"applicable_item_groups": [],
+				"applicable_items": [],
 				"excluded_brands": [],
+				"excluded_items": [],
+				"excluded_item_groups": [],
 				"eligibility_basis": "Customer Group",
 				"eligible_customer_groups": [{"customer_group": FF_GROUP}],
 				"user_message": "Friends & Family applied",
@@ -144,7 +149,7 @@ class TestFriendsAndFamilyApply(FrappeTestCase):
 		result = apply_friends_and_family_to_items(lines, customer=ELIGIBLE, posting_date=DATE)
 		self.assertEqual(result["applied_count"], 1)
 		self.assertEqual(result["items"][0]["reason"], REASON_APPLIED)
-		self.assertEqual(result["items"][1]["reason"], REASON_OUT_OF_SCOPE)
+		self.assertEqual(result["items"][1]["reason"], REASON_EXCLUDED)
 		self.assertEqual(lines[0].discount_percentage, 30)
 		self.assertEqual(lines[0].discount_source, DISCOUNT_SOURCE_FRIENDS_AND_FAMILY)
 		self.assertEqual(lines[1].discount_percentage, 0)
@@ -333,3 +338,70 @@ class TestFriendsAndFamilyApply(FrappeTestCase):
 		)
 		apply_friends_and_family_on_invoice(doc)
 		self.assertEqual(flt(item.discount_percentage), 0)
+
+
+	# ---- PN-127 inclusions / exclusions ---------------------------------
+
+	def test_mixed_cart_excluded_item_stays_full_price(self):
+		self._configure(excluded_items=[{"item_code": EXCLUDED_ITEM}])
+		lines = [self._line(ITEM, brand=BRAND), self._line(EXCLUDED_ITEM, brand=BRAND)]
+		result = apply_friends_and_family_to_items(lines, customer=ELIGIBLE, posting_date=DATE)
+		self.assertEqual(result["applied_count"], 1)
+		self.assertEqual(result["items"][0]["reason"], REASON_APPLIED)
+		self.assertEqual(result["items"][1]["reason"], REASON_EXCLUDED)
+		self.assertEqual(lines[0].discount_percentage, 30)
+		self.assertEqual(lines[1].discount_percentage, 0)
+
+	def test_excluded_item_wins_over_brand_scope(self):
+		self._configure(
+			discount_scope="Brand",
+			applicable_brands=[{"brand": BRAND}],
+			excluded_items=[{"item_code": ITEM}],
+		)
+		lines = [self._line(ITEM, brand=BRAND)]
+		result = apply_friends_and_family_to_items(lines, customer=ELIGIBLE, posting_date=DATE)
+		self.assertEqual(result["applied_count"], 0)
+		self.assertEqual(result["items"][0]["reason"], REASON_EXCLUDED)
+
+	def test_excluded_item_group_wins_over_entire_cart(self):
+		self._configure(excluded_item_groups=[{"item_group": OTHER_ITEM_GROUP}])
+		lines = [
+			self._line(ITEM, brand=BRAND, item_group=CHILD_GROUP),
+			self._line(EXCLUDED_ITEM, brand=EXCLUDED_BRAND, item_group=OTHER_ITEM_GROUP),
+		]
+		result = apply_friends_and_family_to_items(lines, customer=ELIGIBLE, posting_date=DATE)
+		self.assertEqual(result["applied_count"], 1)
+		self.assertEqual(result["items"][1]["reason"], REASON_EXCLUDED)
+
+	def test_all_brands_excluded_clear_message(self):
+		self._configure(excluded_brands=[{"brand": BRAND}, {"brand": EXCLUDED_BRAND}])
+		lines = [
+			self._line(ITEM, brand=BRAND),
+			self._line(EXCLUDED_ITEM, brand=EXCLUDED_BRAND),
+		]
+		result = apply_friends_and_family_to_items(lines, customer=ELIGIBLE, posting_date=DATE)
+		self.assertTrue(result["eligible"])
+		self.assertEqual(result["applied_count"], 0)
+		self.assertEqual(result["reason"], REASON_NO_COVERED_ITEMS)
+		self.assertIn("excluded", result["message"].lower())
+		self.assertEqual(result["items"][0]["reason"], REASON_EXCLUDED)
+		self.assertEqual(result["items"][1]["reason"], REASON_EXCLUDED)
+
+	def test_item_code_scope_applies_only_listed(self):
+		self._configure(discount_scope="Item Code", applicable_items=[{"item_code": ITEM}])
+		lines = [self._line(ITEM, brand=BRAND), self._line(EXCLUDED_ITEM, brand=EXCLUDED_BRAND)]
+		result = apply_friends_and_family_to_items(lines, customer=ELIGIBLE, posting_date=DATE)
+		self.assertEqual(result["applied_count"], 1)
+		self.assertTrue(result["items"][0]["applies"])
+		self.assertEqual(result["items"][1]["reason"], REASON_OUT_OF_SCOPE)
+
+	def test_settings_exclusion_change_recalculates_next_apply(self):
+		self._configure()
+		lines = [self._line(EXCLUDED_ITEM, brand=EXCLUDED_BRAND)]
+		result = apply_friends_and_family_to_items(lines, customer=ELIGIBLE, posting_date=DATE)
+		self.assertEqual(result["applied_count"], 1)
+		self._configure(excluded_items=[{"item_code": EXCLUDED_ITEM}])
+		result = apply_friends_and_family_to_items(lines, customer=ELIGIBLE, posting_date=DATE)
+		self.assertEqual(result["applied_count"], 0)
+		self.assertEqual(result["items"][0]["reason"], REASON_EXCLUDED)
+		self.assertEqual(flt(lines[0].discount_percentage), 0)
