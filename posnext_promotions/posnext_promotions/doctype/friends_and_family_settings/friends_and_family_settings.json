@@ -99,7 +99,7 @@
   },
   {
    "depends_on": "eval:doc.discount_scope==\"Item Group\"",
-   "description": "F&F applies only to items in these item groups (including child groups when the engine is wired).",
+   "description": "F&F applies only to items in these item groups, including their child groups.",
    "fieldname": "item_groups_section",
    "fieldtype": "Section Break",
    "label": "Applicable Item Groups"
@@ -140,7 +140,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-10-05 14:00:00.000000",
+ "modified": "2026-10-05 15:30:00.000000",
  "modified_by": "Administrator",
  "module": "POSNext Promotions",
  "name": "Friends and Family Settings",
