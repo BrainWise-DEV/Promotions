@@ -1,0 +1,178 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "creation": "2026-10-05 14:00:00.000000",
+ "doctype": "DocType",
+ "document_type": "Setup",
+ "engine": "InnoDB",
+ "field_order": [
+  "general_section",
+  "enabled",
+  "column_break_general",
+  "discount_percentage",
+  "dates_section",
+  "start_date",
+  "column_break_dates",
+  "end_date",
+  "scope_section",
+  "discount_scope",
+  "brands_section",
+  "applicable_brands",
+  "item_groups_section",
+  "applicable_item_groups",
+  "exclusions_section",
+  "excluded_brands",
+  "messages_section",
+  "user_message"
+ ],
+ "fields": [
+  {
+   "fieldname": "general_section",
+   "fieldtype": "Section Break",
+   "label": "General"
+  },
+  {
+   "default": "0",
+   "description": "When disabled, Friends & Family discount is not applied.",
+   "fieldname": "enabled",
+   "fieldtype": "Check",
+   "label": "Enable Program"
+  },
+  {
+   "fieldname": "column_break_general",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "30",
+   "description": "Configurable. Default: 30%",
+   "fieldname": "discount_percentage",
+   "fieldtype": "Percent",
+   "label": "Discount Percentage",
+   "non_negative": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "dates_section",
+   "fieldtype": "Section Break",
+   "label": "Program Dates"
+  },
+  {
+   "fieldname": "start_date",
+   "fieldtype": "Date",
+   "label": "Start Date"
+  },
+  {
+   "fieldname": "column_break_dates",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "end_date",
+   "fieldtype": "Date",
+   "label": "End Date"
+  },
+  {
+   "fieldname": "scope_section",
+   "fieldtype": "Section Break",
+   "label": "Discount Scope"
+  },
+  {
+   "default": "Entire Cart",
+   "fieldname": "discount_scope",
+   "fieldtype": "Select",
+   "label": "Discount Scope",
+   "options": "Entire Cart\nBrand\nItem Group",
+   "reqd": 1
+  },
+  {
+   "depends_on": "eval:doc.discount_scope==\"Brand\"",
+   "description": "F&F applies only to items of these brands.",
+   "fieldname": "brands_section",
+   "fieldtype": "Section Break",
+   "label": "Applicable Brands"
+  },
+  {
+   "depends_on": "eval:doc.discount_scope==\"Brand\"",
+   "fieldname": "applicable_brands",
+   "fieldtype": "Table",
+   "label": "Applicable Brands",
+   "options": "Friends and Family Brand"
+  },
+  {
+   "depends_on": "eval:doc.discount_scope==\"Item Group\"",
+   "description": "F&F applies only to items in these item groups (including child groups when the engine is wired).",
+   "fieldname": "item_groups_section",
+   "fieldtype": "Section Break",
+   "label": "Applicable Item Groups"
+  },
+  {
+   "depends_on": "eval:doc.discount_scope==\"Item Group\"",
+   "fieldname": "applicable_item_groups",
+   "fieldtype": "Table",
+   "label": "Applicable Item Groups",
+   "options": "Friends and Family Item Group"
+  },
+  {
+   "depends_on": "eval:doc.discount_scope==\"Entire Cart\"",
+   "description": "Brands listed here stay at standard price even when scope is Entire Cart. Enforcement is PN-127.",
+   "fieldname": "exclusions_section",
+   "fieldtype": "Section Break",
+   "label": "Brand Exclusions"
+  },
+  {
+   "depends_on": "eval:doc.discount_scope==\"Entire Cart\"",
+   "fieldname": "excluded_brands",
+   "fieldtype": "Table",
+   "label": "Excluded Brands",
+   "options": "Friends and Family Excluded Brand"
+  },
+  {
+   "fieldname": "messages_section",
+   "fieldtype": "Section Break",
+   "label": "Customer Message"
+  },
+  {
+   "default": "You have received the Miraaya Friends & Family offer!",
+   "description": "Shown to eligible customers after verification (engine/UI tasks later).",
+   "fieldname": "user_message",
+   "fieldtype": "Small Text",
+   "label": "User Message"
+  }
+ ],
+ "issingle": 1,
+ "links": [],
+ "modified": "2026-10-05 14:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "POSNext Promotions",
+ "name": "Friends and Family Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "delete": 0,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "Sales Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "read": 1,
+   "role": "Sales User"
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}
