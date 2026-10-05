@@ -7,6 +7,7 @@ from frappe.model.document import Document
 from frappe.utils import cint, getdate
 
 from posnext_promotions.promotions import friends_and_family
+from posnext_promotions.promotions import friends_and_family_eligibility as eligibility
 
 
 class FriendsandFamilySettings(Document):
@@ -14,6 +15,7 @@ class FriendsandFamilySettings(Document):
 		self._validate_percentage()
 		self._validate_dates()
 		self._validate_scope_tables()
+		self._validate_eligibility()
 
 	def _validate_percentage(self):
 		percentage = self.discount_percentage
@@ -43,6 +45,28 @@ class FriendsandFamilySettings(Document):
 			frappe.throw(_("Add at least one Applicable Brand for the Brand scope"))
 		if self.discount_scope == friends_and_family.SCOPE_ITEM_GROUP and not self.applicable_item_groups:
 			frappe.throw(_("Add at least one Applicable Item Group for the Item Group scope"))
+
+	def _validate_eligibility(self):
+		if self.eligibility_basis not in eligibility.BASES:
+			self.eligibility_basis = eligibility.BASIS_GROUP_OR_FLAG
+
+		if self.eligibility_basis == eligibility.BASIS_FLAG:
+			self.eligible_customer_groups = []
+		else:
+			seen = set()
+			for row in list(self.eligible_customer_groups or []):
+				if row.customer_group in seen:
+					frappe.throw(
+						_("Customer Group {0} is listed more than once").format(frappe.bold(row.customer_group))
+					)
+				seen.add(row.customer_group)
+
+		if (
+			cint(self.enabled)
+			and self.eligibility_basis == eligibility.BASIS_GROUP
+			and not self.eligible_customer_groups
+		):
+			frappe.throw(_("Add at least one Eligible Customer Group when eligibility is by Customer Group"))
 
 
 def get_friends_and_family_settings():

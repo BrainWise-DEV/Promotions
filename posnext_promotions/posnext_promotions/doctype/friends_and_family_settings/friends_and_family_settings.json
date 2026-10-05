@@ -14,6 +14,10 @@
   "start_date",
   "column_break_dates",
   "end_date",
+  "eligibility_section",
+  "eligibility_basis",
+  "column_break_eligibility",
+  "eligible_customer_groups",
   "scope_section",
   "discount_scope",
   "brands_section",
@@ -69,6 +73,32 @@
    "fieldname": "end_date",
    "fieldtype": "Date",
    "label": "End Date"
+  },
+  {
+   "description": "Who gets Friends & Family. \"Customer Flag\" is the Friends & Family Member checkbox on the Customer form.",
+   "fieldname": "eligibility_section",
+   "fieldtype": "Section Break",
+   "label": "Customer Eligibility"
+  },
+  {
+   "default": "Customer Group or Flag",
+   "fieldname": "eligibility_basis",
+   "fieldtype": "Select",
+   "label": "Eligible When",
+   "options": "Customer Group or Flag\nCustomer Group\nCustomer Flag",
+   "reqd": 1
+  },
+  {
+   "fieldname": "column_break_eligibility",
+   "fieldtype": "Column Break"
+  },
+  {
+   "depends_on": "eval:doc.eligibility_basis!=\"Customer Flag\"",
+   "description": "Customers in these groups, including their child groups, are eligible.",
+   "fieldname": "eligible_customer_groups",
+   "fieldtype": "Table",
+   "label": "Eligible Customer Groups",
+   "options": "Friends and Family Customer Group"
   },
   {
    "fieldname": "scope_section",
@@ -140,7 +170,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-10-05 15:30:00.000000",
+ "modified": "2026-10-05 16:00:00.000000",
  "modified_by": "Administrator",
  "module": "POSNext Promotions",
  "name": "Friends and Family Settings",

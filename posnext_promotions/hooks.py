@@ -77,6 +77,9 @@ doc_events = {
 	"Quotation": {"validate": "posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts"},
 	"Delivery Note": {"validate": "posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts"},
 	"POS Invoice": {"validate": "posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts"},
+	"Customer": {
+		"validate": "posnext_promotions.promotions.friends_and_family_eligibility.guard_flag_changes"
+	},
 }
 
 # Daily cleanup stays on pos_next develop so it does not run twice when both apps

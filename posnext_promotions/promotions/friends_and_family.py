@@ -11,8 +11,9 @@ Settings are read through ``frappe.get_cached_doc``. Saving the singleton clears
 that cache entry, so the next cart / invoice recalculation sees the new values
 without a deploy or restart.
 
-Whether a given *customer* is entitled to the program is decided elsewhere; this
-module only answers "is the program live, and which lines does it cover".
+Whether a given *customer* is entitled to the program is decided in
+:mod:`posnext_promotions.promotions.friends_and_family_eligibility`; this module
+only answers "is the program live, and which lines does it cover".
 """
 
 from __future__ import annotations
