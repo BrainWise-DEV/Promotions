@@ -130,6 +130,7 @@ class TestFriendsandFamilySettings(FrappeTestCase):
 		program = get_active_program("2026-10-05")
 		self.assertTrue(program.covers(_line(brand=BRAND)))
 		self.assertTrue(program.covers(_line()))
+		self.assertFalse(program.covers(_line(brand=OTHER_BRAND)))
 		self.assertFalse(program.covers(_line(is_free_item=1)))
 		self.assertEqual(program.to_client_payload()["excluded_brands"], [OTHER_BRAND])
 

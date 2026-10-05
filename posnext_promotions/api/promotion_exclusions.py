@@ -64,6 +64,7 @@ DISCOUNT_SOURCE_AUTO = "auto_discount"
 DISCOUNT_SOURCE_GWP = "gwp"
 DISCOUNT_SOURCE_FREE_ITEM = "free_item"
 DISCOUNT_SOURCE_LEGACY = "pricing_rule"
+DISCOUNT_SOURCE_FRIENDS_AND_FAMILY = "friends_and_family"
 
 
 def _parse_pricing_rules(value) -> list[str]:
@@ -367,7 +368,11 @@ def mark_item_discount_flags(items, rule_type_map: dict[str, str] | None = None)
 		# Preserve bundled free-item / GWP stamps so the POS cart can show
 		# "N free items" instead of falling back to a derived "%".
 		existing_source = item.get("discount_source")
-		if existing_source in (DISCOUNT_SOURCE_FREE_ITEM, DISCOUNT_SOURCE_GWP):
+		if existing_source in (
+			DISCOUNT_SOURCE_FREE_ITEM,
+			DISCOUNT_SOURCE_GWP,
+			DISCOUNT_SOURCE_FRIENDS_AND_FAMILY,
+		):
 			item.is_already_discounted = 1
 			continue
 		if flt(item.get("free_qty")) > 0:

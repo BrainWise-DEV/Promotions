@@ -68,6 +68,7 @@ doc_events = {
 		"validate": [
 			"posnext_promotions.overrides.sales_invoice_free_bundle.combine_packed_qty_for_free_product_bundles",
 			"posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts",
+			"posnext_promotions.promotions.friends_and_family_apply.apply_friends_and_family_on_invoice",
 		],
 		"before_submit": "posnext_promotions.authorization.gate.enforce_document",
 		"on_submit": "posnext_promotions.api.one_time_usage.record_one_time_offer_usage",
@@ -76,7 +77,12 @@ doc_events = {
 	"Sales Order": {"validate": "posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts"},
 	"Quotation": {"validate": "posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts"},
 	"Delivery Note": {"validate": "posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts"},
-	"POS Invoice": {"validate": "posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts"},
+	"POS Invoice": {
+		"validate": [
+			"posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts",
+			"posnext_promotions.promotions.friends_and_family_apply.apply_friends_and_family_on_invoice",
+		]
+	},
 	"Customer": {
 		"validate": "posnext_promotions.promotions.friends_and_family_eligibility.guard_flag_changes"
 	},

@@ -23,6 +23,10 @@ from posnext_promotions.promotions.engine import (
 	rule_promotion_type,
 	run_line_discount_passes,
 )
+
+from posnext_promotions.promotions.friends_and_family_apply import (
+	apply_friends_and_family_to_items,
+)
 from posnext_promotions.promotions.schedule import (
 	filter_rules_by_schedule,
 	get_inactive_rules,
@@ -1556,6 +1560,15 @@ def apply_offers(invoice_data, selected_offers=None):
 					if pr_name in rule_map:
 						applied_rules.add(pr_name)
 
+		# Friends & Family (PN-126): best-of vs line % already decided above.
+		# Percentage always from Settings; cashier cannot set a different F&F rate.
+		# Full multi-promo comparison / caps / audit → PN-128.
+		ff_result = apply_friends_and_family_to_items(
+			prepared_items,
+			customer=customer,
+			posting_date=invoice.get("posting_date") or nowdate(),
+		)
+
 		# Fold the item-level discounts decided above back into `pricing_items`
 		# before the transaction-scoped engine runs. `pricing_items` was built
 		# pre-discount (rate == list rate, discount fields zeroed) to feed the
@@ -1661,6 +1674,14 @@ def apply_offers(invoice_data, selected_offers=None):
 			"additional_discount_percentage": flt(txn_result.get("additional_discount_percentage") or 0),
 			"discount_amount": flt(txn_result.get("discount_amount") or 0),
 			"apply_discount_on": txn_result.get("apply_discount_on"),
+			"friends_and_family": {
+				"eligible": ff_result.get("eligible"),
+				"discount_percentage": ff_result.get("discount_percentage"),
+				"applied_count": ff_result.get("applied_count"),
+				"message": ff_result.get("message"),
+				"reason": ff_result.get("reason"),
+				"user_message": ff_result.get("user_message"),
+			},
 		}
 	except Exception as e:
 		frappe.log_error(frappe.get_traceback(), "Apply Offers Error")

@@ -46,13 +46,20 @@ class FriendsAndFamilyProgram:
 	user_message: str
 
 	def covers(self, item) -> bool:
-		"""Whether a cart line falls inside the configured scope."""
+		"""Whether a cart line falls inside the configured scope.
+
+		Entire Cart covers every paid line except brands listed under Excluded Brands.
+		Brand / Item Group scopes are inclusion-only (exclusions apply only to Entire Cart).
+		"""
 		if item.get("is_free_item"):
 			return False
+		brand = cstr(item.get("brand"))
 		if self.discount_scope == SCOPE_ENTIRE_CART:
+			if brand and brand in self.excluded_brands:
+				return False
 			return True
 		if self.discount_scope == SCOPE_BRAND:
-			return cstr(item.get("brand")) in self.brands
+			return brand in self.brands
 		if self.discount_scope == SCOPE_ITEM_GROUP:
 			return cstr(item.get("item_group")) in self.item_groups
 		return False
