@@ -9,6 +9,7 @@ from frappe.utils import flt
 
 from posnext_promotions.api.apply_offers import (
 	_decide_fnf_vs_order_promotion,
+	_friends_and_family_only_response,
 	_prune_suppressed_rules,
 	_reconcile_fnf_after_free_passes,
 	_strip_txn_header,
@@ -28,6 +29,7 @@ from posnext_promotions.promotions.friends_and_family_apply import (
 	apply_friends_and_family_to_items,
 	compute_friends_and_family_discounts,
 )
+from posnext_promotions.promotions.friends_and_family_caps import FIELD_FNF_REPLACED
 from posnext_promotions.promotions.friends_and_family_eligibility import (
 	FLAG_FIELD,
 	ensure_customer_flag_field,
@@ -260,6 +262,37 @@ class TestFriendsAndFamilyBestDiscount(FrappeTestCase):
 		self.assertFalse(payload["items"][1]["applies"])
 		self.assertEqual(flt(gifted.discount_amount), 50)
 
+	# ---- re-validation keeps the replaced discount (PN-133) ---------------
+
+	def test_revalidate_keeps_comparison_with_replaced_promotion(self):
+		line = self._promo_line(pct=10)
+		apply_friends_and_family_to_items([line], customer=ELIGIBLE, posting_date=DATE)
+		self.assertTrue(line.get(FIELD_FNF_REPLACED))
+		# Second run (e.g. submit after save): the promotion F&F beat is put back
+		# and compared again, so the decision and its log survive.
+		payload = apply_friends_and_family_to_items([line], customer=ELIGIBLE, posting_date=DATE)
+		decision = payload["items"][0]["best_discount"]
+		self.assertEqual(decision["outcome"], bd.OUTCOME_FNF_BETTER)
+		self.assertEqual(payload["items"][0]["competing_amount"], 10)
+		self.assertEqual(line.discount_percentage, 30)
+		self.assertFalse(line.pricing_rules)
+
+	def test_program_off_after_stamp_gives_promotion_back(self):
+		line = self._promo_line(pct=10)
+		apply_friends_and_family_to_items([line], customer=ELIGIBLE, posting_date=DATE)
+		self._configure(enabled=0)
+		apply_friends_and_family_to_items([line], customer=ELIGIBLE, posting_date=DATE)
+		self.assertEqual(flt(line.discount_percentage), 10)
+		self.assertEqual(line.pricing_rules, PROMO_RULE)
+		self.assertNotEqual(line.discount_source, DISCOUNT_SOURCE_FRIENDS_AND_FAMILY)
+		self.assertFalse(line.get(FIELD_FNF_REPLACED))
+
+	def test_plain_line_without_competitor_stores_nothing(self):
+		line = self._line()
+		apply_friends_and_family_to_items([line], customer=ELIGIBLE, posting_date=DATE)
+		self.assertEqual(line.discount_percentage, 30)
+		self.assertFalse(line.get(FIELD_FNF_REPLACED))
+
 	# ---- coupon vs F&F (Jira acceptance) ---------------------------------
 
 	def test_coupon_15_vs_fnf_30_keeps_fnf(self):
@@ -381,6 +414,18 @@ class TestFriendsAndFamilyBestDiscount(FrappeTestCase):
 		self.assertEqual([flt(i.rate) for i in rows], [100, 100])
 		self.assertEqual(flt(doc.discount_amount), 90)
 
+	def test_invoice_header_stronger_keeps_promotion_lines(self):
+		# Header 150 beats F&F (30 + 30): the promotion line keeps its own 10%,
+		# only F&F stamps are removed (PN-133 order-level fix).
+		promo = self._promo_line(pct=10)
+		promo.rate = 90
+		doc = self._invoice([promo, self._line(item_code=ITEM_2)], discount_amount=150)
+		apply_friends_and_family_on_invoice(doc)
+		self.assertEqual(flt(doc.discount_amount), 150)
+		self.assertEqual(flt(promo.discount_percentage), 10)
+		self.assertEqual(promo.pricing_rules, PROMO_RULE)
+		self.assertEqual(flt(doc.get("items")[1].discount_percentage), 0)
+
 	def test_invoice_header_tie_goes_to_fnf(self):
 		doc = self._invoice([self._line(), self._line(item_code=ITEM_2)], discount_amount=60)
 		apply_friends_and_family_on_invoice(doc)
@@ -436,6 +481,23 @@ class TestFriendsAndFamilyBestDiscount(FrappeTestCase):
 			fnf_lines, pre_lines, {"discount_amount": 60}, pricing, ff
 		)
 		self.assertTrue(keep_fnf)  # tie → F&F
+
+	def test_fnf_only_response_strips_stale_stamp_for_ineligible(self):
+		stale = self._line(
+			discount_percentage=30, discount_amount=30, discount_source=DISCOUNT_SOURCE_FRIENDS_AND_FAMILY
+		)
+		stale.rate = 70
+		manual = self._line(item_code=ITEM_2, discount_percentage=5, discount_amount=5)
+		items = [dict(stale), dict(manual)]
+		res = _friends_and_family_only_response(
+			items, [frappe._dict(i) for i in items], INELIGIBLE, {"posting_date": DATE}
+		)
+		line, kept = res["items"]
+		self.assertEqual((flt(line["rate"]), flt(line["discount_percentage"])), (100, 0))
+		self.assertFalse(line.get("discount_source"))
+		self.assertEqual(flt(kept["discount_percentage"]), 5)  # non-F&F line returned as sent
+		self.assertFalse(res["friends_and_family"]["eligible"])
+		self.assertIn("caps", res["friends_and_family"])
 
 	def test_strip_txn_header_drops_price_rules_only(self):
 		rule_map = {

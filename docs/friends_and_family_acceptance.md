@@ -1,0 +1,279 @@
+# Friends & Family — سيناريوهات اختبار القبول (PN-133)
+
+الملف ده بيغطي سيناريوهات القبول لبرنامج **Friends & Family (F&F)** (PN-124 → PN-132) على **POS** والـ Promotions شغالة.
+كل حالة مكتوب فيها المدخلات بالظبط والأرقام المتوقعة. أسماء الحقول والزراير بالإنجليزي زي ما هي ظاهرة في الـ Desk / POS.
+
+> نفس السيناريوهات دي متغطية أوتوماتيك في
+> `posnext_promotions/posnext_promotions/doctype/friends_and_family_settings/test_friends_and_family_acceptance.py`
+> (رقم الحالة هنا = رقم الـ test هناك).
+
+---
+
+## 0. التجهيز
+
+### 0.1 بيانات الديمو (على dev site بس)
+
+الـ seed helper بيعمل كل البيانات المطلوبة، وتقدر تشغّله أكتر من مرة من غير ما يكرر حاجة (idempotent).
+**مش هيشتغل** غير لو `developer_mode` = 1، ولازم يكون اللي بيشغّله System Manager.
+
+```bash
+cd ~/frappe-bench
+bench --site <dev-site> execute posnext_promotions.promotions.friends_and_family_demo.setup_demo_data
+# لو الـ POS Profile بيستخدم Price List غير الـ default في Selling Settings:
+bench --site <dev-site> execute posnext_promotions.promotions.friends_and_family_demo.setup_demo_data \
+  --kwargs "{'company': 'Brainwise', 'price_list': 'Standard Selling'}"
+```
+
+> ⚠️ ممنوع تشغيله على أي site إنتاج (Miraaya وغيرها). وكمان تشغيله تاني بيرجّع **Friends and Family Settings** للقيم اللي تحت.
+
+اللي بيتعمل (الـ prefix الافتراضي `FF Demo`):
+
+| النوع | الاسم | ملاحظات |
+|---|---|---|
+| Customer Group | `FF Demo Staff Group` | جروب مؤهل (Eligible) |
+| Customer Group | `FF Demo Public Group` | جروب عادي |
+| Customer | `FF Demo Staff` | مؤهل بالجروب |
+| Customer | `FF Demo Flagged` | مؤهل بالـ flag **Friends & Family Member** (وجروبه Public) |
+| Customer | `FF Demo Public` | **مش** مؤهل |
+| Brand | `FF Demo Brand A` / `FF Demo Brand X` | ‏X مستثنى (Excluded) |
+| Item Group | `FF Demo Products` | |
+
+| Item | Price List Rate | Brand | Promotion (Pricing Rule) | الغرض |
+|---|---|---|---|---|
+| `FF Demo Laptop` | 1000 | A | — | covered + caps |
+| `FF Demo Phone` | 500 | A | — | covered |
+| `FF Demo Cable` | 100 | A | 10% | البرومو أقل → F&F يكسب |
+| `FF Demo Charger` | 200 | A | 40% | البرومو أعلى → البرومو يكسب |
+| `FF Demo Mouse` | 100 | A | 30% | تعادل → F&F يكسب |
+| `FF Demo Gift Card` | 300 | A | — | **Excluded Item** |
+| `FF Demo Headset` | 400 | X | — | **Excluded Brand** |
+
+POS Coupons (لو POS Next متسطب): `FFDEMO15` (15%) و`FFDEMO40` (40%)، الاتنين Percentage / Apply On = Net Total.
+
+### 0.2 إعدادات الـ Desk (لو هتجهّز يدوي أو عايز تراجع)
+
+افتح **Friends and Family Settings** (Desk → Search → "Friends and Family Settings"):
+
+| Section | Field | القيمة |
+|---|---|---|
+| General | **Enable Program** | ✔ |
+| General | **Discount Percentage** | 30 |
+| Program Dates | **Start Date** / **End Date** | فاضيين |
+| Discount Caps | **Max Discount per Order** | 0 (من غير حد) |
+| Discount Caps | **Max Discount per Customer per Month** | 0 (من غير حد) |
+| Customer Eligibility | **Eligible When** | Customer Group or Flag |
+| Customer Eligibility | **Eligible Customer Groups** | `FF Demo Staff Group` |
+| Discount Scope | **Discount Scope** | Entire Cart |
+| Exclusions | **Excluded Items** | `FF Demo Gift Card` |
+| Exclusions | **Excluded Brands** | `FF Demo Brand X` |
+| Customer Message | **User Message** | `Friends & Family discount applied / تم تطبيق خصم الأصدقاء والعائلة` |
+
+اضغط **Save**. من زرار **View** في نفس الصفحة هتلاقي: **Audit Log**، **Settings Changes**، **Version History**، **Performance Report**.
+
+- الـ flag على العميل: افتح **Customer** → checkbox **Friends & Family Member** (بيعدّله Sales Manager / System Manager بس، الكاشير لأ).
+- البرومو: **Pricing Rule** → Apply On = Item Code، Selling ✔، Price or Product Discount = Price، Rate or Discount = Discount Percentage.
+- الـ POS: استخدم POS Profile عادي (على brainwise.dev: `profile 1`) والـ Price List بتاعه لازم فيها الأسعار اللي فوق.
+
+### 0.3 قواعد عامة لكل الحالات
+
+- الحسبة: F&F = **Price List Rate × 30%** على كل سطر مغطّى. الـ Rate الجديد = Price List Rate × 0.7.
+- **مفيش stacking أبدًا**: كل سطر عليه خصم واحد بس، الأحسن بالفلوس. لو حصل تعادل، F&F يكسب.
+- بعد **Submit** لأي فاتورة، اتأكد من **Friends and Family Log** (Desk → "Friends and Family Log"، فلتر Reference Name = رقم الفاتورة).
+- ملاحظة بيئة (brainwise.dev): app الـ Wallet بيعمل **Wallet Transaction** "Loyalty Credit" submitted مع كل Sales Invoice. علشان تعمل Cancel للفاتورة لازم تعمل Cancel للـ Wallet Transaction ده الأول.
+
+---
+
+## 1. حالات الـ Backend / Desk (Sales Invoice أو POS Invoice، Is POS ✔)
+
+اعمل الفاتورة من **Sales Invoice → New**، علّم **Include Payment (POS)** واختار الـ **POS Profile**، أو من شاشة POS. المبالغ تحت قبل الضرايب.
+
+### الحالة 1 — عميل مؤهل بياخد F&F تلقائي
+
+| Customer | Items |
+|---|---|
+| `FF Demo Staff` | Laptop × 1، Phone × 2 |
+
+المتوقع:
+- Laptop: **Discount (%)** = 30، **Rate** = 700.
+- Phone: Rate = 350 (لكل واحدة).
+- **Net Total** = 1400 (بدل 2000).
+- الرسالة = الـ User Message.
+- بعد Submit: في الـ Log سطرين **Discount Applied** (Laptop 300، Phone 300)، Discount Source = `friends_and_family`. المجموع 600.
+
+**1b — مؤهل بالـ flag:** نفس الحالة مع `FF Demo Flagged` و Laptop × 1 → Rate = 700.
+بعد كده غيّر **Eligible When** لـ `Customer Group` واعمل Save، وكرر → Rate = 1000 (الـ flag مبقاش بيتحسب). رجّعها `Customer Group or Flag`.
+
+### الحالة 2 — عميل مش مؤهل
+
+`FF Demo Public` + Laptop × 1 → Rate = **1000**، مفيش خصم، ومفيش ولا سطر في الـ Log.
+
+**2b — تغيير العميل في السلة (PN-130):** في الـ POS ضيف Laptop للعميل `FF Demo Staff` (هيبقى 700)، وبعدين غيّر العميل لـ `FF Demo Public` → السطر يرجع **1000** و0%، من غير أي أثر لـ F&F. نفس الكلام لو البرنامج اتقفل (**Enable Program** ✘) والسلة مفتوحة.
+
+### الحالة 3 — الكاشير مايقدرش يفرض F&F أو النسبة
+
+1. ادخل بيوزر **Sales User** بس (كاشير)، افتح `FF Demo Public` وعلّم **Friends & Family Member** وSave → لازم تطلع رسالة **Not permitted**.
+2. لعميل مؤهل، غيّر يدوي Discount (%) على Laptop لـ 50 وSave → السيستم يرجّعها **30** (Rate 700).
+3. نفس الحاجة لعميل مش مؤهل (`FF Demo Public`) → يرجع **1000**.
+
+### الحالة 4 — صنف مستثنى (Excluded Item)
+
+`FF Demo Staff` + Gift Card × 1 + Laptop × 1:
+- Gift Card: Rate = **300** (من غير خصم).
+- Laptop: Rate = 700.
+- Log: **Excluded** للـ Gift Card، **Discount Applied** للـ Laptop.
+
+### الحالة 5 — سلة مختلطة فيها Brand مستثنى
+
+`FF Demo Staff` + Laptop × 1 + Headset × 1:
+- Laptop 700، Headset **400**.
+- Net Total = **1100**.
+- Log: Headset = **Excluded**.
+
+**5b — كل الأصناف مستثناة:** Gift Card + Headset → مفيش خصم، Net Total = **700**. الـ reason = `no_covered_items`، والرسالة فيها "every item in the cart is excluded". Log: **Excluded** بس.
+
+### الحالة 6 — البرومو أقل من F&F → F&F يكسب + رسالة
+
+`FF Demo Staff` + Cable × 1 (برومو 10%):
+- Discount (%) = **30**، Rate = **70**، و**Pricing Rules** على السطر فاضية (البرومو اتشال، مفيش stacking).
+- رسالة المقارنة (EN + AR) فيها "Friends & Family" / "الأصدقاء والعائلة".
+- Log بعد Submit: Discount Applied، Comparison Outcome = `fnf_better`، Competing Source = `promotion`، Competing Amount = **10**.
+- اعمل **Save** الأول وبعدين **Submit** (مش Submit على طول) → المقارنة لازم تفضل موجودة في الـ Log (ده كان bug واتصلّح في PN-133).
+
+### الحالة 7 — البرومو أعلى → البرومو يكسب + رسالة
+
+`FF Demo Staff` + Charger × 1 (برومو 40%):
+- Discount (%) = **40**، Rate = **120**، والـ Pricing Rule لسه على السطر.
+- الرسالة بتقول إن البرومو أحسن.
+- Log: **Comparison Lost**، Discount Source = `promotion`.
+
+### الحالة 8 — تعادل → F&F يكسب
+
+`FF Demo Staff` + Mouse × 1 (برومو 30%) → Rate = **70** بـ F&F. Log: Comparison Outcome = `tie_fnf_wins`.
+
+### الحالة 9 — خصم على الفاتورة كلها (Additional Discount) — مفيش stacking
+
+`FF Demo Staff` + Laptop × 1، **Apply Additional Discount On** = Net Total:
+- **Additional Discount Percentage** = 10 → السيستم يشيله (يبقى 0)، F&F يفضل، Net Total = **700**.
+- Additional Discount Percentage = 50 → F&F يتشال (Rate 1000)، Net Total = **500**. Log: **Order Comparison** والـ winner = `order_manual`.
+
+### الحالة 10 — Coupon قصاد F&F
+
+السلة: `FF Demo Staff` + Laptop × 1 (بقت 700 بـ F&F).
+- كوبون `FFDEMO15` → **مرفوض**، reason = `better_discount_exists`، والرسالة: "Friends & Family discount (30%) is better than coupon FFDEMO15 (15%)" + نسخة عربي.
+- كوبون `FFDEMO40` → **مقبول**: Laptop Discount (%) = 40، Rate = **600**. Log: Discount Source = `coupon`.
+- `FFDEMO15` لعميل مش مؤهل (`FF Demo Public`) → مقبول عادي (15%).
+
+### الحالة 11 — Max Discount per Order
+
+في الـ Settings: **Max Discount per Order** = 100، Save.
+- `FF Demo Staff` + Laptop × 1 → Rate = **900** (الخصم 100 بدل 300). الـ caps: cap_hit = `order`، fnf_uncapped_total = 300، fnf_applied_total = 100. الرسالة: "…capped at the per-order maximum of 100.00 (full discount would be 300.00)". Log: **Discount Applied** + **Cap Hit**.
+- Laptop + Phone (300 + 150) → إجمالي الخصم **100**، متوزّع بالنسبة 2:1 (تقريبًا 66.67 على اللابتوب و33.33 على الموبايل).
+
+رجّع الحد لـ 0 بعدها.
+
+### الحالة 12 — Max Discount per Customer per Month + المرتجع بيرجّع الرصيد
+
+> الاستهلاك الشهري بيتحسب من كل الفواتير الـ submitted للعميل في الشهر ده. علشان الأرقام تطلع زي ما هي تحت، اعمل عميل جديد (مثلًا `FF Demo Cap Test`) وعلّم عليه **Friends & Family Member**، أو راجع **monthly_used** الأول.
+
+**Max Discount per Customer per Month** = 500:
+1. فاتورة 1: Laptop → Rate **700** (استهلك 300، فاضل 200).
+2. فاتورة 2: Laptop → Rate **800** (اتخصم 200 بس). cap_hit = `monthly`، والرسالة فيها "reduced to 200.00".
+3. فاتورة 3: Phone → Rate **500** (من غير خصم). الرسالة: "Monthly Friends & Family limit of 500.00 reached…". Log: **Cap Hit**.
+4. اعمل **Return / Credit Note** لفاتورة 1 → سطر المرتجع عليه F&F Amount = **−300**، والاستهلاك يبقى **200**.
+5. فاتورة 4: Laptop → Rate **700** تاني (رجع 300 رصيد).
+
+رجّع الحد لـ 0 بعدها.
+
+### الحالة 13 — نهاية البرنامج / إيقافه → F&F يقف فورًا
+
+1. اعمل Draft لـ `FF Demo Staff` + Laptop (هيبقى 700) وماتعملوش Submit.
+2. في الـ Settings: **Start Date** = من 30 يوم، **End Date** = امبارح، Save.
+3. فاتورة جديدة لنفس العميل → **1000**. الـ POS: `friends_and_family.eligible` = false.
+4. افتح الـ Draft بتاع خطوة 1 واعمل Save → يرجع **1000**. وبعد Submit مفيش Discount Applied في الـ Log.
+5. **Start Date** = بكرة و End Date فاضي → 1000. **Enable Program** ✘ → 1000.
+
+### الحالة 14 — Cancel / Return في الـ Log والتقرير
+
+1. فاتورة A: `FF Demo Staff` + Laptop × 1 (F&F 300).
+2. فاتورة B: Phone × 2 (F&F 300).
+3. Return من B بموبايل واحد (−150).
+4. Cancel لـ A (اعمل Cancel للـ Wallet Transaction الأول على brainwise.dev).
+
+المتوقع في **Friends and Family Log**:
+- A: **Discount Applied** 300 + **Discount Reversed** −300، والاتنين **Is Cancelled** ✔.
+- المرتجع: **Discount Returned** −150.
+
+في **Friends and Family Performance** (View = Invoices، اليوم، Customer = `FF Demo Staff`):
+- A مش ظاهرة. B والمرتجع ظاهرين.
+- **F&F Discount (net)** = **150**، **F&F Orders** = 1، **Returns** = 1.
+
+### الحالة 15 — تغيير الإعدادات والأهلية بيتسجّل
+
+- غيّر **Discount Percentage** لـ 25 وSave → في الـ Log سطر **Settings Changed** وفي Details `discount_percentage`.
+- علّم **Friends & Family Member** على `FF Demo Public` (بيوزر Sales Manager) → Log: **Eligibility Applied**، reason = `customer_flag`. فاتورة Laptop ليه → Rate = **750**.
+- رجّع النسبة 30 وشيل الـ flag.
+
+---
+
+## 2. حالات واجهة الـ POS (PN-130)
+
+الـ POS بياخد كل حاجة من رد `posnext_promotions.api.apply_offers.apply_offers`. الحالات دي مكتوبة على **عقد الـ payload** (شكله ثابت ومش هيتغير)، فتقدر تشتغل عليها أول ما PN-130 ينزل.
+
+### 2.1 عقد الـ payload
+
+```text
+response.items[]                      ← السطور بعد التسعير (rate / discount_percentage / discount_amount)
+response.friends_and_family = {
+  eligible, discount_percentage, applied_count,
+  message, reason, user_message,
+  items[] = { item_code, idx, applies, discount_percentage, discount_amount, rate, reason,
+              competing_source, competing_amount, fnf_uncapped_amount, capped,
+              best_discount{ winner, outcome, candidates[], suppressed[], message_en, message_ar } },
+  caps = { active, max_discount_per_order, max_discount_per_customer_month, monthly_used,
+           monthly_remaining, allowance, fnf_uncapped_total, fnf_applied_total, capped,
+           cap_hit, monthly_remaining_after, message, message_en, message_ar },
+  cap_hit
+}
+response.best_discount = { winner, lines[], order, fnf_total, suppressed[], stacking:false }
+```
+
+قيم مهمة:
+- `reason` (على مستوى السطر): `applied`، `excluded`، `out_of_scope`، `other_discount_better`، `cap_reached`، `order_discount_better`، `customer_ineligible`، `program_inactive`، `stripped`.
+- `best_discount.outcome`: `fnf_only`، `fnf_better`، `tie_fnf_wins`، `other_better`، `no_fnf`.
+- `winner`: `friends_and_family`، `promotion`، `coupon`، `manual`، `order_promotion`، `order_coupon`، `order_manual`.
+- لعميل مش مؤهل أو برنامج مقفول: `friends_and_family.eligible = false` (البلوك موجود بنفس الشكل)، وأي سطر كان عليه F&F بيرجع بالـ Price List Rate.
+
+### 2.2 الحالات
+
+| # | الخطوات | المتوقع في الـ UI | الحقل |
+|---|---|---|---|
+| P1 | اختار `FF Demo Staff` وضيف Laptop | Badge "Friends & Family 30%" على العميل/السلة؛ السطر 1000 مشطوبة ← 700؛ الـ User Message ظاهرة | `eligible`، `discount_percentage`، `items[].applies`، `message` |
+| P2 | اختار `FF Demo Public` | مفيش badge؛ السعر 1000 | `eligible=false` |
+| P3 | P1 وبعدين غيّر العميل لـ Public | السطر يرجع 1000 فورًا من غير F&F | `response.items[]` |
+| P4 | Staff + Gift Card + Headset + Laptop | Gift Card وHeadset عليهم "Excluded" ومن غير خصم؛ Laptop 700 | `items[].reason = excluded` |
+| P5 | Staff + Gift Card + Headset بس | رسالة إن كل الأصناف مستثناة | `reason = no_covered_items` |
+| P6 | Staff + Cable | Breakdown: F&F 30 بدل Promotion 10؛ رسالة `message_en` / `message_ar` | `best_discount.outcome = fnf_better` |
+| P7 | Staff + Charger | السطر 120 (Promotion 40%)؛ رسالة إن البرومو أحسن | `winner = promotion` |
+| P8 | Staff + Mouse | F&F (تعادل) | `outcome = tie_fnf_wins` |
+| P9 | Staff + Laptop + كوبون FFDEMO15 | الكوبون يترفض برسالة "Friends & Family discount (30%) is better than coupon FFDEMO15 (15%)" | `validate_coupon` → `reason = better_discount_exists` |
+| P10 | Staff + Laptop + كوبون FFDEMO40 | الكوبون يتقبل؛ 600 | `line_updates[]` |
+| P11 | Max Discount per Order = 100، Staff + Laptop | 900 + رسالة الحد (EN/AR) | `caps.cap_hit = order`، `caps.message_*` |
+| P12 | Max Discount per Customer per Month = 500 | الرصيد المتبقي (`monthly_remaining`) ورسالة الحد لما يخلص | `caps.cap_hit = monthly` |
+| P13 | End Date = امبارح أو Enable Program ✘ | الـ badge يختفي والأسعار ترجع | `eligible=false` |
+| P14 | Additional Discount 50% على Laptop | F&F يتشال؛ الـ breakdown يوضح إن خصم الفاتورة أحسن | `items[].reason = order_discount_better` |
+
+---
+
+## 3. التشغيل الأوتوماتيك
+
+```bash
+cd ~/frappe-bench
+# اختبارات القبول (end-to-end)
+bench --site brainwise.dev run-tests --skip-before-tests \
+  --module posnext_promotions.posnext_promotions.doctype.friends_and_family_settings.test_friends_and_family_acceptance
+# POS Profile تاني (اختياري)
+FF_ACCEPTANCE_POS_PROFILE="profile 1" bench --site brainwise.dev run-tests --skip-before-tests \
+  --module posnext_promotions.posnext_promotions.doctype.friends_and_family_settings.test_friends_and_family_acceptance
+```
+
+الاختبارات بتعمل بيانات بـ prefix `_Test FF Acc` وبتعمل rollback بعد كل حالة، فمش بتسيب فواتير أو Logs على الـ site.

@@ -29,9 +29,13 @@ from posnext_promotions.promotions.friends_and_family_apply import (
 	DISCOUNT_SOURCE_FRIENDS_AND_FAMILY,
 	REASON_ORDER_DISCOUNT_BETTER,
 	REASON_PROTECTED,
+	_clear_fnf_audit_fields,
+	_is_fnf_stamped,
+	_strip_line_discount,
 	apply_friends_and_family_to_items,
 	summarize_line_payloads,
 )
+from posnext_promotions.promotions.friends_and_family_caps import FIELD_FNF_REPLACED
 from posnext_promotions.promotions.schedule import (
 	filter_rules_by_schedule,
 	get_inactive_rules,
@@ -1116,7 +1120,14 @@ def _friends_and_family_only_response(items, prepared_items, customer, invoice) 
 		posting_date=invoice.get("posting_date") or nowdate(),
 	)
 	if not ff_result.get("eligible"):
-		return {"items": items}
+		# Keep the cart as sent, minus any stale F&F stamp (e.g. customer
+		# switched to an ineligible one / program ended): those lines come back
+		# at list price with no F&F metadata. Tell the POS why F&F is off.
+		cleaned = [
+			dict(prepared) if _is_fnf_stamped(original) else original
+			for original, prepared in zip(items, prepared_items, strict=False)
+		]
+		return {"items": cleaned, "friends_and_family": _friends_and_family_response_block(ff_result)}
 	return {
 		"items": [dict(item) for item in prepared_items],
 		"free_items": [],
@@ -1359,6 +1370,17 @@ def apply_offers(invoice_data, selected_offers=None):
 		prepared_items = [frappe._dict(row) for row in items]
 
 		for idx, item in enumerate(prepared_items):
+			# A previous Friends & Family stamp is engine output, not a cashier
+			# discount: take the line back to list price *before* it is priced, so
+			# F&F is re-decided below (otherwise switching to an ineligible
+			# customer would keep the old F&F rate / % as "manual").
+			is_fnf_stamp = _is_fnf_stamped(item)
+			if is_fnf_stamp:
+				_strip_line_discount(item)
+			else:
+				_clear_fnf_audit_fields(item)
+				item.pop(FIELD_FNF_REPLACED, None)
+
 			item_code = item.get("item_code")
 			qty = flt(item.get("qty") or item.get("quantity") or 0)
 
@@ -1422,13 +1444,6 @@ def apply_offers(invoice_data, selected_offers=None):
 			# current quantity can no longer satisfy the rule.
 			# Preserve manual cashier discounts across offer re-evaluation.
 			is_manual = item.get("discount_source") == DISCOUNT_SOURCE_MANUAL
-			# A previous Friends & Family stamp is engine output, not a cashier
-			# discount: clear it so F&F is re-decided below (otherwise switching to
-			# an ineligible customer would keep the old F&F % as "manual").
-			is_fnf_stamp = item.get("discount_source") == DISCOUNT_SOURCE_FRIENDS_AND_FAMILY
-			if is_fnf_stamp:
-				item.discount_source = None
-				item.is_already_discounted = 0
 			if not is_manual and not is_fnf_stamp and not item.get("pricing_rules"):
 				is_manual = flt(item.get("discount_percentage")) > 0 or flt(item.get("discount_amount")) > 0
 				if is_manual:

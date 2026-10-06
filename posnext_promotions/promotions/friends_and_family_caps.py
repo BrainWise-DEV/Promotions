@@ -57,6 +57,9 @@ from posnext_promotions.promotions import best_discount as bd
 
 FIELD_FNF_AMOUNT = "posnext_fnf_discount_amount"
 FIELD_DISCOUNT_SOURCE = "posnext_discount_source"
+# PN-133: the discount F&F replaced on the line (JSON), so a later save can
+# re-run the comparison — and give the promotion back if F&F no longer wins.
+FIELD_FNF_REPLACED = "posnext_fnf_replaced_discount"
 INVOICE_ITEM_DOCTYPES = ("Sales Invoice Item", "POS Invoice Item")
 INVOICE_DOCTYPES = ("Sales Invoice", "POS Invoice")
 
@@ -86,6 +89,18 @@ ITEM_FIELD_SPECS = [
 		"print_hide": 1,
 		"description": "Friends & Family saving on this line (line total). Negative on returns. "
 		"Drives the monthly per-customer cap.",
+	},
+	{
+		"fieldname": FIELD_FNF_REPLACED,
+		"module": "POSNext Promotions",
+		"label": "Discount Replaced by Friends & Family",
+		"fieldtype": "Small Text",
+		"insert_after": FIELD_FNF_AMOUNT,
+		"read_only": 1,
+		"hidden": 1,
+		"print_hide": 1,
+		"report_hide": 1,
+		"description": "Promotion / coupon / manual discount that Friends & Family replaced (JSON).",
 	},
 ]
 

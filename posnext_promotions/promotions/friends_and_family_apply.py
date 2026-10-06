@@ -40,6 +40,7 @@ amounts, suppressed sources, English + Arabic message) for the POS UI.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, replace
 
 import frappe
@@ -58,6 +59,7 @@ from posnext_promotions.promotions.friends_and_family import (
 from posnext_promotions.promotions.friends_and_family_caps import (
 	FIELD_DISCOUNT_SOURCE,
 	FIELD_FNF_AMOUNT,
+	FIELD_FNF_REPLACED,
 	CapContext,
 	allocate,
 	build_cap_payload,
@@ -275,6 +277,57 @@ def _clear_fnf_audit_fields(item) -> None:
 		_set_item_attr(item, FIELD_FNF_AMOUNT, 0)
 
 
+# Line fields that describe the discount F&F replaced (restored on the next run).
+_REPLACED_FIELDS = (
+	"discount_source",
+	"discount_percentage",
+	"discount_amount",
+	"rate",
+	"pricing_rules",
+	"posnext_coupon_code",
+	"coupon_code",
+	"is_already_discounted",
+)
+
+
+def _replaced_snapshot(item) -> str:
+	return json.dumps({key: item.get(key) for key in _REPLACED_FIELDS}, default=str)
+
+
+def _restore_replaced_discount(item) -> bool:
+	"""Put back the discount an earlier F&F stamp replaced (PN-133).
+
+	Saved invoices are validated more than once (save, then submit). Without
+	this, the second run sees an F&F line with no competitor — the promotion it
+	beat is gone — so the comparison (and its audit log) is lost, and a cap
+	that later reduces F&F could not hand the line back to its promotion.
+	"""
+	raw = item.get(FIELD_FNF_REPLACED)
+	if not raw:
+		return False
+	_set_item_attr(item, FIELD_FNF_REPLACED, None)
+	if not _is_fnf_stamped(item):
+		return False
+	try:
+		data = json.loads(raw) if isinstance(raw, str) else dict(raw)
+	except (TypeError, ValueError):
+		return False
+	_clear_fnf_audit_fields(item)
+	for key in _REPLACED_FIELDS:
+		if key in data:
+			_set_item_attr(item, key, data[key])
+	return True
+
+
+def _restored_copy(item):
+	"""Non-mutating view of ``item`` with its replaced discount put back."""
+	if not item.get(FIELD_FNF_REPLACED):
+		return item
+	copy = frappe._dict(item.as_dict() if hasattr(item, "as_dict") else dict(item))
+	_restore_replaced_discount(copy)
+	return copy
+
+
 def _clear_friends_and_family_stamp(item) -> None:
 	"""Remove an earlier F&F stamp; leave non-F&F discounts untouched."""
 	if not _is_fnf_stamped(item):
@@ -290,6 +343,8 @@ def _strip_line_discount(item) -> None:
 	_set_item_attr(item, "discount_amount", 0)
 	_set_item_attr(item, "is_already_discounted", 0)
 	_clear_fnf_audit_fields(item)
+	if item.get(FIELD_FNF_REPLACED):
+		_set_item_attr(item, FIELD_FNF_REPLACED, None)
 	price_list_rate = _line_price_list_rate(item)
 	if price_list_rate:
 		_set_item_attr(item, "rate", price_list_rate)
@@ -628,7 +683,7 @@ def compute_friends_and_family_discounts(
 	per applying line) always comes from Settings — never from the request.
 	"""
 	posting_date = posting_date or nowdate()
-	items = enrich_items_with_catalog(list(items or []))
+	items = enrich_items_with_catalog([_restored_copy(i) for i in items or []])
 	eligibility = get_customer_eligibility(customer, posting_date)
 	program = eligibility.program if eligibility.eligible else None
 	payload = _base_payload(eligibility, program)
@@ -686,6 +741,7 @@ def apply_friends_and_family_to_items(
 	"""
 	posting_date = posting_date or nowdate()
 	items = enrich_items_with_catalog(list(items or []))
+	restored = {idx for idx, item in enumerate(items) if _restore_replaced_discount(item)}
 	eligibility = get_customer_eligibility(customer, posting_date)
 	program = eligibility.program if eligibility.eligible else None
 	payload = _base_payload(eligibility, program)
@@ -695,7 +751,7 @@ def apply_friends_and_family_to_items(
 	if program is None:
 		results = []
 		for idx, item in enumerate(items):
-			was_fnf = _is_fnf_stamped(item)
+			was_fnf = idx in restored or _is_fnf_stamped(item)
 			_clear_friends_and_family_stamp(item)
 			reason = (
 				REASON_STRIPPED
@@ -726,6 +782,11 @@ def apply_friends_and_family_to_items(
 		results = []
 		for item, result in zip(items, planned, strict=False):
 			if result.applies:
+				replaced = (
+					_replaced_snapshot(item)
+					if result.competing_source not in (None, bd.SOURCE_NONE) and flt(result.competing_amount) > 0
+					else None
+				)
 				suppressed_rules.update(_drop_competing_tags(item, result.competing_source))
 				amount, rate = _stamp_friends_and_family(
 					item,
@@ -733,6 +794,7 @@ def apply_friends_and_family_to_items(
 					amount_basis,
 					line_amount=result.discount_amount if result.capped else None,
 				)
+				_set_item_attr(item, FIELD_FNF_REPLACED, replaced)
 				result = replace(result, discount_amount=amount, rate=rate)
 			else:
 				# Covered comparison lost (or cap exhausted), or out of scope /
@@ -772,6 +834,7 @@ _LINE_SNAPSHOT_FIELDS = (
 	"is_already_discounted",
 	FIELD_DISCOUNT_SOURCE,
 	FIELD_FNF_AMOUNT,
+	FIELD_FNF_REPLACED,
 )
 
 
@@ -883,9 +946,10 @@ def _resolve_order_level(doc, items, snapshots, b_line_values, ff_payload, fnf_l
 	else:
 		fnf_like = fnf_like or [False] * len(items)
 		for item, snap, was_fnf in zip(items, snapshots, fnf_like, strict=False):
-			now_fnf = _is_fnf_stamped(item)
+			# Back to the pre-F&F line (incl. the promotion F&F had replaced);
+			# strip only what is itself an F&F stamp.
 			_restore_line(item, snap)
-			if was_fnf or now_fnf:
+			if was_fnf or _is_fnf_stamped(item):
 				# Our F&F stamp (new or carried in from the cart) — remove it,
 				# keeping whatever else the line carried (Pricing Rules, tags).
 				_strip_line_discount(item)
@@ -971,6 +1035,9 @@ def apply_friends_and_family_on_invoice(doc, method=None):
 		return
 
 	before = _invoice_state(doc, items)
+	# Re-open earlier decisions: lines get back the discount F&F replaced.
+	for item in items:
+		_restore_replaced_discount(item)
 	snapshots = [_snapshot_line(i) for i in items]
 	posting_date = doc.get("posting_date") or nowdate()
 

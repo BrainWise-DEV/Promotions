@@ -37,6 +37,7 @@ from frappe.utils import cstr, flt
 from posnext_promotions.promotions import best_discount as bd
 from posnext_promotions.promotions.friends_and_family_apply import (
 	_is_fnf_stamped,
+	_restore_replaced_discount,
 	compute_friends_and_family_discounts,
 	enrich_items_with_catalog,
 )
@@ -48,6 +49,8 @@ REASON_BETTER_DISCOUNT_EXISTS = "better_discount_exists"
 def _neutral_copy(item):
 	"""Line as the coupon engine should see it: an F&F stamp is not a blocker."""
 	line = frappe._dict(dict(item))
+	if _restore_replaced_discount(line):
+		return line
 	if _is_fnf_stamped(line):
 		line.discount_source = None
 		line.discount_percentage = 0
