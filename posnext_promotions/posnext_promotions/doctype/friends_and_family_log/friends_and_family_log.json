@@ -1,0 +1,317 @@
+{
+ "actions": [],
+ "autoname": "format:FFL-{YYYY}-{######}",
+ "creation": "2026-10-06 10:30:00.000000",
+ "doctype": "DocType",
+ "editable_grid": 0,
+ "engine": "InnoDB",
+ "field_order": [
+  "log_type",
+  "posting_date",
+  "timestamp",
+  "column_break_main",
+  "customer",
+  "reference_doctype",
+  "reference_name",
+  "is_cancelled",
+  "section_break_item",
+  "item_code",
+  "item_name",
+  "invoice_row",
+  "column_break_item",
+  "qty",
+  "price_list_rate",
+  "section_break_discount",
+  "discount_source",
+  "discount_amount",
+  "discount_percentage",
+  "fnf_uncapped_amount",
+  "capped",
+  "cap_hit",
+  "column_break_discount",
+  "comparison_outcome",
+  "competing_source",
+  "competing_amount",
+  "reason",
+  "section_break_context",
+  "pos_profile",
+  "company",
+  "column_break_context",
+  "user",
+  "return_against",
+  "section_break_message",
+  "message",
+  "details"
+ ],
+ "fields": [
+  {
+   "fieldname": "log_type",
+   "fieldtype": "Select",
+   "label": "Log Type",
+   "read_only": 1,
+   "options": "Discount Applied\nComparison Lost\nExcluded\nCap Hit\nOrder Comparison\nEligibility Applied\nEligibility Removed\nDiscount Reversed\nDiscount Returned\nSettings Changed",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "search_index": 1,
+   "reqd": 1
+  },
+  {
+   "fieldname": "posting_date",
+   "fieldtype": "Date",
+   "label": "Date",
+   "read_only": 1,
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "timestamp",
+   "fieldtype": "Datetime",
+   "label": "Timestamp",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_main",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "customer",
+   "fieldtype": "Link",
+   "label": "Customer",
+   "read_only": 1,
+   "options": "Customer",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "reference_doctype",
+   "fieldtype": "Link",
+   "label": "Reference Type",
+   "read_only": 1,
+   "options": "DocType",
+   "in_standard_filter": 1
+  },
+  {
+   "fieldname": "reference_name",
+   "fieldtype": "Dynamic Link",
+   "label": "Order / Invoice / Reference",
+   "read_only": 1,
+   "options": "reference_doctype",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "is_cancelled",
+   "fieldtype": "Check",
+   "label": "Reference Cancelled",
+   "read_only": 1,
+   "default": "0",
+   "description": "Set when the referenced invoice is cancelled; the reversal is logged as its own entry."
+  },
+  {
+   "fieldname": "section_break_item",
+   "fieldtype": "Section Break",
+   "label": "Item"
+  },
+  {
+   "fieldname": "item_code",
+   "fieldtype": "Link",
+   "label": "Item",
+   "read_only": 1,
+   "options": "Item",
+   "in_list_view": 1,
+   "in_standard_filter": 1
+  },
+  {
+   "fieldname": "item_name",
+   "fieldtype": "Data",
+   "label": "Item Name",
+   "read_only": 1
+  },
+  {
+   "fieldname": "invoice_row",
+   "fieldtype": "Data",
+   "label": "Invoice Row",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_item",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "qty",
+   "fieldtype": "Float",
+   "label": "Qty",
+   "read_only": 1
+  },
+  {
+   "fieldname": "price_list_rate",
+   "fieldtype": "Currency",
+   "label": "Price List Rate",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_break_discount",
+   "fieldtype": "Section Break",
+   "label": "Discount"
+  },
+  {
+   "fieldname": "discount_source",
+   "fieldtype": "Data",
+   "label": "Discount Source",
+   "read_only": 1,
+   "in_standard_filter": 1,
+   "description": "Discount the line / order ended with: friends_and_family, promotion, coupon, manual, order_promotion, order_coupon, order_manual."
+  },
+  {
+   "fieldname": "discount_amount",
+   "fieldtype": "Currency",
+   "label": "F&F Discount Amount",
+   "read_only": 1,
+   "in_list_view": 1,
+   "description": "Friends & Family money saved (line total). Negative for reversals and returns."
+  },
+  {
+   "fieldname": "discount_percentage",
+   "fieldtype": "Percent",
+   "label": "F&F Discount %",
+   "read_only": 1
+  },
+  {
+   "fieldname": "fnf_uncapped_amount",
+   "fieldtype": "Currency",
+   "label": "F&F Amount Before Caps",
+   "read_only": 1
+  },
+  {
+   "fieldname": "capped",
+   "fieldtype": "Check",
+   "label": "Capped",
+   "read_only": 1,
+   "default": "0"
+  },
+  {
+   "fieldname": "cap_hit",
+   "fieldtype": "Data",
+   "label": "Cap Hit",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_discount",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "comparison_outcome",
+   "fieldtype": "Data",
+   "label": "Comparison Outcome",
+   "read_only": 1,
+   "in_standard_filter": 1
+  },
+  {
+   "fieldname": "competing_source",
+   "fieldtype": "Data",
+   "label": "Competing Discount",
+   "read_only": 1
+  },
+  {
+   "fieldname": "competing_amount",
+   "fieldtype": "Currency",
+   "label": "Competing Amount",
+   "read_only": 1
+  },
+  {
+   "fieldname": "reason",
+   "fieldtype": "Data",
+   "label": "Reason",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_break_context",
+   "fieldtype": "Section Break",
+   "label": "Context"
+  },
+  {
+   "fieldname": "pos_profile",
+   "fieldtype": "Link",
+   "label": "POS Profile",
+   "read_only": 1,
+   "options": "POS Profile"
+  },
+  {
+   "fieldname": "company",
+   "fieldtype": "Link",
+   "label": "Company",
+   "read_only": 1,
+   "options": "Company"
+  },
+  {
+   "fieldname": "column_break_context",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "user",
+   "fieldtype": "Link",
+   "label": "User",
+   "read_only": 1,
+   "options": "User"
+  },
+  {
+   "fieldname": "return_against",
+   "fieldtype": "Data",
+   "label": "Return Against",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_break_message",
+   "fieldtype": "Section Break",
+   "label": "Details"
+  },
+  {
+   "fieldname": "message",
+   "fieldtype": "Small Text",
+   "label": "Message",
+   "read_only": 1
+  },
+  {
+   "fieldname": "details",
+   "fieldtype": "Code",
+   "label": "Details (JSON)",
+   "read_only": 1,
+   "options": "JSON"
+  }
+ ],
+ "in_create": 1,
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-10-06 10:30:00.000000",
+ "modified_by": "Administrator",
+ "module": "POSNext Promotions",
+ "name": "Friends and Family Log",
+ "naming_rule": "Expression",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "delete": 1
+  },
+  {
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Sales Manager"
+  }
+ ],
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": [],
+ "title_field": "log_type",
+ "track_changes": 0,
+ "description": "Friends & Family audit log (PN-131): every F&F decision on submitted invoices, eligibility changes and admin setting changes. Written by the system only."
+}

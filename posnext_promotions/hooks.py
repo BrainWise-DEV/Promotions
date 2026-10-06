@@ -46,6 +46,10 @@ doctype_js = {
 	"User": "public/js/user.js",
 }
 
+# PN-131: the F&F audit log references invoices / customers but must never
+# block deleting them (it is an audit trail, not a dependency).
+ignore_links_on_delete = ["Friends and Family Log"]
+
 doc_events = {
 	"Promotional Scheme": {
 		"before_validate": [
@@ -71,8 +75,14 @@ doc_events = {
 			"posnext_promotions.promotions.friends_and_family_apply.apply_friends_and_family_on_invoice",
 		],
 		"before_submit": "posnext_promotions.authorization.gate.enforce_document",
-		"on_submit": "posnext_promotions.api.one_time_usage.record_one_time_offer_usage",
-		"on_cancel": "posnext_promotions.api.one_time_usage.release_one_time_offer_usage",
+		"on_submit": [
+			"posnext_promotions.api.one_time_usage.record_one_time_offer_usage",
+			"posnext_promotions.promotions.friends_and_family_log.log_invoice_submit",
+		],
+		"on_cancel": [
+			"posnext_promotions.api.one_time_usage.release_one_time_offer_usage",
+			"posnext_promotions.promotions.friends_and_family_log.log_invoice_cancel",
+		],
 	},
 	"Sales Order": {"validate": "posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts"},
 	"Quotation": {"validate": "posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts"},
@@ -81,10 +91,13 @@ doc_events = {
 		"validate": [
 			"posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts",
 			"posnext_promotions.promotions.friends_and_family_apply.apply_friends_and_family_on_invoice",
-		]
+		],
+		"on_submit": "posnext_promotions.promotions.friends_and_family_log.log_invoice_submit",
+		"on_cancel": "posnext_promotions.promotions.friends_and_family_log.log_invoice_cancel",
 	},
 	"Customer": {
-		"validate": "posnext_promotions.promotions.friends_and_family_eligibility.guard_flag_changes"
+		"validate": "posnext_promotions.promotions.friends_and_family_eligibility.guard_flag_changes",
+		"on_update": "posnext_promotions.promotions.friends_and_family_log.log_customer_eligibility_change",
 	},
 }
 
