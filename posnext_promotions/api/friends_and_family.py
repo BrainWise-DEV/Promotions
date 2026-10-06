@@ -95,7 +95,13 @@ def apply_friends_and_family_discount(
 	Returns:
 	        ``eligible``, ``discount_percentage`` (Settings rate or 0), ``message``,
 	        ``applied_count``, and per-line ``items`` with ``applies``,
-	        ``discount_percentage``, ``discount_amount``, ``rate``, ``reason``.
+	        ``discount_percentage``, ``discount_amount``, ``rate``, ``reason``,
+	        ``competing_source`` / ``competing_amount`` and a per-line
+	        ``best_discount`` decision.
+	        ``best_discount`` (PN-128): ``winner``, per-line ``lines`` (candidates
+	        with amounts, ``suppressed``, ``outcome``), ``fnf_total``,
+	        ``other_total`` and ``message`` / ``message_en`` / ``message_ar``.
+	        Best single discount only — never stacked; tie → Friends & Family.
 
 	POS contract (frontend follow-up in ``pos_next``):
 	  1. On customer change → ``check_friends_and_family_eligibility``.

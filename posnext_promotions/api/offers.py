@@ -13,7 +13,7 @@ from typing import Dict, List, Optional
 
 import frappe
 from frappe import _
-from frappe.utils import cint, flt, getdate, nowdate
+from frappe.utils import cint, cstr, flt, getdate, nowdate
 
 from posnext_promotions.promotions.schedule import SCHEDULE_FIELDS, to_client_payload as schedule_payload
 from posnext_promotions.promotions.scope import (
@@ -998,7 +998,39 @@ def get_active_coupons(customer: str | None = None, company: str | None = None) 
 def validate_coupon(
 	coupon_code: str, customer: str | None = None, company: str | None = None, items=None
 ) -> dict:
-	"""Validate a coupon code and optionally compute line-level discounts for cart items."""
+	"""Validate a coupon code and optionally compute line-level discounts for cart items.
+
+	PN-128: with ``items`` the coupon is only granted on lines where it is the
+	single best discount (vs Friends & Family and existing promotions; tie →
+	F&F). The response carries a ``best_discount`` explanation; a coupon that
+	wins nothing returns ``valid: False`` with ``reason: better_discount_exists``.
+	"""
+	return _validate_coupon(coupon_code, customer, company, items=items, resolve_best=True)
+
+
+def _fnf_hint(customer) -> dict | None:
+	"""Without cart items we cannot compare — tell the POS the customer has F&F."""
+	from posnext_promotions.promotions.friends_and_family_eligibility import get_customer_eligibility
+
+	eligibility = get_customer_eligibility(customer)
+	if not eligibility.eligible:
+		return None
+	pct = flt(eligibility.program.discount_percentage)
+	return {
+		"eligible": True,
+		"discount_percentage": pct,
+		"message": _(
+			"Customer has a {0}% Friends & Family discount. Only the better discount applies — "
+			"they are never combined."
+		).format(f"{pct:g}"),
+		"message_ar": (
+			f"العميل لديه خصم الأصدقاء والعائلة {pct:g}%. يتم تطبيق الخصم الأفضل فقط — "
+			"لا يتم الجمع بين الخصمين."
+		),
+	}
+
+
+def _validate_coupon(coupon_code, customer=None, company=None, items=None, resolve_best=True) -> dict:
 	if not customer:
 		return {"valid": False, "message": _("Customer is required")}
 	if not company:
@@ -1013,6 +1045,7 @@ def validate_coupon(
 		apply_coupon_to_items,
 		check_coupon_code,
 	)
+	from posnext_promotions.promotions.best_discount_coupon import resolve_coupon_best_discount
 
 	if isinstance(items, str):
 		items = json.loads(items) if items else None
@@ -1032,26 +1065,41 @@ def validate_coupon(
 		"total_discount": 0,
 	}
 
-	if items is not None:
+	if items is None:
+		hint = _fnf_hint(customer)
+		if hint:
+			response["friends_and_family"] = hint
+		return response
+
+	if resolve_best:
+		apply_result = resolve_coupon_best_discount(coupon, items, customer=customer)
+	else:
 		apply_result = apply_coupon_to_items(coupon, items)
-		if not apply_result.get("valid"):
-			return {
-				"valid": False,
-				"message": apply_result.get("message") or _("No eligible items for this coupon"),
-				"coupon": coupon_dict,
-				"line_updates": [],
-				"eligible_item_codes": apply_result.get("eligible_item_codes") or [],
-				"total_discount": 0,
-			}
-		response.update(
-			{
-				"line_updates": apply_result.get("line_updates") or [],
-				"eligible_item_codes": apply_result.get("eligible_item_codes") or [],
-				"total_discount": apply_result.get("total_discount") or 0,
-				"eligible_subtotal": apply_result.get("eligible_subtotal") or 0,
-				"message": apply_result.get("message"),
-			}
-		)
+	if not apply_result.get("valid"):
+		return {
+			"valid": False,
+			"message": apply_result.get("message") or _("No eligible items for this coupon"),
+			"message_en": apply_result.get("message_en"),
+			"message_ar": apply_result.get("message_ar"),
+			"reason": apply_result.get("reason"),
+			"coupon": coupon_dict,
+			"line_updates": [],
+			"eligible_item_codes": apply_result.get("eligible_item_codes") or [],
+			"total_discount": 0,
+			"best_discount": apply_result.get("best_discount"),
+		}
+	response.update(
+		{
+			"line_updates": apply_result.get("line_updates") or [],
+			"eligible_item_codes": apply_result.get("eligible_item_codes") or [],
+			"total_discount": apply_result.get("total_discount") or 0,
+			"eligible_subtotal": apply_result.get("eligible_subtotal") or 0,
+			"message": apply_result.get("message"),
+			"message_en": apply_result.get("message_en"),
+			"message_ar": apply_result.get("message_ar"),
+			"best_discount": apply_result.get("best_discount"),
+		}
+	)
 
 	return response
 
@@ -1060,10 +1108,25 @@ def validate_coupon(
 def calculate_coupon_discount(
 	coupon_code: str, invoice_data, customer: str | None = None, company: str | None = None
 ):
-	"""Validate and calculate coupon discount with item-level exclusion support."""
+	"""Validate and calculate an order-level coupon discount with item exclusions.
+
+	PN-128: for a Friends & Family customer the order-level coupon competes with
+	the cart's total F&F saving (lines offered to the coupon without their F&F
+	stamp). Larger total wins; tie → F&F. When the coupon wins the response sets
+	``suppress_friends_and_family`` so the POS drops the F&F line stamps (the
+	invoice validate hook enforces the same rule server-side).
+	"""
 	import json
 
 	from posnext_promotions.api.coupon_engine import apply_coupon_discount
+	from posnext_promotions.promotions import best_discount as bd
+	from posnext_promotions.promotions.best_discount_coupon import (
+		REASON_BETTER_DISCOUNT_EXISTS,
+		_neutral_copy,
+	)
+	from posnext_promotions.promotions.friends_and_family_apply import (
+		compute_friends_and_family_discounts,
+	)
 
 	if isinstance(invoice_data, str):
 		invoice_data = json.loads(invoice_data or "{}")
@@ -1073,7 +1136,19 @@ def calculate_coupon_discount(
 	company = company or invoice.get("company")
 	customer = customer or invoice.get("customer")
 
-	validation = validate_coupon(coupon_code, customer, company, items=items)
+	fnf = compute_friends_and_family_discounts(
+		customer=customer,
+		items=[_neutral_copy(i) for i in items],
+		posting_date=invoice.get("posting_date"),
+	)
+	fnf_total = sum(flt(line.get("discount_amount")) for line in fnf.get("items") or [] if line.get("applies"))
+	if fnf_total > 0:
+		# Coupon sees the cart without F&F stamps so it can compete with F&F.
+		items = [_neutral_copy(i) for i in items]
+		invoice["grand_total"] = 0
+		invoice["net_total"] = 0
+
+	validation = _validate_coupon(coupon_code, customer, company, items=items, resolve_best=False)
 	if not validation.get("valid"):
 		return validation
 
@@ -1126,7 +1201,7 @@ def calculate_coupon_discount(
 		tax_amount=tax_amount,
 	)
 
-	return {
+	response = {
 		"valid": result.get("valid", False),
 		"message": result.get("message"),
 		"discount": flt(result.get("discount") or 0),
@@ -1137,6 +1212,30 @@ def calculate_coupon_discount(
 		"excluded_subtotal": flt(result.get("excluded_subtotal") or 0),
 		"coupon": coupon,
 	}
+
+	if fnf_total > 0 and response["valid"]:
+		code = cstr(coupon.get("coupon_code")).upper()
+		pct = flt(coupon.get("discount_percentage")) if coupon.get("discount_type") == "Percentage" else None
+		decision = bd.decide(
+			[
+				bd.Candidate(
+					source=bd.SOURCE_FRIENDS_AND_FAMILY,
+					amount=fnf_total,
+					percentage=flt(fnf.get("discount_percentage")) or None,
+				),
+				bd.Candidate(source=bd.SOURCE_ORDER_COUPON, amount=response["discount"], percentage=pct, code=code),
+			],
+			granularity=bd.GRANULARITY_ORDER,
+		)
+		msgs = decision.messages()
+		response["best_discount"] = bd.summarize([], decision)
+		response.update({"message": msgs["message"], "message_en": msgs["en"], "message_ar": msgs["ar"]})
+		if decision.fnf_wins:
+			response.update({"valid": False, "discount": 0, "reason": REASON_BETTER_DISCOUNT_EXISTS})
+		else:
+			response["suppress_friends_and_family"] = True
+
+	return response
 
 
 @frappe.whitelist()
