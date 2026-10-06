@@ -414,7 +414,7 @@ class TestFriendsAndFamilyLog(FrappeTestCase):
 			user.insert(ignore_permissions=True)
 		self.assertFalse(frappe.has_permission(LOG_DOCTYPE, "read", user=CASHIER))
 		perms = {p.role: p for p in frappe.get_meta(LOG_DOCTYPE).permissions}
-		self.assertEqual(set(perms), {"System Manager", "Sales Manager"})
+		self.assertEqual(set(perms), {"System Manager", "Sales Manager", "Accounts Manager"})  # PN-132 report access
 		self.assertTrue(all(not p.write and not p.create for p in perms.values()))
 		self.assertTrue(frappe.get_meta(LOG_DOCTYPE).in_create)
 

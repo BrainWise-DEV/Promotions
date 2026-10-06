@@ -19,6 +19,14 @@ frappe.ui.form.on("Friends and Family Settings", {
 				__("View")
 			);
 		}
+		if (frappe.model.can_get_report("Friends and Family Log")) {
+			// PN-132: program cost and usage.
+			frm.add_custom_button(
+				__("Performance Report"),
+				() => frappe.set_route("query-report", "Friends and Family Performance"),
+				__("View")
+			);
+		}
 		if (frappe.model.can_read("Version")) {
 			frm.add_custom_button(
 				__("Version History"),
