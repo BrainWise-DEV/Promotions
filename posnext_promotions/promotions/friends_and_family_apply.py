@@ -853,45 +853,89 @@ def _header_discount_value(doc) -> float:
 	return flt(doc.get("discount_amount") or 0)
 
 
-def _pos_coupon_value(coupon_code: str, base_net: float, base_grand: float) -> tuple[float, float | None] | None:
-	"""``(value, percentage)`` of an order-level POS Coupon on a base (``None`` if unknown)."""
+def _scenario_b_lines(items, snapshots, fnf_like) -> list:
+	"""Paid cart lines as they would be **without** F&F (scenario B), for the coupon engine.
+
+	Each line gets back its pre-F&F state (``snapshots``); a line that is itself
+	an F&F stamp goes back to list price with no discount.
+	"""
+	lines = []
+	fnf_like = fnf_like or [False] * len(items)
+	for item, snap, was_fnf in zip(items, snapshots, fnf_like, strict=False):
+		if item.get("is_free_item"):
+			continue
+		line = frappe._dict(item.as_dict() if hasattr(item, "as_dict") else dict(item))
+		line.update(snap or {})
+		if was_fnf or _is_fnf_stamped(line):
+			line.discount_source = None
+			line.discount_percentage = 0
+			line.discount_amount = 0
+			line.is_already_discounted = 0
+			line[FIELD_DISCOUNT_SOURCE] = None
+			price_list_rate = _line_price_list_rate(line)
+			if price_list_rate:
+				line.rate = price_list_rate
+		line.amount = flt(line.get("rate")) * flt(line.get("qty"))
+		lines.append(line)
+	return lines
+
+
+def _pos_coupon_value(
+	coupon_code: str, base_net: float, base_grand: float, lines=None, tax_amount: float = 0
+) -> tuple[float, float | None] | None:
+	"""``(value, percentage)`` of an order-level POS Coupon (``None`` if unknown).
+
+	With ``lines`` the value comes from the coupon engine, i.e. the same base the
+	POS used in ``calculate_coupon_discount``: already-discounted lines (a
+	promotion that beat F&F) and excluded brands do not count. Without lines it
+	falls back to the coupon % of the whole base.
+	"""
 	code = cstr(coupon_code).strip().upper()
 	if not code or not frappe.db.table_exists("POS Coupon"):
 		return None
-	row = frappe.db.get_value(
-		"POS Coupon",
-		{"coupon_code": code},
-		["discount_type", "discount_percentage", "discount_amount", "max_amount", "apply_on"],
-		as_dict=True,
-	)
-	if not row:
+	name = frappe.db.get_value("POS Coupon", {"coupon_code": code})
+	if not name:
 		return None
-	base = base_grand if cstr(row.apply_on) == "Grand Total" else base_net
-	pct = None
-	if cstr(row.discount_type) == "Percentage":
-		pct = flt(row.discount_percentage)
-		value = flt(base) * pct / 100.0
+	row = frappe.get_cached_doc("POS Coupon", name)
+	pct = flt(row.discount_percentage) if cstr(row.discount_type) == "Percentage" else None
+	if lines:
+		from posnext_promotions.api.coupon_engine import apply_coupon_discount
+
+		result = apply_coupon_discount(
+			row,
+			cart_total=base_grand,
+			net_total=base_net,
+			items=[dict(line) for line in lines],
+			tax_amount=tax_amount,
+		)
+		value = flt(result.get("discount")) if result.get("valid") else 0.0
 	else:
-		value = flt(row.discount_amount)
+		base = base_grand if cstr(row.apply_on) == "Grand Total" else base_net
+		value = flt(base) * pct / 100.0 if pct is not None else flt(row.discount_amount)
 	if flt(row.max_amount) and value > flt(row.max_amount):
 		value = flt(row.max_amount)
 		pct = None  # capped: the face % no longer describes it
+	base = base_grand if cstr(row.apply_on) == "Grand Total" else base_net
 	return max(0.0, min(value, flt(base))), pct
 
 
-def _order_candidate_without_fnf(doc, items, b_line_values) -> bd.Candidate:
+def _order_candidate_without_fnf(doc, items, b_line_values, snapshots=None, fnf_like=None) -> bd.Candidate:
 	"""Header discount the invoice would carry if F&F did not apply (scenario B)."""
 	gross = sum(bd.line_gross(i) for i in items if not i.get("is_free_item"))
 	base_net = max(0.0, gross - sum(b_line_values))
-	base_grand = base_net + flt(doc.get("total_taxes_and_charges") or 0)
+	tax_amount = flt(doc.get("total_taxes_and_charges") or 0)
+	base_grand = base_net + tax_amount
 	pct = flt(doc.get("additional_discount_percentage") or 0)
 	coupon_code = cstr(doc.get("coupon_code")).strip()
 	value = _header_discount_value(doc)
 	if coupon_code:
-		coupon = _pos_coupon_value(coupon_code, base_net, base_grand)
+		lines = _scenario_b_lines(items, snapshots, fnf_like) if snapshots else None
+		coupon = _pos_coupon_value(coupon_code, base_net, base_grand, lines=lines, tax_amount=tax_amount)
 		coupon_pct = None
 		if coupon is not None:
-			value = max(value, coupon[0])
+			# The coupon engine is authoritative for a POS Coupon: it skips lines
+			# that already carry a promotion, so the coupon never stacks on them.
+			value = coupon[0] if lines else max(value, coupon[0])
 			coupon_pct = coupon[1]
 		return bd.Candidate(
 			source=bd.SOURCE_ORDER_COUPON,
@@ -920,7 +964,7 @@ def _resolve_order_level(doc, items, snapshots, b_line_values, ff_payload, fnf_l
 		return None
 
 	a_total = sum(bd.line_discount_value(i, bd.AMOUNT_BASIS_UNIT) for i in items)
-	order_b = _order_candidate_without_fnf(doc, items, b_line_values)
+	order_b = _order_candidate_without_fnf(doc, items, b_line_values, snapshots, fnf_like)
 	fnf_side = bd.Candidate(
 		source=bd.SOURCE_FRIENDS_AND_FAMILY,
 		amount=a_total,

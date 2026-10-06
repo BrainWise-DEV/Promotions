@@ -163,6 +163,10 @@ POS Coupons (لو POS Next متسطب): `FFDEMO15` (15%) و`FFDEMO40` (40%)، ا
 - كوبون `FFDEMO40` → **مقبول**: Laptop Discount (%) = 40، Rate = **600**. Log: Discount Source = `coupon`.
 - `FFDEMO15` لعميل مش مؤهل (`FF Demo Public`) → مقبول عادي (15%).
 
+**10b — سلة مختلطة في الـ POS (كوبون على مستوى الفاتورة):** `FF Demo Flagged` + Laptop + Phone + Cable + Charger + Mouse + Headset + Gift Card (Subtotal **2600**). من غير كوبون: F&F على 4 أصناف = **510**، والـ Charger بالبرومو (**80**)، الإجمالي **2010**.
+- `FFDEMO40` → الكوبون (40% على الأصناف اللي مالهاش خصم تاني = 2400 → **960**) أحسن من F&F (510)، فـ F&F يتشال من كل السطور، والـ Charger يفضل بالبرومو. Discount: Promotion 80 + Coupon **960**، الإجمالي **1560**، وبعد Save الفاتورة لازم تفضل Discount Amount = **960** (مش 1008 — الكوبون مايتحسبش على سطر عليه برومو).
+- `FFDEMO15` → 360 أقل من 510 → مرفوض بـ `better_discount_exists`، والسلة تفضل **2010**.
+
 ### الحالة 11 — Max Discount per Order
 
 في الـ Settings: **Max Discount per Order** = 100، Save.
