@@ -57,6 +57,13 @@ class FriendsAndFamilyProgram:
 	start_date: str | None
 	end_date: str | None
 	user_message: str
+	# PN-129 caps (money). 0 = no cap.
+	max_discount_per_order: float = 0.0
+	max_discount_per_customer_month: float = 0.0
+
+	@property
+	def has_caps(self) -> bool:
+		return self.max_discount_per_order > 0 or self.max_discount_per_customer_month > 0
 
 	def covers_reason(self, item) -> str:
 		"""Why a cart line is / is not covered. Exclusions always win.
@@ -119,6 +126,8 @@ class FriendsAndFamilyProgram:
 			"start_date": self.start_date,
 			"end_date": self.end_date,
 			"user_message": self.user_message,
+			"max_discount_per_order": self.max_discount_per_order,
+			"max_discount_per_customer_month": self.max_discount_per_customer_month,
 		}
 
 
@@ -195,4 +204,6 @@ def get_active_program(on_date=None) -> FriendsAndFamilyProgram | None:
 		start_date=cstr(settings.start_date) if settings.get("start_date") else None,
 		end_date=cstr(settings.end_date) if settings.get("end_date") else None,
 		user_message=cstr(settings.get("user_message")),
+		max_discount_per_order=max(0.0, flt(settings.get("max_discount_per_order"))),
+		max_discount_per_customer_month=max(0.0, flt(settings.get("max_discount_per_customer_month"))),
 	)

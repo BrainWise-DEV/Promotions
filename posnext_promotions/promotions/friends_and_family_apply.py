@@ -55,6 +55,15 @@ from posnext_promotions.promotions.friends_and_family import (
 	COVER_OK,
 	COVER_OUT_OF_SCOPE,
 )
+from posnext_promotions.promotions.friends_and_family_caps import (
+	FIELD_DISCOUNT_SOURCE,
+	FIELD_FNF_AMOUNT,
+	CapContext,
+	allocate,
+	build_cap_payload,
+	ceil_cents,
+	get_cap_context,
+)
 from posnext_promotions.promotions.friends_and_family_eligibility import (
 	get_customer_eligibility,
 )
@@ -77,6 +86,7 @@ REASON_INELIGIBLE = "customer_ineligible"
 REASON_PROGRAM_INACTIVE = "program_inactive"
 REASON_STRIPPED = "stripped"
 REASON_ORDER_DISCOUNT_BETTER = "order_discount_better"
+REASON_CAP_REACHED = "cap_reached"
 
 
 def _coverage_message(program, items, applied_count: int, eligibility_message: str) -> str:
@@ -148,6 +158,9 @@ class FriendsAndFamilyLineResult:
 	competing_source: str | None = None
 	competing_amount: float = 0.0
 	decision: dict | None = None
+	# PN-129: F&F before caps, and whether a cap reduced / removed it.
+	fnf_uncapped_amount: float = 0.0
+	capped: bool = False
 
 	def to_client_payload(self) -> dict:
 		return {
@@ -163,6 +176,8 @@ class FriendsAndFamilyLineResult:
 			"competing_source": self.competing_source,
 			"competing_amount": bd.money(self.competing_amount),
 			"best_discount": self.decision,
+			"fnf_uncapped_amount": bd.money(self.fnf_uncapped_amount),
+			"capped": self.capped,
 		}
 
 
@@ -246,9 +261,24 @@ def _set_item_attr(item, key: str, value) -> None:
 		item.set(key, value) if hasattr(item, "set") else setattr(item, key, value)
 
 
+def _is_fnf_stamped(item) -> bool:
+	return DISCOUNT_SOURCE_FRIENDS_AND_FAMILY in (
+		cstr(item.get("discount_source")),
+		cstr(item.get(FIELD_DISCOUNT_SOURCE)),
+	)
+
+
+def _clear_fnf_audit_fields(item) -> None:
+	if cstr(item.get(FIELD_DISCOUNT_SOURCE)) == DISCOUNT_SOURCE_FRIENDS_AND_FAMILY:
+		_set_item_attr(item, FIELD_DISCOUNT_SOURCE, None)
+	if flt(item.get(FIELD_FNF_AMOUNT)):
+		_set_item_attr(item, FIELD_FNF_AMOUNT, 0)
+
+
 def _clear_friends_and_family_stamp(item) -> None:
 	"""Remove an earlier F&F stamp; leave non-F&F discounts untouched."""
-	if cstr(item.get("discount_source")) != DISCOUNT_SOURCE_FRIENDS_AND_FAMILY:
+	if not _is_fnf_stamped(item):
+		_clear_fnf_audit_fields(item)
 		return
 	_strip_line_discount(item)
 
@@ -259,32 +289,65 @@ def _strip_line_discount(item) -> None:
 	_set_item_attr(item, "discount_percentage", 0)
 	_set_item_attr(item, "discount_amount", 0)
 	_set_item_attr(item, "is_already_discounted", 0)
+	_clear_fnf_audit_fields(item)
 	price_list_rate = _line_price_list_rate(item)
 	if price_list_rate:
 		_set_item_attr(item, "rate", price_list_rate)
 
 
+def _capped_line_values(price_list_rate: float, qty: float, line_amount: float, amount_basis: str) -> tuple:
+	"""``(actual line saving, net rate, percentage, stored discount_amount)`` for a capped line.
+
+	Saved invoice rows hold a per-unit rate in currency precision, so the rate is
+	rounded **up** to the cent — the line never saves more than its allowance.
+	"""
+	gross = price_list_rate * qty
+	if gross <= 0 or qty <= 0:
+		return 0.0, price_list_rate, 0.0, 0.0
+	line_amount = max(0.0, min(flt(line_amount), gross))
+	if amount_basis == bd.AMOUNT_BASIS_UNIT:
+		rate = min(price_list_rate, max(0.0, ceil_cents(price_list_rate - line_amount / qty)))
+		stored = bd.money(price_list_rate - rate)
+		actual = bd.money(stored * qty)
+	else:
+		rate = price_list_rate - line_amount / qty
+		actual = line_amount
+		stored = line_amount
+	return actual, rate, actual / gross * 100.0, stored
+
+
 def _stamp_friends_and_family(
-	item, percentage: float, amount_basis: str = bd.AMOUNT_BASIS_LINE
+	item, percentage: float, amount_basis: str = bd.AMOUNT_BASIS_LINE, line_amount: float | None = None
 ) -> tuple[float, float]:
-	"""Write Settings % onto the line. Percentage is never taken from the client.
+	"""Write the F&F discount onto the line. Percentage is never taken from the client.
 
 	Returns ``(line discount total, net rate)``. On saved invoice rows
 	(``amount_basis="unit"``) ``discount_amount`` is stored per unit, as ERPNext
 	expects; on cart payloads it is the line total, as ``apply_offers`` uses.
+	``line_amount`` (PN-129) stamps a cap-reduced saving instead of the full %.
 	"""
 	qty = _line_qty(item)
 	price_list_rate = _line_price_list_rate(item)
-	discount_amount, rate = _materialize_amounts(price_list_rate, qty, percentage)
-	stored_amount = (
-		price_list_rate * flt(percentage) / 100.0 if amount_basis == bd.AMOUNT_BASIS_UNIT else discount_amount
-	)
+	if line_amount is not None:
+		discount_amount, rate, percentage, stored_amount = _capped_line_values(
+			price_list_rate, qty, line_amount, amount_basis
+		)
+	else:
+		discount_amount, rate = _materialize_amounts(price_list_rate, qty, percentage)
+		stored_amount = (
+			price_list_rate * flt(percentage) / 100.0
+			if amount_basis == bd.AMOUNT_BASIS_UNIT
+			else discount_amount
+		)
 	_set_item_attr(item, "discount_percentage", percentage)
 	_set_item_attr(item, "discount_amount", stored_amount)
 	_set_item_attr(item, "rate", rate)
 	_set_item_attr(item, "price_list_rate", price_list_rate)
 	_set_item_attr(item, "discount_source", DISCOUNT_SOURCE_FRIENDS_AND_FAMILY)
 	_set_item_attr(item, "is_already_discounted", 1)
+	# Persisted audit trail (PN-129): drives the monthly cap and reporting.
+	_set_item_attr(item, FIELD_DISCOUNT_SOURCE, DISCOUNT_SOURCE_FRIENDS_AND_FAMILY)
+	_set_item_attr(item, FIELD_FNF_AMOUNT, bd.money(discount_amount))
 	return discount_amount, rate
 
 
@@ -329,7 +392,7 @@ def _looks_like_fnf_stamp(item, program, amount_basis: str) -> bool:
 	it, so on the invoice path a percentage equal to the Settings rate with no
 	Pricing Rule / coupon behind it is our stamp (re-stamping is idempotent).
 	"""
-	if cstr(item.get("discount_source")) == DISCOUNT_SOURCE_FRIENDS_AND_FAMILY:
+	if _is_fnf_stamped(item):
 		return True
 	if amount_basis != bd.AMOUNT_BASIS_UNIT:
 		return False
@@ -354,14 +417,30 @@ def _competing_candidate(item, program, amount_basis: str) -> bd.Candidate | Non
 
 
 def _evaluate_line(
-	item, program, idx: int | None = None, amount_basis: str = bd.AMOUNT_BASIS_LINE
+	item,
+	program,
+	idx: int | None = None,
+	amount_basis: str = bd.AMOUNT_BASIS_LINE,
+	fnf_amount_override: float | None = None,
 ) -> FriendsAndFamilyLineResult:
+	"""Best-of decision for one line. ``fnf_amount_override`` = cap-reduced F&F saving (PN-129)."""
 	item_code = cstr(item.get("item_code"))
 	existing = flt(item.get("discount_percentage") or 0)
 	qty = _line_qty(item)
 	price_list_rate = _line_price_list_rate(item)
 
-	def _result(applies, percentage, reason, replaced=False, amount=0.0, rate=None, competitor=None, decision=None):
+	def _result(
+		applies,
+		percentage,
+		reason,
+		replaced=False,
+		amount=0.0,
+		rate=None,
+		competitor=None,
+		decision=None,
+		uncapped=0.0,
+		capped=False,
+	):
 		if rate is None:
 			rate = price_list_rate * (1.0 - flt(percentage) / 100.0) if price_list_rate else flt(item.get("rate") or 0)
 		return FriendsAndFamilyLineResult(
@@ -377,6 +456,8 @@ def _evaluate_line(
 			competing_source=competitor.source if competitor else None,
 			competing_amount=competitor.amount if competitor else 0.0,
 			decision=decision.to_payload() if decision else None,
+			fnf_uncapped_amount=flt(uncapped),
+			capped=capped,
 		)
 
 	if _is_protected_line(item):
@@ -401,30 +482,88 @@ def _evaluate_line(
 		return _result(False, 0, reason, rate=flt(item.get("rate") or price_list_rate), competitor=competitor)
 
 	fnf_pct = flt(program.discount_percentage)
-	fnf_amount, fnf_rate = _materialize_amounts(price_list_rate, qty, fnf_pct)
-	fnf = bd.Candidate(source=bd.SOURCE_FRIENDS_AND_FAMILY, amount=fnf_amount, percentage=fnf_pct)
+	fnf_full, fnf_rate = _materialize_amounts(price_list_rate, qty, fnf_pct)
+	fnf_amount, fnf_line_pct = fnf_full, fnf_pct
+	capped = fnf_amount_override is not None and bd.money(fnf_amount_override) < bd.money(fnf_full)
+	if capped:
+		fnf_amount, fnf_rate, fnf_line_pct, _stored = _capped_line_values(
+			price_list_rate, qty, fnf_amount_override, amount_basis
+		)
+	fnf = (
+		bd.Candidate(source=bd.SOURCE_FRIENDS_AND_FAMILY, amount=fnf_amount, percentage=flt(fnf_line_pct, 2))
+		if bd.money(fnf_amount) > 0
+		else None
+	)
 	decision = bd.decide([fnf, competitor], idx=idx, item_code=item_code)
 
 	if not decision.fnf_wins:
+		would_have_won = competitor is None or bd.money(fnf_full) >= bd.money(competitor.amount)
 		return _result(
 			False,
 			0,
-			REASON_OTHER_BETTER,
+			REASON_CAP_REACHED if capped and would_have_won else REASON_OTHER_BETTER,
 			rate=flt(item.get("rate") or price_list_rate),
 			competitor=competitor,
-			decision=decision,
+			decision=decision if decision.candidates else None,
+			uncapped=fnf_full,
+			capped=capped,
 		)
 
 	return _result(
 		True,
-		fnf_pct,
+		fnf_line_pct,
 		REASON_APPLIED,
 		replaced=competitor is not None,
 		amount=fnf_amount,
 		rate=fnf_rate,
 		competitor=competitor,
 		decision=decision,
+		uncapped=fnf_full,
+		capped=capped,
 	)
+
+
+def _plan_lines(items, program, customer, posting_date, amount_basis, exclude_invoice=None) -> tuple:
+	"""Per-line decisions with PN-129 caps applied. Returns ``(results, cap context, uncapped total)``."""
+	results = [
+		_evaluate_line(item, program, idx=idx, amount_basis=amount_basis) for idx, item in enumerate(items)
+	]
+	ctx = get_cap_context(program, customer, posting_date, exclude=exclude_invoice)
+	uncapped_total = sum(r.discount_amount for r in results if r.applies)
+	allowance = ctx.allowance
+	if allowance is None or bd.money(uncapped_total) <= bd.money(allowance):
+		return results, ctx, uncapped_total
+
+	alloc = allocate(
+		[(r.idx, r.fnf_uncapped_amount, r.competing_amount) for r in results if r.fnf_uncapped_amount > 0],
+		allowance,
+	)
+	final = []
+	for item, res in zip(items, results, strict=False):
+		if res.fnf_uncapped_amount > 0:
+			res = _evaluate_line(
+				item,
+				program,
+				idx=res.idx,
+				amount_basis=amount_basis,
+				fnf_amount_override=alloc.get(res.idx, 0.0),
+			)
+		final.append(res)
+	return final, ctx, uncapped_total
+
+
+def _applied_total(results) -> float:
+	return sum(flt(r.discount_amount) for r in results if r.applies)
+
+
+def _attach_caps(payload, caps: dict) -> None:
+	payload["caps"] = caps
+	payload["best_discount"]["caps"] = caps
+	if caps.get("capped"):
+		payload["message"] = caps["message"]
+		payload["message_en"] = caps["message_en"]
+		payload["message_ar"] = caps["message_ar"]
+		payload["cap_hit"] = caps["cap_hit"]
 
 
 def _decision_from_payload(payload: dict | None, idx=None, item_code=None):
@@ -477,7 +616,11 @@ def _base_payload(eligibility, program) -> dict:
 
 
 def compute_friends_and_family_discounts(
-	customer=None, items=None, posting_date=None, amount_basis: str = bd.AMOUNT_BASIS_LINE
+	customer=None,
+	items=None,
+	posting_date=None,
+	amount_basis: str = bd.AMOUNT_BASIS_LINE,
+	exclude_invoice: str | None = None,
 ) -> dict:
 	"""Per-line F&F decision for ``customer`` + cart ``items`` on ``posting_date``.
 
@@ -508,24 +651,28 @@ def compute_friends_and_family_discounts(
 				).to_client_payload()
 			)
 		payload["best_discount"] = bd.summarize([])
+		_attach_caps(payload, build_cap_payload(CapContext(), 0, 0))
 		return payload
 
-	applied = 0
-	results = []
-	for idx, item in enumerate(items):
-		result = _evaluate_line(item, program, idx=idx, amount_basis=amount_basis)
-		if result.applies:
-			applied += 1
-		results.append(result)
-		payload["items"].append(result.to_client_payload())
+	results, ctx, uncapped_total = _plan_lines(
+		items, program, customer, posting_date, amount_basis, exclude_invoice
+	)
+	caps = build_cap_payload(ctx, uncapped_total, _applied_total(results))
+	applied = sum(1 for r in results if r.applies)
+	payload["items"] = [r.to_client_payload() for r in results]
 	payload["applied_count"] = applied
 	_attach_coverage_fields(payload, program, items, applied, eligibility)
 	payload["best_discount"] = bd.summarize(_line_decisions(results))
+	_attach_caps(payload, caps)
 	return payload
 
 
 def apply_friends_and_family_to_items(
-	items, customer=None, posting_date=None, amount_basis: str = bd.AMOUNT_BASIS_LINE
+	items,
+	customer=None,
+	posting_date=None,
+	amount_basis: str = bd.AMOUNT_BASIS_LINE,
+	exclude_invoice: str | None = None,
 ) -> dict:
 	"""Mutate ``items``: stamp F&F where it wins, strip stale F&F stamps otherwise.
 
@@ -544,12 +691,11 @@ def apply_friends_and_family_to_items(
 	payload = _base_payload(eligibility, program)
 	payload["suppressed_pricing_rules"] = []
 
-	applied = 0
-	results = []
 	suppressed_rules: set[str] = set()
-	for idx, item in enumerate(items):
-		if program is None:
-			was_fnf = cstr(item.get("discount_source")) == DISCOUNT_SOURCE_FRIENDS_AND_FAMILY
+	if program is None:
+		results = []
+		for idx, item in enumerate(items):
+			was_fnf = _is_fnf_stamped(item)
 			_clear_friends_and_family_stamp(item)
 			reason = (
 				REASON_STRIPPED
@@ -560,26 +706,37 @@ def apply_friends_and_family_to_items(
 					else REASON_INELIGIBLE
 				)
 			)
-			result = FriendsAndFamilyLineResult(
-				item_code=cstr(item.get("item_code")),
-				applies=False,
-				discount_percentage=0.0,
-				discount_amount=0.0,
-				rate=flt(item.get("rate") or item.get("price_list_rate") or 0),
-				reason=reason,
-				existing_discount_percentage=0.0,
-				idx=idx,
+			results.append(
+				FriendsAndFamilyLineResult(
+					item_code=cstr(item.get("item_code")),
+					applies=False,
+					discount_percentage=0.0,
+					discount_amount=0.0,
+					rate=flt(item.get("rate") or item.get("price_list_rate") or 0),
+					reason=reason,
+					existing_discount_percentage=0.0,
+					idx=idx,
+				)
 			)
-		else:
-			result = _evaluate_line(item, program, idx=idx, amount_basis=amount_basis)
+		caps = build_cap_payload(CapContext(), 0, 0)
+	else:
+		planned, ctx, uncapped_total = _plan_lines(
+			items, program, customer, posting_date, amount_basis, exclude_invoice
+		)
+		results = []
+		for item, result in zip(items, planned, strict=False):
 			if result.applies:
 				suppressed_rules.update(_drop_competing_tags(item, result.competing_source))
-				amount, rate = _stamp_friends_and_family(item, program.discount_percentage, amount_basis)
+				amount, rate = _stamp_friends_and_family(
+					item,
+					program.discount_percentage,
+					amount_basis,
+					line_amount=result.discount_amount if result.capped else None,
+				)
 				result = replace(result, discount_amount=amount, rate=rate)
-				applied += 1
 			else:
-				# Covered comparison lost, or out of scope / excluded: drop a stale
-				# F&F stamp but keep a competing better discount.
+				# Covered comparison lost (or cap exhausted), or out of scope /
+				# excluded: drop a stale F&F stamp but keep a competing discount.
 				_clear_friends_and_family_stamp(item)
 				result = replace(
 					result,
@@ -587,15 +744,19 @@ def apply_friends_and_family_to_items(
 					discount_amount=0.0,
 					rate=flt(item.get("rate") or item.get("price_list_rate") or 0),
 				)
+			results.append(result)
+		# Built after stamping: on saved rows the per-unit rate is rounded, so
+		# the applied total is what the invoice really gives.
+		caps = build_cap_payload(ctx, uncapped_total, _applied_total(results))
 
-		results.append(result)
-		payload["items"].append(result.to_client_payload())
-
+	applied = sum(1 for r in results if r.applies)
+	payload["items"] = [r.to_client_payload() for r in results]
 	payload["applied_count"] = applied
 	payload["suppressed_pricing_rules"] = sorted(suppressed_rules)
 	if program is not None:
 		_attach_coverage_fields(payload, program, items, applied, eligibility)
 	payload["best_discount"] = bd.summarize(_line_decisions(results))
+	_attach_caps(payload, caps)
 	return payload
 
 
@@ -609,6 +770,8 @@ _LINE_SNAPSHOT_FIELDS = (
 	"posnext_coupon_code",
 	"discount_source",
 	"is_already_discounted",
+	FIELD_DISCOUNT_SOURCE,
+	FIELD_FNF_AMOUNT,
 )
 
 
@@ -720,7 +883,7 @@ def _resolve_order_level(doc, items, snapshots, b_line_values, ff_payload, fnf_l
 	else:
 		fnf_like = fnf_like or [False] * len(items)
 		for item, snap, was_fnf in zip(items, snapshots, fnf_like, strict=False):
-			now_fnf = cstr(item.get("discount_source")) == DISCOUNT_SOURCE_FRIENDS_AND_FAMILY
+			now_fnf = _is_fnf_stamped(item)
 			_restore_line(item, snap)
 			if was_fnf or now_fnf:
 				# Our F&F stamp (new or carried in from the cart) — remove it,
@@ -730,6 +893,8 @@ def _resolve_order_level(doc, items, snapshots, b_line_values, ff_payload, fnf_l
 			doc.discount_amount = order_b.amount
 		ff_payload["applied_count"] = 0
 		ff_payload["reason"] = REASON_ORDER_DISCOUNT_BETTER
+		if ff_payload.get("caps"):
+			ff_payload["caps"]["fnf_applied_total"] = 0.0
 		for line in ff_payload.get("items") or []:
 			if line.get("applies"):
 				line.update(
@@ -750,6 +915,23 @@ def _invoice_state(doc, items) -> tuple:
 	)
 
 
+def _stamp_return_usage(items) -> None:
+	"""Credit-note rows give F&F allowance back: store the negative saving for the returned qty.
+
+	The row copies ``posnext_discount_source`` / rate / price list rate from
+	the original line, so the per-unit saving is ``price_list_rate - rate``.
+	"""
+	for row in items:
+		if cstr(row.get(FIELD_DISCOUNT_SOURCE)) != DISCOUNT_SOURCE_FRIENDS_AND_FAMILY:
+			if flt(row.get(FIELD_FNF_AMOUNT)):
+				_set_item_attr(row, FIELD_FNF_AMOUNT, 0)
+			continue
+		price_list_rate = flt(row.get("price_list_rate"))
+		rate = flt(row.get("rate"))
+		per_unit = price_list_rate - rate if price_list_rate > rate else flt(row.get("discount_amount"))
+		_set_item_attr(row, FIELD_FNF_AMOUNT, -bd.money(abs(flt(row.get("qty"))) * max(0.0, per_unit)))
+
+
 def apply_friends_and_family_on_invoice(doc, method=None):
 	"""Sales Invoice / POS Invoice ``validate`` — enforce Settings % and best-only.
 
@@ -764,12 +946,22 @@ def apply_friends_and_family_on_invoice(doc, method=None):
 	  3. Totals are recalculated when anything changed, so the saved invoice
 	     can never hold F&F stacked with another discount.
 
+	  4. PN-129 caps (per order / monthly per customer) are applied inside the
+	     per-line plan; each F&F row persists ``posnext_discount_source`` and
+	     ``posnext_fnf_discount_amount`` for the monthly usage ledger.
+
+	Returns / credit notes only get their (negative) F&F usage stamped.
+
 	Skips during install / migrate / patch.
 	"""
 	if frappe.flags.in_install or frappe.flags.in_migrate or frappe.flags.in_patch:
 		return
 	items = doc.get("items")
 	if not items:
+		return
+
+	if cint(doc.get("is_return")):
+		_stamp_return_usage(items)
 		return
 
 	# Only POS / point-of-sale invoices for now — the program is a POS benefit.
@@ -797,6 +989,7 @@ def apply_friends_and_family_on_invoice(doc, method=None):
 		customer=doc.get("customer"),
 		posting_date=posting_date,
 		amount_basis=bd.AMOUNT_BASIS_UNIT,
+		exclude_invoice=doc.get("name") or None,
 	)
 	order_decision = _resolve_order_level(doc, items, snapshots, b_line_values, ff_payload, fnf_like)
 	if order_decision:

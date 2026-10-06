@@ -102,6 +102,12 @@ def apply_friends_and_family_discount(
 	        with amounts, ``suppressed``, ``outcome``), ``fnf_total``,
 	        ``other_total`` and ``message`` / ``message_en`` / ``message_ar``.
 	        Best single discount only — never stacked; tie → Friends & Family.
+	        ``caps`` (PN-129): ``max_discount_per_order``,
+	        ``max_discount_per_customer_month``, ``monthly_used``,
+	        ``monthly_remaining``, ``allowance``, ``fnf_uncapped_total``,
+	        ``fnf_applied_total``, ``monthly_remaining_after``, ``capped``,
+	        ``cap_hit`` (``order`` / ``monthly``) and an EN + AR message. When
+	        a cap reduces F&F the top-level ``message`` shows the cap message.
 
 	POS contract (frontend follow-up in ``pos_next``):
 	  1. On customer change → ``check_friends_and_family_eligibility``.

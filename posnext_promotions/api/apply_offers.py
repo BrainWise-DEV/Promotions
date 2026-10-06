@@ -1098,6 +1098,9 @@ def _friends_and_family_response_block(ff_result) -> dict:
 		"reason": ff_result.get("reason"),
 		"user_message": ff_result.get("user_message"),
 		"items": ff_result.get("items"),
+		# PN-129: per-order / monthly caps — limits, usage, remaining, EN/AR message.
+		"caps": ff_result.get("caps"),
+		"cap_hit": ff_result.get("cap_hit"),
 	}
 
 
@@ -1253,6 +1256,8 @@ def _mark_fnf_lost_to_order(ff_result) -> None:
 	ff_result["applied_count"] = 0
 	ff_result["reason"] = REASON_ORDER_DISCOUNT_BETTER
 	ff_result["suppressed_pricing_rules"] = []
+	if ff_result.get("caps"):
+		ff_result["caps"]["fnf_applied_total"] = 0.0
 	for line in ff_result.get("items") or []:
 		if line.get("applies"):
 			line.update({"applies": False, "reason": REASON_ORDER_DISCOUNT_BETTER, "discount_percentage": 0.0})
@@ -1271,6 +1276,7 @@ def _reconcile_fnf_after_free_passes(ff_result, prepared_items, order_decision=N
 			ff_result["applied_count"] = max(0, cint(ff_result.get("applied_count")) - 1)
 
 	summary = summarize_line_payloads(ff_result.get("items") or [])
+	summary["caps"] = ff_result.get("caps")
 	if order_decision:
 		summary["order"] = order_decision
 		summary["granularity"] = bd.GRANULARITY_ORDER

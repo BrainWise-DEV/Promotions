@@ -84,6 +84,14 @@ POS_COUPON_EXTRA_FIELDS = [
 def after_migrate():
 	_ensure_pos_coupon_extras()
 	_ensure_friends_and_family_customer_flag()
+	_ensure_friends_and_family_invoice_fields()
+
+
+def _ensure_friends_and_family_invoice_fields():
+	"""PN-129: per-line F&F source + amount on Sales / POS Invoice Item (monthly cap ledger)."""
+	from posnext_promotions.promotions.friends_and_family_caps import ensure_invoice_item_fields
+
+	ensure_invoice_item_fields()
 
 
 def _ensure_friends_and_family_customer_flag():

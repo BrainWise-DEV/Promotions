@@ -14,6 +14,10 @@
   "start_date",
   "column_break_dates",
   "end_date",
+  "caps_section",
+  "max_discount_per_order",
+  "column_break_caps",
+  "max_discount_per_customer_month",
   "eligibility_section",
   "eligibility_basis",
   "column_break_eligibility",
@@ -77,6 +81,32 @@
    "fieldname": "end_date",
    "fieldtype": "Date",
    "label": "End Date"
+  },
+  {
+   "fieldname": "caps_section",
+   "fieldtype": "Section Break",
+   "label": "Discount Caps",
+   "description": "Limit program cost. Leave 0 for no cap. When a cap is hit the Friends & Family discount is reduced (spread proportionally over the covered items) or not applied, with a message to the cashier."
+  },
+  {
+   "fieldname": "max_discount_per_order",
+   "fieldtype": "Currency",
+   "label": "Max Discount per Order",
+   "non_negative": 1,
+   "default": "0",
+   "description": "Maximum total Friends & Family discount on one invoice. 0 = no cap."
+  },
+  {
+   "fieldname": "column_break_caps",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "max_discount_per_customer_month",
+   "fieldtype": "Currency",
+   "label": "Max Discount per Customer per Month",
+   "non_negative": 1,
+   "default": "0",
+   "description": "Maximum cumulative Friends & Family discount one customer can receive in a calendar month (submitted invoices, net of returns). 0 = no cap."
   },
   {
    "description": "Who gets Friends & Family. \"Customer Flag\" is the Friends & Family Member checkbox on the Customer form.",
@@ -203,7 +233,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-10-05 17:00:00.000000",
+ "modified": "2026-10-06 10:05:00.000000",
  "modified_by": "Administrator",
  "module": "POSNext Promotions",
  "name": "Friends and Family Settings",

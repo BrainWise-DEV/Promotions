@@ -4,7 +4,7 @@
 import frappe
 from frappe import _
 from frappe.model.document import Document
-from frappe.utils import cint, getdate
+from frappe.utils import cint, flt, getdate
 
 from posnext_promotions.promotions import friends_and_family
 from posnext_promotions.promotions import friends_and_family_eligibility as eligibility
@@ -17,6 +17,7 @@ class FriendsandFamilySettings(Document):
 		self._validate_scope_tables()
 		self._validate_exclusion_tables()
 		self._validate_eligibility()
+		self._validate_caps()
 
 	def on_update(self):
 		# get_cached_doc is cleared by Document.save; document for callers that
@@ -97,6 +98,18 @@ class FriendsandFamilySettings(Document):
 			and not self.eligible_customer_groups
 		):
 			frappe.throw(_("Add at least one Eligible Customer Group when eligibility is by Customer Group"))
+
+
+	def _validate_caps(self):
+		"""PN-129: caps are money amounts; 0 (or blank) means no cap."""
+		for fieldname, label in (
+			("max_discount_per_order", _("Max Discount per Order")),
+			("max_discount_per_customer_month", _("Max Discount per Customer per Month")),
+		):
+			value = flt(self.get(fieldname))
+			if value < 0:
+				frappe.throw(_("{0} cannot be negative").format(label))
+			self.set(fieldname, value)
 
 
 def get_friends_and_family_settings():

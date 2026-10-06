@@ -16,6 +16,9 @@ the single best discount:
   is a cart total, so it is compared **as a whole**: coupon total vs the best
   non-coupon saving on the same lines. All-or-nothing.
 
+The F&F side is the saving the customer would really get, **after** the
+PN-129 caps (per order / monthly), so a cap-reduced F&F can lose to a coupon.
+
 Lines currently stamped F&F are offered to the coupon engine as undiscounted
 (otherwise the coupon would never see them — F&F lines count as "already
 discounted"), so a stronger coupon can replace F&F.
@@ -32,11 +35,9 @@ from frappe import _
 from frappe.utils import cstr, flt
 
 from posnext_promotions.promotions import best_discount as bd
-from posnext_promotions.promotions.friends_and_family import COVER_OK
 from posnext_promotions.promotions.friends_and_family_apply import (
-	DISCOUNT_SOURCE_FRIENDS_AND_FAMILY,
-	_is_discountable,
-	_is_protected_line,
+	_is_fnf_stamped,
+	compute_friends_and_family_discounts,
 	enrich_items_with_catalog,
 )
 from posnext_promotions.promotions.friends_and_family_eligibility import get_customer_eligibility
@@ -47,7 +48,7 @@ REASON_BETTER_DISCOUNT_EXISTS = "better_discount_exists"
 def _neutral_copy(item):
 	"""Line as the coupon engine should see it: an F&F stamp is not a blocker."""
 	line = frappe._dict(dict(item))
-	if cstr(line.get("discount_source")) == DISCOUNT_SOURCE_FRIENDS_AND_FAMILY:
+	if _is_fnf_stamped(line):
 		line.discount_source = None
 		line.discount_percentage = 0
 		line.discount_amount = 0
@@ -59,15 +60,24 @@ def _neutral_copy(item):
 	return line
 
 
-def _fnf_candidate(item, program) -> bd.Candidate | None:
-	if program is None or _is_protected_line(item) or not _is_discountable(item):
-		return None
-	if program.covers_reason(item) != COVER_OK:
-		return None
-	pct = flt(program.discount_percentage)
-	return bd.Candidate(
-		source=bd.SOURCE_FRIENDS_AND_FAMILY, amount=bd.line_gross(item) * pct / 100.0, percentage=pct
+def _capped_fnf_candidates(items, customer, posting_date) -> dict:
+	"""F&F the customer would get per line *without* the coupon — caps (PN-129) included.
+
+	The coupon then competes with that (possibly cap-reduced) F&F saving.
+	"""
+	plan = compute_friends_and_family_discounts(
+		customer=customer, items=[_neutral_copy(i) for i in items], posting_date=posting_date
 	)
+	candidates = {}
+	for line in plan.get("items") or []:
+		if not line.get("applies"):
+			continue
+		candidates[line.get("idx")] = bd.Candidate(
+			source=bd.SOURCE_FRIENDS_AND_FAMILY,
+			amount=flt(line.get("discount_amount")),
+			percentage=flt(line.get("discount_percentage"), 2) or None,
+		)
+	return candidates
 
 
 def _existing_candidate(item, coupon_code: str) -> bd.Candidate | None:
@@ -114,6 +124,7 @@ def resolve_coupon_best_discount(coupon, items, customer=None, posting_date=None
 		result["best_discount"] = bd.summarize([])
 		return result
 
+	fnf_by_line = _capped_fnf_candidates(items, customer, posting_date) if program is not None else {}
 	updates = list(result.get("line_updates") or [])
 	pct = flt(coupon.get("discount_percentage")) if cstr(coupon.get("discount_type")) == "Percentage" else None
 	rows = []
@@ -129,7 +140,7 @@ def resolve_coupon_best_discount(coupon, items, customer=None, posting_date=None
 				bd.Candidate(
 					source=bd.SOURCE_COUPON, amount=_coupon_line_amount(update, item), percentage=pct, code=code
 				),
-				_fnf_candidate(item, program),
+				fnf_by_line.get(idx),
 				_existing_candidate(item, code),
 			)
 		)
