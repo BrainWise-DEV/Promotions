@@ -8,8 +8,13 @@ from __future__ import annotations
 import frappe
 
 # Module Def names this app owns. They may already exist on a site that ran
-# staging pos_next (auth gate lived there before the split).
-OWNED_MODULE_DEFS = ("POSNext Promotions", "POS Next Auth Gate")
+# staging pos_next (promotions lived there before the split).
+#
+# "POS Next Auth Gate" is deliberately absent: the authorization gate belongs to
+# pos_next (its modules.txt, DocTypes and rehome patch). Deleting that Module Def
+# here left sites without it when pos_next's migrate ran before this install
+# (the Frappe Cloud order: update site, then install from the dashboard).
+OWNED_MODULE_DEFS = ("POSNext Promotions",)
 
 
 def before_install():

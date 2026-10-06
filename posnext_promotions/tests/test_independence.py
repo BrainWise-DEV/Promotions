@@ -14,6 +14,15 @@ BENCH_APPS = APP_ROOT.parent
 POS_NEXT = BENCH_APPS / "pos_next"
 
 
+def _owned_module_defs():
+	"""OWNED_MODULE_DEFS from install.py, read without importing frappe."""
+	tree = ast.parse((PKG / "install.py").read_text())
+	for node in tree.body:
+		if isinstance(node, ast.Assign) and any(getattr(t, "id", None) == "OWNED_MODULE_DEFS" for t in node.targets):
+			return tuple(ast.literal_eval(node.value))
+	raise AssertionError("OWNED_MODULE_DEFS not found in install.py")
+
+
 def _python_files(root: Path):
 	for path in root.rglob("*.py"):
 		if "__pycache__" in path.parts or "scripts" in path.parts:
@@ -108,10 +117,18 @@ class TestIndependence(unittest.TestCase):
 		hooks = (PKG / "hooks.py").read_text()
 		self.assertNotIn("authorization.gate", hooks)
 
+		owned = _owned_module_defs()
+		self.assertNotIn("POS Next Auth Gate", owned)
+
 		customization = json.loads((PKG / "posnext_promotions" / "custom" / "sales_invoice.json").read_text())
 		fieldnames = {f["fieldname"] for f in customization["custom_fields"]}
 		self.assertNotIn("custom_authorized_by", fieldnames)
 		self.assertNotIn("custom_authorized_at", fieldnames)
+
+	def test_before_install_only_reclaims_own_modules(self):
+		"""before_install may only delete Module Defs listed in this app's modules.txt."""
+		modules = {m.strip() for m in (PKG / "modules.txt").read_text().splitlines() if m.strip()}
+		self.assertTrue(set(_owned_module_defs()) <= modules, _owned_module_defs())
 
 	def test_form_js_is_safe_to_concatenate_with_pos_next(self):
 		"""Frappe concatenates every app's doctype_js into one Function.
