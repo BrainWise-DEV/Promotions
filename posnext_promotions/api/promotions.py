@@ -682,6 +682,71 @@ def search_items(search_term, pos_profile=None, limit=20):
 
 # ==================== COUPON MANAGEMENT ====================
 
+# Request key -> (scope table fieldname, child column, legacy single-value key)
+_COUPON_SCOPE_INPUTS = (
+	("applicable_items", "item_code", None),
+	("applicable_item_groups", "item_group", "applicable_item_group"),
+	("applicable_brands", "brand", "applicable_brand"),
+)
+
+
+def _scope_values(raw, column):
+	values = []
+	for entry in raw or []:
+		value = entry.get(column) if isinstance(entry, dict) else entry
+		if value and value not in values:
+			values.append(value)
+	return values
+
+
+def _apply_coupon_scope(coupon, data, *, partial):
+	"""Write scope tables from request data. With partial=True only keys present in data are touched."""
+	if "apply_scope" in data or not partial:
+		coupon.apply_scope = data.get("apply_scope") or "All Eligible Items"
+
+	for fieldname, column, legacy_key in _COUPON_SCOPE_INPUTS:
+		if not coupon.meta.has_field(fieldname):
+			continue
+		if fieldname in data:
+			values = _scope_values(data.get(fieldname), column)
+		elif legacy_key and data.get(legacy_key):
+			values = [data[legacy_key]]
+		elif partial:
+			continue
+		else:
+			values = []
+		coupon.set(fieldname, [{column: value} for value in values])
+
+
+def _coupon_scope_summary(coupons):
+	"""Map coupon name -> scope values of its active apply_scope, for the list view."""
+	from posnext_promotions.api.coupon_engine import SCOPE_TABLES
+
+	summary = {coupon.name: [] for coupon in coupons}
+	meta = frappe.get_meta("POS Coupon")
+	for apply_scope, (fieldname, column, legacy_field) in SCOPE_TABLES.items():
+		scoped = [coupon for coupon in coupons if coupon.get("apply_scope") == apply_scope]
+		if not scoped:
+			continue
+		child_doctype = meta.get_options(fieldname)
+		if child_doctype and frappe.db.exists("DocType", child_doctype):
+			rows = frappe.get_all(
+				child_doctype,
+				filters={
+					"parenttype": "POS Coupon",
+					"parent": ["in", [coupon.name for coupon in scoped]],
+					"parentfield": fieldname,
+				},
+				fields=["parent", column],
+				order_by="idx asc",
+			)
+			for row in rows:
+				summary[row.parent].append(row.get(column))
+		for coupon in scoped:
+			if not summary[coupon.name] and legacy_field and coupon.get(legacy_field):
+				summary[coupon.name].append(coupon.get(legacy_field))
+	return summary
+
 
 @frappe.whitelist()
 def get_coupons(company=None, include_disabled=False, coupon_type=None):
@@ -737,11 +802,14 @@ def get_coupons(company=None, include_disabled=False, coupon_type=None):
 			fields.append(fieldname)
 
 	coupons = frappe.get_all("POS Coupon", filters=filters, fields=fields, order_by="modified desc")
+	scope_summary = _coupon_scope_summary(coupons)
 
 	# Enrich with status
 	today = getdate(nowdate())
 
 	for coupon in coupons:
+		coupon["scope_values"] = scope_summary.get(coupon.name) or []
+
 		# Set disabled to 0 if field doesn't exist
 		if not has_disabled_field:
 			coupon["disabled"] = 0
@@ -803,7 +871,11 @@ def create_coupon(data):
 		"valid_upto": "2025-12-31",
 		"maximum_use": 100,  # Optional
 		"one_use": 0,  # 0 or 1
-		"campaign": "Campaign Name"  # Optional
+		"campaign": "Campaign Name",  # Optional
+		"apply_scope": "Item Code",  # All Eligible Items, Item Code, Item Group or Brand
+		"applicable_items": ["ITEM-001"],  # Used when apply_scope is Item Code
+		"applicable_item_groups": ["Shoes"],  # Used when apply_scope is Item Group
+		"applicable_brands": ["Nike"]  # Used when apply_scope is Brand
 	}
 	"""
 	check_promotion_permissions("write")
@@ -857,9 +929,6 @@ def create_coupon(data):
 				"min_amount": flt(data.get("min_amount")) if data.get("min_amount") else None,
 				"max_amount": flt(data.get("max_amount")) if data.get("max_amount") else None,
 				"apply_on": data.get("apply_on", "Grand Total"),
-				"apply_scope": data.get("apply_scope") or "All Eligible Items",
-				"applicable_brand": data.get("applicable_brand"),
-				"applicable_item_group": data.get("applicable_item_group"),
 				"company": data.get("company"),
 				"customer": data.get("customer"),
 				"valid_from": data.get("valid_from"),
@@ -873,6 +942,7 @@ def create_coupon(data):
 				"campaign": data.get("campaign"),
 			}
 		)
+		_apply_coupon_scope(coupon, data, partial=False)
 
 		for brand in data.get("excluded_brands") or []:
 			brand_name = brand.get("brand") if isinstance(brand, dict) else brand
@@ -928,12 +998,7 @@ def update_coupon(coupon_name, data):
 			coupon.max_amount = flt(data["max_amount"]) if data["max_amount"] else None
 		if "apply_on" in data:
 			coupon.apply_on = data["apply_on"]
-		if "apply_scope" in data:
-			coupon.apply_scope = data["apply_scope"] or "All Eligible Items"
-		if "applicable_brand" in data:
-			coupon.applicable_brand = data["applicable_brand"]
-		if "applicable_item_group" in data:
-			coupon.applicable_item_group = data["applicable_item_group"]
+		_apply_coupon_scope(coupon, data, partial=True)
 		if "excluded_brands" in data:
 			coupon.set("excluded_brands", [])
 			for brand in data.get("excluded_brands") or []:
