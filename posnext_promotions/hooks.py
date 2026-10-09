@@ -66,6 +66,7 @@ doc_events = {
 	"Sales Invoice": {
 		"validate": [
 			"posnext_promotions.overrides.sales_invoice_free_bundle.combine_packed_qty_for_free_product_bundles",
+			"posnext_promotions.overrides.scoped_coupon.validate_scoped_coupon_lines",
 			"posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts",
 		],
 		"on_submit": "posnext_promotions.api.one_time_usage.record_one_time_offer_usage",
@@ -81,4 +82,3 @@ doc_events = {
 # are installed. Keep the task module for sites that call it explicitly.
 
 before_install = "posnext_promotions.install.before_install"
-after_migrate = "posnext_promotions.install.after_migrate"
