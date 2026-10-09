@@ -101,9 +101,17 @@ def _get_customer_coupon_usage_count(customer, coupon_code):
 
 def get_coupon_eligible_items(coupon, items):
 	"""
-	Return cart items that pass exclusion rules and scope checks.
+	Return cart items that pass the Promotion Interaction Matrix for coupons.
 
-	Uses the Promotion Interaction Matrix for discount/coupon eligibility.
+	Coupon is blocked only when the line has:
+	1. Auto Discount
+	2. Item Level Discount (including Accumulative)
+	3. Manual cashier discount
+	4. Excluded brands from coupon config
+
+	Other promotional types (GWP, Gift Pool, etc.) remain coupon-eligible.
+	``exclude_already_discounted_items`` on the coupon is ignored — matrix rules
+	are mandatory for coupons.
 	"""
 	if not items:
 		return []
@@ -116,15 +124,13 @@ def get_coupon_eligible_items(coupon, items):
 		_parse_pricing_rules,
 	)
 
-	exclude_discounted = cint(getattr(coupon, "exclude_already_discounted_items", 1))
 	prepared_items = [frappe._dict(row) for row in items]
 	all_rule_names: list[str] = []
 	for item in prepared_items:
 		all_rule_names.extend(_parse_pricing_rules(item.get("pricing_rules")))
 	type_map = get_rule_promotion_types(list(set(all_rule_names)))
 
-	if exclude_discounted:
-		mark_item_discount_flags(prepared_items, type_map)
+	mark_item_discount_flags(prepared_items, type_map)
 
 	excluded_brands = _get_excluded_brands(coupon)
 	eligible = []
@@ -138,7 +144,7 @@ def get_coupon_eligible_items(coupon, items):
 			PROMOTION_TARGET_COUPON,
 			rule_type_map=type_map,
 			excluded_brands=excluded_brands,
-			exclude_discounted=exclude_discounted,
+			exclude_discounted=True,
 		):
 			# Allow re-evaluating lines already tagged with this same coupon
 			existing_coupon = (item.get("coupon_code") or "").upper()
@@ -216,16 +222,16 @@ def _coupon_rejection_message(coupon, items) -> str:
 		if brand and brand in excluded_brands:
 			reasons.append(_("Item {0} is excluded (brand {1})").format(code, brand))
 			continue
-		if cint(getattr(coupon, "exclude_already_discounted_items", 1)) and is_coupon_broad_discounted(
-			item
-		):
-			reasons.append(_("Item {0} is already discounted").format(code))
+		if is_coupon_broad_discounted(item):
+			reasons.append(
+				_("Item {0} already has Auto Discount or Item Level Discount").format(code)
+			)
 			continue
 		state = classify_item_state(
 			item,
 			excluded_brands=excluded_brands,
 			target=PROMOTION_TARGET_COUPON,
-			exclude_discounted=cint(getattr(coupon, "exclude_already_discounted_items", 1)),
+			exclude_discounted=True,
 		)
 		if state == "excluded_brand":
 			reasons.append(_("Item {0} is excluded (brand {1})").format(code, brand or ""))
@@ -237,7 +243,11 @@ def _coupon_rejection_message(coupon, items) -> str:
 
 def apply_coupon_to_items(coupon, items):
 	"""
-	Calculate per-line coupon discounts for eligible items.
+	Calculate per-line coupon discounts for matrix-eligible items only.
+
+	Lines with Auto Discount, Item Level Discount, or manual discount never
+	reach this path (see get_coupon_eligible_items). Other promotional types
+	remain eligible.
 
 	Returns dict with valid, message, eligible_item_codes, line_updates, total_discount.
 	"""
@@ -269,30 +279,30 @@ def apply_coupon_to_items(coupon, items):
 
 	if coupon.discount_type == "Percentage":
 		pct = flt(coupon.discount_percentage)
+		coupon_frac = pct / 100.0
 		for item in eligible:
 			base = flt(item["_base_amount"])
-			line_discount = flt(base) * pct / 100.0
-			total_discount += line_discount
+			coupon_discount = base * coupon_frac
+			total_discount += coupon_discount
 			qty = flt(item.get("qty") or item.get("quantity") or 0) or 1
 			price_list_rate = flt(item.get("price_list_rate") or 0)
 			if price_list_rate <= 0:
 				price_list_rate = flt(item.get("rate") or 0) or (base / qty)
-			new_rate = price_list_rate * (1 - pct / 100.0)
+			new_rate = price_list_rate * (1.0 - coupon_frac)
 			line_updates.append(
 				{
 					"line_key": item["_line_key"],
 					"item_code": item.get("item_code"),
-					"discount_percentage": pct,
+					"discount_percentage": flt(pct, 6),
 					"discount_amount": 0,
 					"rate": flt(new_rate, 6),
 					"amount": flt(new_rate * qty, 6),
 					"coupon_code": coupon.coupon_code,
+					"coupon_only_discount": flt(coupon_discount, 6),
+					"pre_coupon_discount_fraction": 0,
 				}
 			)
 
-		# When max_amount is configured, always materialize as absolute amounts.
-		# Otherwise local qty changes recalculate % and can exceed the cap before
-		# the next server revalidation.
 		if coupon.max_amount:
 			cap = flt(coupon.max_amount)
 			scale = 1.0
@@ -300,54 +310,55 @@ def apply_coupon_to_items(coupon, items):
 				scale = cap / total_discount
 				total_discount = cap
 			for update in line_updates:
-				base_amount = next(
-					(flt(i["_base_amount"]) for i in eligible if i["_line_key"] == update["line_key"]),
-					0,
-				)
-				line_discount = flt(base_amount) * pct / 100.0 * scale
-				for item in eligible:
-					if item["_line_key"] == update["line_key"]:
-						qty = flt(item.get("qty") or item.get("quantity") or 0) or 1
-						new_amount = max(base_amount - line_discount, 0)
-						update["discount_percentage"] = 0
-						update["discount_amount"] = flt(line_discount, 6)
-						update["rate"] = flt(new_amount / qty, 6) if qty else 0
-						update["amount"] = flt(new_amount, 6)
-						break
+				item = next((i for i in eligible if i["_line_key"] == update["line_key"]), None)
+				if not item:
+					continue
+				base_amount = flt(item["_base_amount"])
+				coupon_only = flt(update.get("coupon_only_discount") or 0) * scale
+				qty = flt(item.get("qty") or item.get("quantity") or 0) or 1
+				new_amount = max(base_amount - coupon_only, 0)
+				update["discount_percentage"] = 0
+				update["discount_amount"] = flt(coupon_only, 6)
+				update["rate"] = flt(new_amount / qty, 6) if qty else 0
+				update["amount"] = flt(new_amount, 6)
+				update["coupon_only_discount"] = flt(coupon_only, 6)
 	else:
-		# Fixed amount distributed across eligible lines by share of subtotal
+		# Fixed amount distributed across eligible lines by list-price share.
+		bases = [flt(item["_base_amount"]) for item in eligible]
+		bases_subtotal = sum(bases)
+
 		total_discount = flt(coupon.discount_amount)
 		if coupon.max_amount and total_discount > flt(coupon.max_amount):
 			total_discount = flt(coupon.max_amount)
-		if total_discount > eligible_subtotal:
-			total_discount = eligible_subtotal
+		if bases_subtotal and total_discount > bases_subtotal:
+			total_discount = bases_subtotal
+		elif not bases_subtotal:
+			total_discount = 0
 
 		allocated = 0.0
 		for index, item in enumerate(eligible):
-			base = flt(item["_base_amount"])
+			base = bases[index]
 			if index == len(eligible) - 1:
-				line_discount = flt(total_discount - allocated, 6)
+				coupon_only = flt(total_discount - allocated, 6)
 			else:
-				share = base / eligible_subtotal if eligible_subtotal else 0
-				line_discount = flt(total_discount * share, 6)
-				allocated += line_discount
+				share = base / bases_subtotal if bases_subtotal else 0
+				coupon_only = flt(total_discount * share, 6)
+				allocated += coupon_only
 
 			qty = flt(item.get("qty") or item.get("quantity") or 0) or 1
-			price_list_rate = flt(item.get("price_list_rate") or 0)
-			if price_list_rate <= 0:
-				price_list_rate = flt(item.get("rate") or 0) or (base / qty)
-			# Convert line discount amount into effective rate
-			new_amount = max(base - line_discount, 0)
+			new_amount = max(base - coupon_only, 0)
 			new_rate = new_amount / qty if qty else 0
 			line_updates.append(
 				{
 					"line_key": item["_line_key"],
 					"item_code": item.get("item_code"),
 					"discount_percentage": 0,
-					"discount_amount": flt(line_discount, 6),
+					"discount_amount": flt(coupon_only, 6),
 					"rate": flt(new_rate, 6),
 					"amount": flt(new_amount, 6),
 					"coupon_code": coupon.coupon_code,
+					"coupon_only_discount": flt(coupon_only, 6),
+					"pre_coupon_discount_fraction": 0,
 				}
 			)
 
@@ -375,9 +386,9 @@ def apply_coupon_discount(coupon, cart_total, net_total=None, items=None, tax_am
 	if prepared_items:
 		mark_item_discount_flags(prepared_items)
 
-	exclude_discounted = cint(getattr(coupon, "exclude_already_discounted_items", 1))
-
-	if prepared_items and exclude_discounted:
+	# Matrix always applies for coupons — never fall back to full cart total
+	# when exclude_already_discounted_items is unchecked.
+	if prepared_items:
 		subtotal_kwargs = {
 			"exclude_discounted": True,
 			"promotion_target": PROMOTION_TARGET_COUPON,
