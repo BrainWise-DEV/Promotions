@@ -189,6 +189,22 @@ class TestPOSCoupon(unittest.TestCase):
 		self.assertEqual(codes(by_brand), ["B", "C"])
 		self.assertEqual(codes(empty), [])
 
+	def test_item_group_scope_includes_child_groups(self):
+		bounds = {"All Item Groups": [1, 10], "Shoes": [2, 3], "Caps": [4, 5]}
+		lft = {k: v[0] for k, v in bounds.items()}
+
+		def get_value(doctype, name, field):
+			return bounds.get(name) if isinstance(field, list) else lft.get(name)
+
+		db = Mock()
+		db.get_value.side_effect = get_value
+		root = _coupon(apply_scope="Item Group", applicable_item_groups=[{"item_group": "All Item Groups"}])
+		shoes = _coupon(apply_scope="Item Group", applicable_item_groups=[{"item_group": "Shoes"}])
+		item = {"item_code": "A", "item_group": "Caps", "qty": 1, "price_list_rate": 10, "rate": 10}
+		with patch("posnext_promotions.api.coupon_engine.frappe.db", new=db):
+			self.assertEqual(len(get_coupon_eligible_items(root, [item])), 1)
+			self.assertEqual(len(get_coupon_eligible_items(shoes, [item])), 0)
+
 	def test_scope_brand_and_item_group(self):
 		brand_coupon = _coupon(apply_scope="Brand", applicable_brand="Nike")
 		group_coupon = _coupon(apply_scope="Item Group", applicable_item_group="Shoes")

@@ -197,8 +197,31 @@ def _item_matches_scope(coupon, item):
 		groups = _get_scope_values(coupon, "applicable_item_groups", "item_group")
 		if getattr(coupon, "applicable_item_group", None):
 			groups.add(coupon.applicable_item_group)
-		return bool(item.get("item_group")) and item.get("item_group") in groups
+		return _item_group_in(item.get("item_group"), groups)
 	return True
+
+
+def _item_group_in(item_group, groups):
+	"""True when ``item_group`` is one of ``groups`` or sits below one in the Item Group tree.
+
+	Item Group is a nested-set tree, so a coupon on "All Item Groups" (the root) or on a
+	parent group covers every item filed under its child groups.
+	"""
+	if not item_group or not groups:
+		return False
+	if item_group in groups:
+		return True
+	try:
+		item_lft = frappe.db.get_value("Item Group", item_group, "lft")
+		if item_lft is None:
+			return False
+		for group in groups:
+			bounds = frappe.db.get_value("Item Group", group, ["lft", "rgt"])
+			if bounds and bounds[0] <= item_lft < bounds[1]:
+				return True
+	except Exception:
+		return False
+	return False
 
 
 def _item_line_key(item, index):
