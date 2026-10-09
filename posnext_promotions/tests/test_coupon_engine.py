@@ -87,6 +87,7 @@ class TestPOSCoupon(unittest.TestCase):
 		self.assertEqual(_get_per_customer_use_limit(_coupon(one_use=0, maximum_use_per_customer=0)), 0)
 
 	def test_eligible_items_exclude_discounted_free_and_excluded_brand(self):
+		"""Exclude manual discounts, free items, excluded brands — not other promo types."""
 		coupon = _coupon(
 			excluded_brands=[{"brand": "BrandX"}],
 		)
@@ -133,11 +134,22 @@ class TestPOSCoupon(unittest.TestCase):
 				"price_list_rate": 100,
 				"rate": 100,
 				"pricing_rules": ["PR-1"],
+				"discount_source": "gwp",
+			},
+			{
+				"item_code": "F",
+				"brand": "BrandA",
+				"item_group": "Group1",
+				"qty": 1,
+				"price_list_rate": 100,
+				"rate": 90,
+				"discount_percentage": 10,
+				"discount_source": "auto_discount",
 			},
 		]
 
 		eligible = get_coupon_eligible_items(coupon, items)
-		self.assertEqual([i["item_code"] for i in eligible], ["A"])
+		self.assertEqual([i["item_code"] for i in eligible], ["A", "E"])
 
 	def test_matrix_coupon_excludes_excluded_brand(self):
 		"""Excluded brand × Coupon = excluded per Promotion Interaction Matrix."""
@@ -377,6 +389,122 @@ class TestPOSCoupon(unittest.TestCase):
 		result = apply_coupon_to_items(coupon, items)
 		self.assertFalse(result["valid"])
 		self.assertIn("Minimum eligible amount", result["message"])
+
+	def test_matrix_excludes_already_discounted_even_when_flag_off(self):
+		"""Manual / item-level discount blocks coupon even when exclude flag is off."""
+		coupon = _coupon(
+			discount_percentage=10,
+			exclude_already_discounted_items=0,
+		)
+		items = [
+			{
+				"item_code": "A",
+				"brand": "B1",
+				"item_group": "G1",
+				"qty": 1,
+				"price_list_rate": 100,
+				"rate": 80,
+				"discount_percentage": 20,
+			}
+		]
+		result = apply_coupon_to_items(coupon, items)
+		self.assertFalse(result["valid"])
+		self.assertEqual(result["line_updates"], [])
+		self.assertIn("auto discount or item level", result["message"].lower())
+
+	def test_matrix_allows_coupon_on_non_auto_item_level_promo(self):
+		"""GWP / other promo types stamped with pricing_rules stay coupon-eligible."""
+		coupon = _coupon(discount_percentage=20, exclude_already_discounted_items=0)
+		items = [
+			{
+				"item_code": "SLA-PAID",
+				"brand": "SLA",
+				"item_group": "G1",
+				"qty": 1,
+				"price_list_rate": 16000,
+				"rate": 16000,
+				"pricing_rules": "PRLE-0215",
+				"discount_source": "gwp",
+				"is_already_discounted": 1,
+			},
+			{
+				"item_code": "SLA-FREE",
+				"brand": "SLA",
+				"item_group": "G1",
+				"qty": 1,
+				"price_list_rate": 0,
+				"rate": 0,
+				"is_free_item": 1,
+				"pricing_rules": "PRLE-0215",
+			},
+		]
+		result = apply_coupon_to_items(coupon, items)
+		self.assertTrue(result["valid"])
+		self.assertEqual(len(result["line_updates"]), 1)
+		self.assertEqual(result["line_updates"][0]["item_code"], "SLA-PAID")
+		self.assertAlmostEqual(result["total_discount"], 3200.0, places=4)
+		eligible_codes = [i["item_code"] for i in get_coupon_eligible_items(coupon, items)]
+		self.assertEqual(eligible_codes, ["SLA-PAID"])
+
+	def test_matrix_excludes_auto_discount_line(self):
+		"""Auto Discount lines never receive a coupon."""
+		coupon = _coupon(discount_percentage=10, exclude_already_discounted_items=0)
+		items = [
+			{
+				"item_code": "A",
+				"brand": "B1",
+				"item_group": "G1",
+				"qty": 1,
+				"price_list_rate": 100,
+				"rate": 90,
+				"discount_percentage": 10,
+				"discount_source": "auto_discount",
+				"is_already_discounted": 0,
+			}
+		]
+		result = apply_coupon_to_items(coupon, items)
+		self.assertFalse(result["valid"])
+		self.assertEqual(get_coupon_eligible_items(coupon, items), [])
+
+	def test_matrix_excludes_item_level_discount_line(self):
+		"""Item Level Discount lines never receive a coupon."""
+		coupon = _coupon(discount_percentage=10, exclude_already_discounted_items=0)
+		items = [
+			{
+				"item_code": "A",
+				"brand": "B1",
+				"item_group": "G1",
+				"qty": 1,
+				"price_list_rate": 100,
+				"rate": 80,
+				"discount_percentage": 20,
+				"discount_source": "item_level_promotion",
+				"is_already_discounted": 1,
+			}
+		]
+		result = apply_coupon_to_items(coupon, items)
+		self.assertFalse(result["valid"])
+		self.assertEqual(get_coupon_eligible_items(coupon, items), [])
+
+	def test_percentage_on_normal_eligible_item(self):
+		"""Matrix: normal eligible item receives coupon % on list price."""
+		coupon = _coupon(discount_percentage=10, exclude_already_discounted_items=0)
+		items = [
+			{
+				"item_code": "A",
+				"brand": "B1",
+				"item_group": "G1",
+				"qty": 1,
+				"price_list_rate": 100,
+				"rate": 100,
+			}
+		]
+		result = apply_coupon_to_items(coupon, items)
+		self.assertTrue(result["valid"])
+		self.assertAlmostEqual(result["total_discount"], 10.0, places=4)
+		self.assertAlmostEqual(result["line_updates"][0]["discount_percentage"], 10.0, places=4)
+		self.assertAlmostEqual(result["line_updates"][0]["rate"], 90.0, places=4)
+		self.assertEqual(result["line_updates"][0]["pre_coupon_discount_fraction"], 0)
 
 
 if __name__ == "__main__":
