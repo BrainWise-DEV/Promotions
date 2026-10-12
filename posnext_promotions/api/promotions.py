@@ -944,6 +944,11 @@ def create_coupon(data):
 		)
 		_apply_coupon_scope(coupon, data, partial=False)
 
+		for brand in data.get("excluded_brands") or []:
+			brand_name = brand.get("brand") if isinstance(brand, dict) else brand
+			if brand_name:
+				coupon.append("excluded_brands", {"brand": brand_name})
+
 		coupon.insert()
 
 		return {
