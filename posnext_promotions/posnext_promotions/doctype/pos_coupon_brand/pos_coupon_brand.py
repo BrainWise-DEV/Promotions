@@ -4,5 +4,5 @@
 from frappe.model.document import Document
 
 
-class POSCouponApplicableItem(Document):
+class POSCouponBrand(Document):
 	pass

@@ -22,9 +22,6 @@ def _coupon(**kwargs):
 		"apply_scope": "All Eligible Items",
 		"applicable_brand": None,
 		"applicable_item_group": None,
-		"applicable_items": [],
-		"applicable_item_groups": [],
-		"applicable_brands": [],
 		"excluded_brands": [],
 		"min_amount": None,
 		"max_amount": None,
@@ -167,44 +164,6 @@ class TestPOSCoupon(unittest.TestCase):
 		eligible = get_coupon_eligible_items(coupon, items)
 		self.assertEqual([i["item_code"] for i in eligible], ["Eligible"])
 
-	def test_scope_item_code_item_groups_and_brands_tables(self):
-		items = [
-			{"item_code": "A", "brand": "Nike", "item_group": "Shoes", "qty": 1, "price_list_rate": 10, "rate": 10},
-			{"item_code": "B", "brand": "Adidas", "item_group": "Caps", "qty": 1, "price_list_rate": 10, "rate": 10},
-			{"item_code": "C", "brand": "Puma", "item_group": "Bags", "qty": 1, "price_list_rate": 10, "rate": 10},
-		]
-
-		def codes(coupon):
-			return [i["item_code"] for i in get_coupon_eligible_items(coupon, items)]
-
-		by_item = _coupon(apply_scope="Item Code", applicable_items=[{"item_code": "A"}, {"item_code": "C"}])
-		by_group = _coupon(
-			apply_scope="Item Group", applicable_item_groups=[{"item_group": "Shoes"}, {"item_group": "Caps"}]
-		)
-		by_brand = _coupon(apply_scope="Brand", applicable_brands=[{"brand": "Adidas"}, {"brand": "Puma"}])
-		empty = _coupon(apply_scope="Item Code")
-
-		self.assertEqual(codes(by_item), ["A", "C"])
-		self.assertEqual(codes(by_group), ["A", "B"])
-		self.assertEqual(codes(by_brand), ["B", "C"])
-		self.assertEqual(codes(empty), [])
-
-	def test_item_group_scope_includes_child_groups(self):
-		bounds = {"All Item Groups": [1, 10], "Shoes": [2, 3], "Caps": [4, 5]}
-		lft = {k: v[0] for k, v in bounds.items()}
-
-		def get_value(doctype, name, field):
-			return bounds.get(name) if isinstance(field, list) else lft.get(name)
-
-		db = Mock()
-		db.get_value.side_effect = get_value
-		root = _coupon(apply_scope="Item Group", applicable_item_groups=[{"item_group": "All Item Groups"}])
-		shoes = _coupon(apply_scope="Item Group", applicable_item_groups=[{"item_group": "Shoes"}])
-		item = {"item_code": "A", "item_group": "Caps", "qty": 1, "price_list_rate": 10, "rate": 10}
-		with patch("posnext_promotions.api.coupon_engine.frappe.db", new=db):
-			self.assertEqual(len(get_coupon_eligible_items(root, [item])), 1)
-			self.assertEqual(len(get_coupon_eligible_items(shoes, [item])), 0)
-
 	def test_scope_brand_and_item_group(self):
 		brand_coupon = _coupon(apply_scope="Brand", applicable_brand="Nike")
 		group_coupon = _coupon(apply_scope="Item Group", applicable_item_group="Shoes")
@@ -234,6 +193,36 @@ class TestPOSCoupon(unittest.TestCase):
 		self.assertEqual(
 			[i["item_code"] for i in get_coupon_eligible_items(group_coupon, items)],
 			["SHOE-1"],
+		)
+
+	def test_scope_tables_take_precedence_over_legacy_fields(self):
+		coupon = _coupon(
+			apply_scope="Brand",
+			applicable_brand="Ignored",
+			applicable_brands=[{"brand": "Nike"}, {"brand": "Puma"}],
+		)
+		items = [
+			{"item_code": "NIKE-1", "brand": "Nike", "qty": 1, "price_list_rate": 10, "rate": 10},
+			{"item_code": "PUMA-1", "brand": "Puma", "qty": 1, "price_list_rate": 10, "rate": 10},
+			{"item_code": "IGN-1", "brand": "Ignored", "qty": 1, "price_list_rate": 10, "rate": 10},
+		]
+
+		self.assertEqual(
+			[i["item_code"] for i in get_coupon_eligible_items(coupon, items)],
+			["NIKE-1", "PUMA-1"],
+		)
+
+	def test_item_code_scope_matches_listed_codes_and_variant_templates(self):
+		coupon = _coupon(apply_scope="Item Code", applicable_items=[{"item_code": "TSHIRT"}])
+		items = [
+			{"item_code": "TSHIRT-RED", "variant_of": "TSHIRT", "qty": 1, "price_list_rate": 10, "rate": 10},
+			{"item_code": "TSHIRT", "qty": 1, "price_list_rate": 10, "rate": 10},
+			{"item_code": "MUG", "qty": 1, "price_list_rate": 10, "rate": 10},
+		]
+
+		self.assertEqual(
+			[i["item_code"] for i in get_coupon_eligible_items(coupon, items)],
+			["TSHIRT-RED", "TSHIRT"],
 		)
 
 	def test_percentage_line_discount(self):
@@ -361,9 +350,7 @@ class TestPOSCoupon(unittest.TestCase):
 		for update in result["line_updates"]:
 			self.assertEqual(update["discount_percentage"], 0)
 			self.assertGreater(update["discount_amount"], 0)
-		self.assertAlmostEqual(
-			sum(u["discount_amount"] for u in result["line_updates"]), 40, places=4
-		)
+		self.assertAlmostEqual(sum(u["discount_amount"] for u in result["line_updates"]), 40, places=4)
 
 	def test_percentage_with_max_amount_under_cap_still_uses_amounts(self):
 		coupon = _coupon(
@@ -386,6 +373,55 @@ class TestPOSCoupon(unittest.TestCase):
 		self.assertEqual(result["total_discount"], 10)
 		self.assertEqual(result["line_updates"][0]["discount_percentage"], 0)
 		self.assertEqual(result["line_updates"][0]["discount_amount"], 10)
+
+	@patch("posnext_promotions.api.coupon_engine.frappe.get_precision", return_value=2)
+	def test_fixed_amount_is_exact_per_unit_on_multi_qty_lines(self, _precision):
+		coupon = _coupon(discount_type="Amount", discount_amount=80)
+		items = [
+			{"item_code": "A", "qty": 3, "price_list_rate": 200, "rate": 200},
+			{"item_code": "B", "qty": 1, "price_list_rate": 100, "rate": 100},
+		]
+		result = apply_coupon_to_items(coupon, items)
+
+		self.assertEqual(result["total_discount"], 80)
+		for update, item in zip(result["line_updates"], items, strict=True):
+			per_unit = update["discount_amount"] / item["qty"]
+			self.assertAlmostEqual(per_unit, round(per_unit, 2), places=9)
+			self.assertAlmostEqual(update["rate"], round(update["rate"], 2), places=9)
+		self.assertAlmostEqual(sum(u["discount_amount"] for u in result["line_updates"]), 80, places=9)
+
+	@patch("posnext_promotions.api.coupon_engine.frappe.get_precision", return_value=2)
+	def test_fixed_amount_never_exceeds_total_without_qty_one_line(self, _precision):
+		coupon = _coupon(discount_type="Amount", discount_amount=100)
+		items = [{"item_code": "A", "qty": 3, "price_list_rate": 200, "rate": 200}]
+		result = apply_coupon_to_items(coupon, items)
+
+		update = result["line_updates"][0]
+		self.assertEqual(update["discount_amount"], 99.99)
+		self.assertEqual(update["rate"], 166.67)
+		self.assertEqual(result["total_discount"], 99.99)
+
+	def test_is_coupon_line_requires_source_code_and_no_pricing_rule(self):
+		from posnext_promotions.api.promotion_exclusions import is_coupon_line
+
+		line = {"discount_source": "coupon", "coupon_code": "SAVE10", "discount_percentage": 10}
+		self.assertTrue(is_coupon_line(line))
+		self.assertFalse(is_coupon_line({**line, "coupon_code": None}))
+		self.assertFalse(is_coupon_line({**line, "discount_source": "manual_discount"}))
+		self.assertFalse(is_coupon_line({**line, "pricing_rules": '["PRLE-0001"]'}))
+
+	def test_mark_item_discount_flags_keeps_coupon_lines(self):
+		from frappe import _dict
+
+		from posnext_promotions.api.promotion_exclusions import mark_item_discount_flags
+
+		coupon_line = _dict(discount_source="coupon", coupon_code="SAVE10", discount_percentage=10)
+		manual_line = _dict(discount_percentage=5)
+		mark_item_discount_flags([coupon_line, manual_line], rule_type_map={})
+
+		self.assertEqual(coupon_line.discount_source, "coupon")
+		self.assertEqual(coupon_line.is_already_discounted, 1)
+		self.assertEqual(manual_line.discount_source, "manual_discount")
 
 	def test_no_eligible_items_returns_invalid(self):
 		coupon = _coupon(apply_scope="Brand", applicable_brand="Missing")

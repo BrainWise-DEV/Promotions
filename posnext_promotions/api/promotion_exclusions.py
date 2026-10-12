@@ -64,6 +64,7 @@ DISCOUNT_SOURCE_AUTO = "auto_discount"
 DISCOUNT_SOURCE_GWP = "gwp"
 DISCOUNT_SOURCE_FREE_ITEM = "free_item"
 DISCOUNT_SOURCE_LEGACY = "pricing_rule"
+DISCOUNT_SOURCE_COUPON = "coupon"
 
 
 def _parse_pricing_rules(value) -> list[str]:
@@ -110,6 +111,15 @@ def has_item_level_promotion_rule(item, rule_type_map: dict[str, str] | None = N
 
 	type_map = rule_type_map or get_rule_promotion_types(rule_names)
 	return any(type_map.get(name) == PROMOTION_TYPE_ITEM_LEVEL for name in rule_names)
+
+
+def is_coupon_line(item) -> bool:
+	"""Line discounted by a scoped POS Coupon and not since claimed by a pricing rule."""
+	return (
+		item.get("discount_source") == DISCOUNT_SOURCE_COUPON
+		and bool(item.get("coupon_code"))
+		and not _parse_pricing_rules(item.get("pricing_rules"))
+	)
 
 
 def has_manual_item_discount(item) -> bool:
@@ -368,6 +378,9 @@ def mark_item_discount_flags(items, rule_type_map: dict[str, str] | None = None)
 		# "N free items" instead of falling back to a derived "%".
 		existing_source = item.get("discount_source")
 		if existing_source in (DISCOUNT_SOURCE_FREE_ITEM, DISCOUNT_SOURCE_GWP):
+			item.is_already_discounted = 1
+			continue
+		if is_coupon_line(item):
 			item.is_already_discounted = 1
 			continue
 		if flt(item.get("free_qty")) > 0:

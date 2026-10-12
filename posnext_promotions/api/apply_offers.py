@@ -48,6 +48,7 @@ try:
 		PROMOTION_TYPE_AUTO,
 		PROMOTION_TYPE_ITEM_LEVEL,
 		get_rule_promotion_types,
+		is_coupon_line,
 		mark_item_discount_flags,
 	)
 	from posnext_promotions.api.gwp import (
@@ -97,6 +98,7 @@ except Exception:  # pragma: no cover
 	DISCOUNT_SOURCE_FREE_ITEM = "free_item"
 	DISCOUNT_SOURCE_MANUAL = "manual_discount"
 	get_rule_promotion_types = None
+	is_coupon_line = None
 	mark_item_discount_flags = None
 	allocate_gift_pool_free_items = None
 	get_scheme_gift_pools = None
@@ -1199,7 +1201,9 @@ def apply_offers(invoice_data, selected_offers=None):
 			# Clear previously applied promotional metadata if the
 			# current quantity can no longer satisfy the rule.
 			# Preserve manual cashier discounts across offer re-evaluation.
-			is_manual = item.get("discount_source") == DISCOUNT_SOURCE_MANUAL
+			is_manual = item.get("discount_source") == DISCOUNT_SOURCE_MANUAL or bool(
+				is_coupon_line and is_coupon_line(item)
+			)
 			if not is_manual and not item.get("pricing_rules"):
 				is_manual = flt(item.get("discount_percentage")) > 0 or flt(item.get("discount_amount")) > 0
 				if is_manual:
