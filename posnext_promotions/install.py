@@ -85,6 +85,14 @@ def after_migrate():
 	_ensure_pos_coupon_extras()
 	_ensure_friends_and_family_customer_flag()
 	_ensure_friends_and_family_invoice_fields()
+	_ensure_friends_and_family_message_events()
+
+
+def _ensure_friends_and_family_message_events():
+	"""Structural: standard F&F message event definitions the engine fires (no message text)."""
+	from posnext_promotions.promotions.friends_and_family_messages import ensure_standard_events
+
+	ensure_standard_events()
 
 
 def _ensure_friends_and_family_invoice_fields():

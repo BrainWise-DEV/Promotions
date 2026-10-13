@@ -293,13 +293,24 @@ FF_ACCEPTANCE_POS_PROFILE="profile 1" bench --site brainwise.dev run-tests --ski
 - **Select Multiple** — `MultiSelectDialog` with filters (Item: item group / brand; Item Group:
   parent / is group). Selected values are appended without duplicates.
 
-**Friends and Family Message** (doctype, named by `event`): `event`, `enabled`, `description`,
-`message_ar` (required), `message_en`. **Nothing is seeded** — records are created per site.
-Events: `ff_activated`, `coupon_lower_ff_applied`, `coupon_higher_applied`, `tie`, `item_excluded`,
-`monthly_cap_reached`, `email_change_old_email`, `email_change_new_email`. Placeholders `{percent}`
-(Settings %) and `{brand}` (Settings → *Brand Name*, else the default Company). Helper:
-`promotions.friends_and_family_messages.get_customer_message(event)` → `{event, ar, en, message}`,
-or `None` when no enabled record exists (no built-in fallback text).
+**Friends and Family Message Event** (named by `event_code`, snake_case, set once): `event_name`
+(label), `event_code`, `description` (when it fires), `placeholders`, `is_standard` (read-only),
+`enabled`. The 8 standard events the engine fires are created/updated on migrate (labels and
+descriptions only — no message text): `ff_activated`, `coupon_lower_ff_applied`,
+`coupon_higher_applied`, `tie`, `item_excluded`, `monthly_cap_reached`, `email_change_old_email`,
+`email_change_new_email`. Standard events cannot be deleted (disable them instead).
+
+**Friends and Family Message**: `event` (Link → Message Event, one message per event), fetched
+read-only event name / description / placeholders, `enabled`, `message_ar` (required),
+`message_en`. **No messages are seeded.** A message is used only if both it and its event are enabled.
+
+Helper: `promotions.friends_and_family_messages.get_customer_message(event_code, context=None)` →
+`{event, ar, en, message}` or `None`. `{percent}` = Settings %, `{brand}` = Settings → *Brand Name*,
+else default Company; any other `{key}` comes from `context`; unknown placeholders stay as typed.
+
+Adding a custom event: create a *Friends and Family Message Event* (e.g. `birthday_offer`), create a
+*Friends and Family Message* for it, then call from code or a hook:
+`get_customer_message("birthday_offer", {"customer_name": doc.customer_name})`.
 
 Example (optional) Arabic text for `ff_activated`:
 "خصمك الحصري بنسبة {percent}% لبرنامج الأصدقاء والعائلة أصبح مفعّلًا الآن. استمتع بتسوقك في {brand}!"
