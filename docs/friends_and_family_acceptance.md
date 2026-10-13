@@ -294,14 +294,17 @@ FF_ACCEPTANCE_POS_PROFILE="profile 1" bench --site brainwise.dev run-tests --ski
   parent / is group). Selected values are appended without duplicates.
 
 **Friends and Family Message** (doctype, named by `event`): `event`, `enabled`, `description`,
-`message_ar` (required), `message_en`. Eight defaults are seeded on migrate (add-only, edited
-records are never overwritten): `ff_activated`, `coupon_lower_ff_applied`,
-`coupon_higher_applied`, `tie`, `item_excluded`, `monthly_cap_reached`,
-`email_change_old_email`, `email_change_new_email`. Placeholders `{percent}` (Settings %) and
-`{brand}` (ميرايا / Miraaya). Helper: `promotions.friends_and_family_messages.get_customer_message(event)`
-→ `{event, ar, en, message}`; falls back to built-in text if the record is missing/disabled.
+`message_ar` (required), `message_en`. **Nothing is seeded** — records are created per site.
+Events: `ff_activated`, `coupon_lower_ff_applied`, `coupon_higher_applied`, `tie`, `item_excluded`,
+`monthly_cap_reached`, `email_change_old_email`, `email_change_new_email`. Placeholders `{percent}`
+(Settings %) and `{brand}` (Settings → *Brand Name*, else the default Company). Helper:
+`promotions.friends_and_family_messages.get_customer_message(event)` → `{event, ar, en, message}`,
+or `None` when no enabled record exists (no built-in fallback text).
 
-Wired as an **additional** `customer_message` key (existing cashier `message` / `message_en` /
+Example (optional) Arabic text for `ff_activated`:
+"خصمك الحصري بنسبة {percent}% لبرنامج الأصدقاء والعائلة أصبح مفعّلًا الآن. استمتع بتسوقك في {brand}!"
+
+Wired as an **additional** `customer_message` key (null when no record) (existing cashier `message` / `message_en` /
 `message_ar` are unchanged):
 
 | Event | Where |
@@ -316,10 +319,9 @@ The POS UI does not render `customer_message` yet.
 
 **Approved Domains** (Settings child table *Friends and Family Approved Domain*: `email_domain`,
 `company`, `enabled`). Domains are normalised to lowercase without a leading `@`; duplicates and
-invalid domains are rejected on save. Seven defaults are seeded add-only (iq.zain.com, zaincash.iq,
-switch.com.iq, horizonscope.com, tawasulco.com, mediaworldiq.com, miraaya.com).
+invalid domains are rejected on save. **No domains are seeded** (example: `miraaya.com` – Miraaya).
 `friends_and_family_eligibility.is_approved_email(email)` (exact domain or sub-domain) is exposed
 for the future e-mail/OTP enrolment; Customer Group / Flag eligibility is unchanged.
 
 QA: open `/app/friends-and-family-settings` → use the grid buttons, save; `/app/friends-and-family-message`
-→ 8 records; in a console, `is_approved_email("x@miraaya.com")` → True, `"x@gmail.com"` → False.
+→ create the records you need (none by default); in a console, `is_approved_email("x@miraaya.com")` → True, `"x@gmail.com"` → False.

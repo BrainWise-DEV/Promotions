@@ -23,7 +23,7 @@
    "unique": 1,
    "in_list_view": 1,
    "in_standard_filter": 1,
-   "description": "When this message is shown. Placeholders: {percent} (Settings discount %), {brand} (Miraaya / ميرايا)."
+   "description": "When this message is shown. Placeholders: {percent} (Settings discount %), {brand} (Settings Brand Name, else default Company)."
   },
   {
    "default": "1",

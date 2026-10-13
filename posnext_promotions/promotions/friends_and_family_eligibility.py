@@ -265,17 +265,6 @@ def ensure_customer_flag_field():
 
 # ---- approved email domains (company e-mail eligibility, future OTP flow) ----
 
-DEFAULT_APPROVED_DOMAINS = (
-	("iq.zain.com", "Zain IQ (زين العراق)"),
-	("zaincash.iq", "ZainCash (زين كاش)"),
-	("switch.com.iq", "SWITCH (سويتش)"),
-	("horizonscope.com", "Horizon (هورايزون)"),
-	("tawasulco.com", "Tawasul (تواصل)"),
-	("mediaworldiq.com", "Media World (ميديا وورلد)"),
-	("miraaya.com", "Miraaya (ميرايا)"),
-)
-
-
 def normalize_email_domain(value) -> str:
 	domain = (value or "").strip().lower()
 	while domain.startswith("@"):
@@ -316,36 +305,3 @@ def is_approved_email(email, settings=None) -> bool:
 	"""
 	return get_approved_domain_for_email(email, settings) is not None
 
-
-def seed_default_approved_domains():
-	"""Idempotent: add missing default domains to the Settings table; never removes or edits rows."""
-	doctype = "Friends and Family Settings"
-	child = "Friends and Family Approved Domain"
-	if not frappe.db.table_exists(child):
-		return
-	existing = {
-		normalize_email_domain(d)
-		for d in frappe.get_all(child, filters={"parenttype": doctype, "parent": doctype}, pluck="email_domain")
-	}
-	idx = frappe.db.count(child, {"parenttype": doctype, "parent": doctype})
-	added = False
-	for domain, company in DEFAULT_APPROVED_DOMAINS:
-		if domain in existing:
-			continue
-		idx += 1
-		row = frappe.get_doc(
-			{
-				"doctype": child,
-				"parent": doctype,
-				"parenttype": doctype,
-				"parentfield": "approved_domains",
-				"idx": idx,
-				"email_domain": domain,
-				"company": company,
-				"enabled": 1,
-			}
-		)
-		row.db_insert()
-		added = True
-	if added:
-		frappe.clear_cache(doctype=doctype)

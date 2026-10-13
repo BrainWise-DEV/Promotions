@@ -37,7 +37,8 @@
   "excluded_item_groups",
   "excluded_brands",
   "messages_section",
-  "user_message"
+  "user_message",
+  "brand_name"
  ],
  "fields": [
   {
@@ -244,11 +245,17 @@
    "fieldname": "user_message",
    "fieldtype": "Small Text",
    "label": "User Message"
+  },
+  {
+   "fieldname": "brand_name",
+   "fieldtype": "Data",
+   "label": "Brand Name",
+   "description": "Replaces {brand} in Friends and Family Message texts. Blank = default Company name."
   }
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-10-13 12:00:00.000000",
+ "modified": "2026-10-13 12:30:00.000000",
  "modified_by": "Administrator",
  "module": "POSNext Promotions",
  "name": "Friends and Family Settings",
