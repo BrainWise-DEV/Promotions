@@ -209,6 +209,7 @@ def resolve_coupon_best_discount(coupon, items, customer=None, posting_date=None
 				"message": msgs["message"],
 				"message_en": msgs["en"],
 				"message_ar": msgs["ar"],
+				"customer_message": msgs.get("customer"),
 				"line_updates": [],
 				"total_discount": 0,
 			}
@@ -242,6 +243,7 @@ def resolve_coupon_best_discount(coupon, items, customer=None, posting_date=None
 			"message": summary["message"] if summary.get("suppressed") else result.get("message"),
 			"message_en": summary.get("message_en"),
 			"message_ar": summary.get("message_ar"),
+			"customer_message": summary.get("customer_message"),
 		}
 	)
 	return result

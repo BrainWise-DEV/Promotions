@@ -1087,6 +1087,7 @@ def _validate_coupon(coupon_code, customer=None, company=None, items=None, resol
 			"eligible_item_codes": apply_result.get("eligible_item_codes") or [],
 			"total_discount": 0,
 			"best_discount": apply_result.get("best_discount"),
+			"customer_message": apply_result.get("customer_message"),
 		}
 	response.update(
 		{
@@ -1098,6 +1099,7 @@ def _validate_coupon(coupon_code, customer=None, company=None, items=None, resol
 			"message_en": apply_result.get("message_en"),
 			"message_ar": apply_result.get("message_ar"),
 			"best_discount": apply_result.get("best_discount"),
+			"customer_message": apply_result.get("customer_message"),
 		}
 	)
 
