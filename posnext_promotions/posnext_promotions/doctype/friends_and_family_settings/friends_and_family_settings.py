@@ -19,6 +19,7 @@ class FriendsandFamilySettings(Document):
 		self._validate_exclusion_tables()
 		self._validate_eligibility()
 		self._validate_caps()
+		self._validate_approved_domains()
 
 	def on_update(self):
 		# get_cached_doc is cleared by Document.save; document for callers that
@@ -114,6 +115,21 @@ class FriendsandFamilySettings(Document):
 				frappe.throw(_("{0} cannot be negative").format(label))
 			self.set(fieldname, value)
 
+	def _validate_approved_domains(self):
+		"""Normalise domains (lowercase, no leading @ / spaces) and reject duplicates."""
+		seen = set()
+		for row in list(self.get("approved_domains") or []):
+			domain = eligibility.normalize_email_domain(row.email_domain)
+			if not domain or "." not in domain or "@" in domain or " " in domain:
+				frappe.throw(
+					_("Row {0}: {1} is not a valid email domain").format(row.idx, frappe.bold(row.email_domain or ""))
+				)
+			if domain in seen:
+				frappe.throw(_("Approved Domain {0} is listed more than once").format(frappe.bold(domain)))
+			seen.add(domain)
+			row.email_domain = domain
+			row.company = (row.company or "").strip()
+
 
 def get_friends_and_family_settings():
 	"""Return the singleton settings document."""
@@ -123,3 +139,22 @@ def get_friends_and_family_settings():
 def is_friends_and_family_active(on_date=None):
 	"""True when the program is enabled, configured and within its start/end dates."""
 	return friends_and_family.get_active_program(on_date) is not None
+
+
+_PICKER_SOURCES = {
+	"Item": {"filters": {"disabled": 0, "is_sales_item": 1, "has_variants": 0}},
+	"Item Group": {"filters": {}},
+	"Brand": {"filters": {}},
+}
+
+
+@frappe.whitelist()
+def get_all_for_table(source_doctype: str, leaf_only=1):
+	"""Names for the 'Get All' buttons: enabled sales items, item groups (leaf only by default), brands."""
+	frappe.only_for(("System Manager", "Sales Manager"))
+	if source_doctype not in _PICKER_SOURCES:
+		frappe.throw(_("Unsupported doctype {0}").format(source_doctype))
+	filters = dict(_PICKER_SOURCES[source_doctype]["filters"])
+	if source_doctype == "Item Group" and cint(leaf_only):
+		filters["is_group"] = 0
+	return frappe.get_all(source_doctype, filters=filters, pluck="name", order_by="name asc", limit_page_length=0)
