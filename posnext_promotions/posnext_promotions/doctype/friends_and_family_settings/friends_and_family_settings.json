@@ -140,9 +140,8 @@
   {
    "fieldname": "approved_domains_section",
    "fieldtype": "Section Break",
-   "label": "Approved Email Domains",
-   "collapsible": 1,
-   "description": "Company email domains whose employees can join Friends & Family (email/OTP eligibility). Not used by Customer Group / Flag eligibility."
+   "label": "Approved Domains",
+   "description": "Company email domains (e.g. company.com, lowercase, no @) whose employees can join Friends & Family via email/OTP. Not used by Customer Group / Flag eligibility."
   },
   {
    "fieldname": "approved_domains",
@@ -255,7 +254,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-10-13 12:30:00.000000",
+ "modified": "2026-10-13 14:20:00.000000",
  "modified_by": "Administrator",
  "module": "POSNext Promotions",
  "name": "Friends and Family Settings",
