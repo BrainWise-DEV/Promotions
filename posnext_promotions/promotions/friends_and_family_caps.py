@@ -262,6 +262,7 @@ def build_cap_payload(ctx: CapContext, uncapped_total: float, applied_total: flo
 		"message": "",
 		"message_en": "",
 		"message_ar": "",
+		"customer_message": None,
 	}
 	if not capped:
 		return payload
@@ -283,4 +284,11 @@ def build_cap_payload(ctx: CapContext, uncapped_total: float, applied_total: flo
 	payload["message_en"] = en.format(*args)
 	payload["message_ar"] = ar.format(*args)
 	payload["message"] = _(en).format(*args)
+	if cap_hit == CAP_MONTHLY and bd.money(remaining or 0) <= 0:
+		from posnext_promotions.promotions.friends_and_family_messages import (
+			EVENT_MONTHLY_CAP_REACHED,
+			get_customer_message,
+		)
+
+		payload["customer_message"] = get_customer_message(EVENT_MONTHLY_CAP_REACHED)
 	return payload

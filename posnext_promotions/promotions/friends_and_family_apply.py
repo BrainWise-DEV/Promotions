@@ -164,6 +164,23 @@ class FriendsAndFamilyLineResult:
 	fnf_uncapped_amount: float = 0.0
 	capped: bool = False
 
+	@property
+	def customer_message(self) -> dict | None:
+		"""item_excluded text when the line keeps an existing sale (promotion / manual) discount."""
+		if self.applies or self.reason != REASON_OTHER_BETTER:
+			return None
+		if self.competing_source not in (bd.SOURCE_PROMOTION, bd.SOURCE_MANUAL):
+			return None
+		from posnext_promotions.promotions.friends_and_family_messages import (
+			EVENT_ITEM_EXCLUDED,
+			get_customer_message,
+		)
+
+		try:
+			return get_customer_message(EVENT_ITEM_EXCLUDED)
+		except Exception:
+			return None
+
 	def to_client_payload(self) -> dict:
 		return {
 			"item_code": self.item_code,
@@ -178,6 +195,7 @@ class FriendsAndFamilyLineResult:
 			"competing_source": self.competing_source,
 			"competing_amount": bd.money(self.competing_amount),
 			"best_discount": self.decision,
+			"customer_message": self.customer_message,
 			"fnf_uncapped_amount": bd.money(self.fnf_uncapped_amount),
 			"capped": self.capped,
 		}

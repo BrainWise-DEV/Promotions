@@ -283,6 +283,7 @@ class Decision:
 			"message": msgs["message"],
 			"message_en": msgs["en"],
 			"message_ar": msgs["ar"],
+			"customer_message": msgs.get("customer"),
 		}
 		if self.granularity == GRANULARITY_LINE:
 			payload["idx"] = self.idx
@@ -366,7 +367,28 @@ def build_messages(outcome: str, fnf: Candidate | None, other: Candidate | None)
 		"en": _cap(en.format(fnf_v, o_label["en"], other_v)),
 		"ar": ar.format(fnf_v, o_label["ar"], other_v),
 		"message": _cap(_(en).format(fnf_v, _(o_label["en"]), other_v)),
+		"customer": customer_message_for(outcome, other),
 	}
+
+
+_COUPON_SOURCES = frozenset({SOURCE_COUPON, SOURCE_ORDER_COUPON})
+
+
+def customer_message_for(outcome: str, other: Candidate | None) -> dict | None:
+	"""Friends and Family Message for a coupon vs F&F decision (None when no coupon involved)."""
+	if other is None or other.source not in _COUPON_SOURCES:
+		return None
+	from posnext_promotions.promotions import friends_and_family_messages as ffm
+
+	event = {
+		OUTCOME_FNF_BETTER: ffm.EVENT_COUPON_LOWER_FF_APPLIED,
+		OUTCOME_TIE_FNF: ffm.EVENT_TIE,
+		OUTCOME_OTHER_BETTER: ffm.EVENT_COUPON_HIGHER_APPLIED,
+	}.get(outcome)
+	try:
+		return ffm.get_customer_message(event) if event else None
+	except Exception:
+		return None
 
 
 # ---- summary ---------------------------------------------------------------
@@ -391,6 +413,7 @@ def summarize(line_decisions, order_decision: Decision | None = None) -> dict:
 		payload["message"] = order_decision.messages()["message"]
 		payload["message_en"] = order_decision.messages()["en"]
 		payload["message_ar"] = order_decision.messages()["ar"]
+		payload["customer_message"] = order_decision.messages().get("customer")
 	else:
 		winners = {d.winner_source for d in compared if d.winner}
 		payload["winner"] = (
@@ -405,4 +428,5 @@ def summarize(line_decisions, order_decision: Decision | None = None) -> dict:
 		payload["message"] = msgs["message"]
 		payload["message_en"] = msgs["en"]
 		payload["message_ar"] = msgs["ar"]
+		payload["customer_message"] = msgs.get("customer")
 	return payload
