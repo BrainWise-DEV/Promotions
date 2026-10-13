@@ -85,6 +85,16 @@ def after_migrate():
 	_ensure_pos_coupon_extras()
 	_ensure_friends_and_family_customer_flag()
 	_ensure_friends_and_family_invoice_fields()
+	_seed_friends_and_family_defaults()
+
+
+def _seed_friends_and_family_defaults():
+	"""Idempotent: default customer messages + approved e-mail domains (add-only)."""
+	from posnext_promotions.promotions.friends_and_family_eligibility import seed_default_approved_domains
+	from posnext_promotions.promotions.friends_and_family_messages import seed_default_messages
+
+	seed_default_messages()
+	seed_default_approved_domains()
 
 
 def _ensure_friends_and_family_invoice_fields():

@@ -281,3 +281,45 @@ FF_ACCEPTANCE_POS_PROFILE="profile 1" bench --site brainwise.dev run-tests --ski
 ```
 
 الاختبارات بتعمل بيانات بـ prefix `_Test FF Acc` وبتعمل rollback بعد كل حالة، فمش بتسيب فواتير أو Logs على الـ site.
+
+## Settings UX, customer messages & approved domains (2026-10-13)
+
+**Bulk pickers (Friends and Family Settings form).** Every include / exclude table
+(Applicable / Excluded Brands, Item Groups, Items) has two grid buttons:
+
+- **Get All …** — Brands: all; Item Groups: leaf groups by default (prompt lets you take all);
+  Items: enabled sales items without variants (templates skipped). Duplicates are skipped and
+  a confirm dialog appears when more than 50 rows would be added.
+- **Select Multiple** — `MultiSelectDialog` with filters (Item: item group / brand; Item Group:
+  parent / is group). Selected values are appended without duplicates.
+
+**Friends and Family Message** (doctype, named by `event`): `event`, `enabled`, `description`,
+`message_ar` (required), `message_en`. Eight defaults are seeded on migrate (add-only, edited
+records are never overwritten): `ff_activated`, `coupon_lower_ff_applied`,
+`coupon_higher_applied`, `tie`, `item_excluded`, `monthly_cap_reached`,
+`email_change_old_email`, `email_change_new_email`. Placeholders `{percent}` (Settings %) and
+`{brand}` (ميرايا / Miraaya). Helper: `promotions.friends_and_family_messages.get_customer_message(event)`
+→ `{event, ar, en, message}`; falls back to built-in text if the record is missing/disabled.
+
+Wired as an **additional** `customer_message` key (existing cashier `message` / `message_en` /
+`message_ar` are unchanged):
+
+| Event | Where |
+|---|---|
+| ff_activated | eligibility payload when the customer is eligible |
+| coupon_lower_ff_applied / coupon_higher_applied / tie | `best_discount` decision + summary when the competitor is a (line or order) coupon |
+| item_excluded | line result when F&F lost to an existing promotion / manual (sale) discount |
+| monthly_cap_reached | caps payload when the monthly cap is exhausted |
+| email_change_* | not wired — no e-mail / OTP flow exists yet |
+
+The POS UI does not render `customer_message` yet.
+
+**Approved Domains** (Settings child table *Friends and Family Approved Domain*: `email_domain`,
+`company`, `enabled`). Domains are normalised to lowercase without a leading `@`; duplicates and
+invalid domains are rejected on save. Seven defaults are seeded add-only (iq.zain.com, zaincash.iq,
+switch.com.iq, horizonscope.com, tawasulco.com, mediaworldiq.com, miraaya.com).
+`friends_and_family_eligibility.is_approved_email(email)` (exact domain or sub-domain) is exposed
+for the future e-mail/OTP enrolment; Customer Group / Flag eligibility is unchanged.
+
+QA: open `/app/friends-and-family-settings` → use the grid buttons, save; `/app/friends-and-family-message`
+→ 8 records; in a console, `is_approved_email("x@miraaya.com")` → True, `"x@gmail.com"` → False.

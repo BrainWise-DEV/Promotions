@@ -22,6 +22,8 @@
   "eligibility_basis",
   "column_break_eligibility",
   "eligible_customer_groups",
+  "approved_domains_section",
+  "approved_domains",
   "scope_section",
   "discount_scope",
   "brands_section",
@@ -135,6 +137,19 @@
    "options": "Friends and Family Customer Group"
   },
   {
+   "fieldname": "approved_domains_section",
+   "fieldtype": "Section Break",
+   "label": "Approved Email Domains",
+   "collapsible": 1,
+   "description": "Company email domains whose employees can join Friends & Family (email/OTP eligibility). Not used by Customer Group / Flag eligibility."
+  },
+  {
+   "fieldname": "approved_domains",
+   "fieldtype": "Table",
+   "label": "Approved Domains",
+   "options": "Friends and Family Approved Domain"
+  },
+  {
    "fieldname": "scope_section",
    "fieldtype": "Section Break",
    "label": "Discount Scope"
@@ -233,7 +248,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-10-06 10:05:00.000000",
+ "modified": "2026-10-13 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "POSNext Promotions",
  "name": "Friends and Family Settings",

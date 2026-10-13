@@ -102,7 +102,20 @@ class CustomerEligibility:
 			"program_active": self.program is not None,
 			"discount_percentage": self.program.discount_percentage if self.eligible else 0,
 			"program": self.program.to_client_payload() if self.eligible else None,
+			# Customer-facing text (Friends and Family Message "ff_activated").
+			"customer_message": self.customer_message,
 		}
+
+	@property
+	def customer_message(self) -> dict | None:
+		if not self.eligible:
+			return None
+		from posnext_promotions.promotions.friends_and_family_messages import (
+			EVENT_FF_ACTIVATED,
+			get_customer_message,
+		)
+
+		return get_customer_message(EVENT_FF_ACTIVATED, percent=self.program.discount_percentage)
 
 
 def get_eligibility_basis(settings) -> str:
@@ -248,3 +261,91 @@ def ensure_customer_flag_field():
 	from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 
 	create_custom_fields({"Customer": [CUSTOMER_FLAG_FIELD_SPEC]}, update=True)
+
+
+# ---- approved email domains (company e-mail eligibility, future OTP flow) ----
+
+DEFAULT_APPROVED_DOMAINS = (
+	("iq.zain.com", "Zain IQ (زين العراق)"),
+	("zaincash.iq", "ZainCash (زين كاش)"),
+	("switch.com.iq", "SWITCH (سويتش)"),
+	("horizonscope.com", "Horizon (هورايزون)"),
+	("tawasulco.com", "Tawasul (تواصل)"),
+	("mediaworldiq.com", "Media World (ميديا وورلد)"),
+	("miraaya.com", "Miraaya (ميرايا)"),
+)
+
+
+def normalize_email_domain(value) -> str:
+	domain = (value or "").strip().lower()
+	while domain.startswith("@"):
+		domain = domain[1:]
+	return domain.strip().rstrip(".")
+
+
+def get_approved_domains(settings=None) -> list[str]:
+	"""Enabled approved domains from Friends and Family Settings."""
+	settings = settings or frappe.get_cached_doc("Friends and Family Settings")
+	return [
+		normalize_email_domain(row.email_domain)
+		for row in (settings.get("approved_domains") or [])
+		if cint(row.get("enabled")) and row.get("email_domain")
+	]
+
+
+def get_approved_domain_for_email(email, settings=None) -> str | None:
+	"""Matching approved domain for ``email`` (exact domain or a sub-domain of it), else None."""
+	email = (email or "").strip().lower()
+	if email.count("@") != 1:
+		return None
+	local, domain = email.split("@")
+	domain = normalize_email_domain(domain)
+	if not local or not domain:
+		return None
+	for approved in get_approved_domains(settings):
+		if domain == approved or domain.endswith("." + approved):
+			return approved
+	return None
+
+
+def is_approved_email(email, settings=None) -> bool:
+	"""True when the e-mail belongs to an enabled approved company domain.
+
+	Not yet part of ``get_customer_eligibility`` (Group / Flag rules are
+	unchanged); intended for the e-mail + OTP enrolment flow.
+	"""
+	return get_approved_domain_for_email(email, settings) is not None
+
+
+def seed_default_approved_domains():
+	"""Idempotent: add missing default domains to the Settings table; never removes or edits rows."""
+	doctype = "Friends and Family Settings"
+	child = "Friends and Family Approved Domain"
+	if not frappe.db.table_exists(child):
+		return
+	existing = {
+		normalize_email_domain(d)
+		for d in frappe.get_all(child, filters={"parenttype": doctype, "parent": doctype}, pluck="email_domain")
+	}
+	idx = frappe.db.count(child, {"parenttype": doctype, "parent": doctype})
+	added = False
+	for domain, company in DEFAULT_APPROVED_DOMAINS:
+		if domain in existing:
+			continue
+		idx += 1
+		row = frappe.get_doc(
+			{
+				"doctype": child,
+				"parent": doctype,
+				"parenttype": doctype,
+				"parentfield": "approved_domains",
+				"idx": idx,
+				"email_domain": domain,
+				"company": company,
+				"enabled": 1,
+			}
+		)
+		row.db_insert()
+		added = True
+	if added:
+		frappe.clear_cache(doctype=doctype)
