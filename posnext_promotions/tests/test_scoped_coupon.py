@@ -69,3 +69,47 @@ class TestScopedCoupon(unittest.TestCase):
 		self._run([_row(discount_percentage=0, discount_amount=20)], coupon)
 		with self.assertRaises(frappe.ValidationError):
 			self._run([_row(discount_percentage=0, discount_amount=30)], coupon)
+
+
+class TestCouponScopeValidation(unittest.TestCase):
+	"""POS Coupon save refuses a restricted scope with nothing selected."""
+
+	def _doc(self, **kw):
+		d = {"apply_scope": "Item Code", "applicable_items": [], "applicable_item_groups": [],
+			"applicable_brands": [], "applicable_brand": None, "applicable_item_group": None}
+		d.update(kw)
+		return frappe._dict(d)
+
+	def _check(self, doc):
+		from posnext_promotions.overrides.scoped_coupon import validate_coupon_scope
+
+		def throw(msg, *a, **k):
+			raise frappe.ValidationError(msg)
+
+		with patch("posnext_promotions.overrides.scoped_coupon.frappe.throw", side_effect=throw), patch(
+			"posnext_promotions.overrides.scoped_coupon.frappe.bold", side_effect=lambda v: v
+		):
+			validate_coupon_scope(doc)
+
+	def test_empty_scope_tables_rejected(self):
+		for scope in ("Item Code", "Item Group", "Brand"):
+			with self.subTest(scope=scope), self.assertRaises(frappe.ValidationError) as ctx:
+				self._check(self._doc(apply_scope=scope))
+			self.assertIn(scope, str(ctx.exception))
+
+	def test_blank_rows_count_as_empty(self):
+		with self.assertRaises(frappe.ValidationError):
+			self._check(self._doc(applicable_items=[frappe._dict(item_code=None)]))
+
+	def test_filled_scope_accepted(self):
+		self._check(self._doc(applicable_items=[frappe._dict(item_code="A")]))
+		self._check(self._doc(apply_scope="Item Group", applicable_item_groups=[frappe._dict(item_group="G")]))
+		self._check(self._doc(apply_scope="Brand", applicable_brands=[frappe._dict(brand="B")]))
+
+	def test_legacy_single_field_accepted(self):
+		self._check(self._doc(apply_scope="Brand", applicable_brand="Nike"))
+		self._check(self._doc(apply_scope="Item Group", applicable_item_group="Shoes"))
+
+	def test_unscoped_coupon_unaffected(self):
+		self._check(self._doc(apply_scope="All Eligible Items"))
+		self._check(self._doc(apply_scope=None))

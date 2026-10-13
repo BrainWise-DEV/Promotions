@@ -277,6 +277,9 @@ def _coupon_rejection_message(coupon, items) -> str:
 
 	if reasons:
 		return "; ".join(reasons[:3])
+	scope = getattr(coupon, "apply_scope", None) or "All Eligible Items"
+	if scope in ("Item Code", "Item Group", "Brand"):
+		return _("No items in the cart match this coupon's {0} scope").format(_(scope))
 	return _("No eligible items for this coupon")
 
 

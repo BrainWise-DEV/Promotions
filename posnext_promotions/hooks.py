@@ -46,6 +46,7 @@ doctype_js = {
 }
 
 doc_events = {
+	"POS Coupon": {"validate": "posnext_promotions.overrides.scoped_coupon.validate_coupon_scope"},
 	"Promotional Scheme": {
 		"before_validate": [
 			"posnext_promotions.promotions.schedule.normalize_schedule_fields",

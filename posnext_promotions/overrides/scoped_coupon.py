@@ -73,3 +73,41 @@ def validate_scoped_coupon_lines(doc, method=None):
 		# Percentage coupons without a cap are priced as a percentage, not an amount.
 		if cap and total > cap + TOLERANCE:
 			frappe.throw(_("POS Coupon {0} discount {1} exceeds its limit of {2}").format(code, total, cap))
+
+
+# Scope -> (child table, legacy single field or None, label for the message)
+SCOPE_TABLES = {
+	"Item Code": ("applicable_items", None, _("Applicable Items")),
+	"Item Group": ("applicable_item_groups", "applicable_item_group", _("Applicable Item Groups")),
+	"Brand": ("applicable_brands", "applicable_brand", _("Applicable Brands")),
+}
+
+
+def validate_coupon_scope(doc, method=None):
+	"""POS Coupon save: a restricted scope needs at least one Item / Item Group / Brand.
+
+	A coupon saved with an empty list matches no cart line, so every cart would be
+	rejected. Only checked on save; coupons already stored empty keep loading.
+	"""
+	scope = doc.get("apply_scope") or "All Eligible Items"
+	spec = SCOPE_TABLES.get(scope)
+	if not spec:
+		return
+	table, legacy, label = spec
+	if any(row.get(_ROW_FIELD[table]) for row in (doc.get(table) or [])):
+		return
+	if legacy and doc.get(legacy):
+		return
+	frappe.throw(
+		_("Scope is {0}: add at least one row to {1} or change the scope to All Eligible Items").format(
+			frappe.bold(_(scope)), frappe.bold(label)
+		),
+		title=_("Coupon scope is empty"),
+	)
+
+
+_ROW_FIELD = {
+	"applicable_items": "item_code",
+	"applicable_item_groups": "item_group",
+	"applicable_brands": "brand",
+}
