@@ -767,6 +767,26 @@ def get_coupons(company=None, include_disabled=False, coupon_type=None):
 	return coupons
 
 
+COUPON_SCOPE_TABLES = (
+	("applicable_items", "item_code"),
+	("applicable_item_groups", "item_group"),
+	("applicable_brands", "brand"),
+	("excluded_brands", "brand"),
+)
+
+
+def _set_coupon_scope_tables(coupon, data):
+	"""Replace each scope child table present in ``data`` with its submitted values."""
+	for table, column in COUPON_SCOPE_TABLES:
+		if table not in data:
+			continue
+		coupon.set(table, [])
+		for entry in data.get(table) or []:
+			value = entry.get(column) if isinstance(entry, dict) else entry
+			if value:
+				coupon.append(table, {column: value})
+
+
 @frappe.whitelist()
 def get_coupon_details(coupon_name):
 	"""Get detailed information about a specific coupon."""
@@ -874,10 +894,7 @@ def create_coupon(data):
 			}
 		)
 
-		for brand in data.get("excluded_brands") or []:
-			brand_name = brand.get("brand") if isinstance(brand, dict) else brand
-			if brand_name:
-				coupon.append("excluded_brands", {"brand": brand_name})
+		_set_coupon_scope_tables(coupon, data)
 
 		coupon.insert()
 
@@ -934,12 +951,7 @@ def update_coupon(coupon_name, data):
 			coupon.applicable_brand = data["applicable_brand"]
 		if "applicable_item_group" in data:
 			coupon.applicable_item_group = data["applicable_item_group"]
-		if "excluded_brands" in data:
-			coupon.set("excluded_brands", [])
-			for brand in data.get("excluded_brands") or []:
-				brand_name = brand.get("brand") if isinstance(brand, dict) else brand
-				if brand_name:
-					coupon.append("excluded_brands", {"brand": brand_name})
+		_set_coupon_scope_tables(coupon, data)
 
 		# Update validity and usage fields
 		if "valid_from" in data:

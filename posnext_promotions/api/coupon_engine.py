@@ -170,13 +170,58 @@ def _get_excluded_brands(coupon):
 	return excluded
 
 
+def _get_scope_values(coupon, table_field, column):
+	rows = getattr(coupon, table_field, None)
+	if rows is None and hasattr(coupon, "get"):
+		rows = coupon.get(table_field)
+	values = set()
+	for row in rows or []:
+		value = row.get(column) if isinstance(row, dict) else getattr(row, column, None)
+		if value:
+			values.add(value)
+	return values
+
+
 def _item_matches_scope(coupon, item):
 	apply_scope = getattr(coupon, "apply_scope", None) or "All Eligible Items"
+	if apply_scope == "Item Code":
+		return bool(item.get("item_code")) and item.get("item_code") in _get_scope_values(
+			coupon, "applicable_items", "item_code"
+		)
 	if apply_scope == "Brand":
-		return bool(item.get("brand")) and item.get("brand") == coupon.applicable_brand
+		brands = _get_scope_values(coupon, "applicable_brands", "brand")
+		if getattr(coupon, "applicable_brand", None):
+			brands.add(coupon.applicable_brand)
+		return bool(item.get("brand")) and item.get("brand") in brands
 	if apply_scope == "Item Group":
-		return bool(item.get("item_group")) and item.get("item_group") == coupon.applicable_item_group
+		groups = _get_scope_values(coupon, "applicable_item_groups", "item_group")
+		if getattr(coupon, "applicable_item_group", None):
+			groups.add(coupon.applicable_item_group)
+		return _item_group_in(item.get("item_group"), groups)
 	return True
+
+
+def _item_group_in(item_group, groups):
+	"""True when ``item_group`` is one of ``groups`` or sits below one in the Item Group tree.
+
+	Item Group is a nested-set tree, so a coupon on "All Item Groups" (the root) or on a
+	parent group covers every item filed under its child groups.
+	"""
+	if not item_group or not groups:
+		return False
+	if item_group in groups:
+		return True
+	try:
+		item_lft = frappe.db.get_value("Item Group", item_group, "lft")
+		if item_lft is None:
+			return False
+		for group in groups:
+			bounds = frappe.db.get_value("Item Group", group, ["lft", "rgt"])
+			if bounds and bounds[0] <= item_lft < bounds[1]:
+				return True
+	except Exception:
+		return False
+	return False
 
 
 def _item_line_key(item, index):
@@ -232,6 +277,9 @@ def _coupon_rejection_message(coupon, items) -> str:
 
 	if reasons:
 		return "; ".join(reasons[:3])
+	scope = getattr(coupon, "apply_scope", None) or "All Eligible Items"
+	if scope in ("Item Code", "Item Group", "Brand"):
+		return _("No items in the cart match this coupon's {0} scope").format(_(scope))
 	return _("No eligible items for this coupon")
 
 

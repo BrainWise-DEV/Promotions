@@ -22,6 +22,9 @@ def _coupon(**kwargs):
 		"apply_scope": "All Eligible Items",
 		"applicable_brand": None,
 		"applicable_item_group": None,
+		"applicable_items": [],
+		"applicable_item_groups": [],
+		"applicable_brands": [],
 		"excluded_brands": [],
 		"min_amount": None,
 		"max_amount": None,
@@ -163,6 +166,44 @@ class TestPOSCoupon(unittest.TestCase):
 
 		eligible = get_coupon_eligible_items(coupon, items)
 		self.assertEqual([i["item_code"] for i in eligible], ["Eligible"])
+
+	def test_scope_item_code_item_groups_and_brands_tables(self):
+		items = [
+			{"item_code": "A", "brand": "Nike", "item_group": "Shoes", "qty": 1, "price_list_rate": 10, "rate": 10},
+			{"item_code": "B", "brand": "Adidas", "item_group": "Caps", "qty": 1, "price_list_rate": 10, "rate": 10},
+			{"item_code": "C", "brand": "Puma", "item_group": "Bags", "qty": 1, "price_list_rate": 10, "rate": 10},
+		]
+
+		def codes(coupon):
+			return [i["item_code"] for i in get_coupon_eligible_items(coupon, items)]
+
+		by_item = _coupon(apply_scope="Item Code", applicable_items=[{"item_code": "A"}, {"item_code": "C"}])
+		by_group = _coupon(
+			apply_scope="Item Group", applicable_item_groups=[{"item_group": "Shoes"}, {"item_group": "Caps"}]
+		)
+		by_brand = _coupon(apply_scope="Brand", applicable_brands=[{"brand": "Adidas"}, {"brand": "Puma"}])
+		empty = _coupon(apply_scope="Item Code")
+
+		self.assertEqual(codes(by_item), ["A", "C"])
+		self.assertEqual(codes(by_group), ["A", "B"])
+		self.assertEqual(codes(by_brand), ["B", "C"])
+		self.assertEqual(codes(empty), [])
+
+	def test_item_group_scope_includes_child_groups(self):
+		bounds = {"All Item Groups": [1, 10], "Shoes": [2, 3], "Caps": [4, 5]}
+		lft = {k: v[0] for k, v in bounds.items()}
+
+		def get_value(doctype, name, field):
+			return bounds.get(name) if isinstance(field, list) else lft.get(name)
+
+		db = Mock()
+		db.get_value.side_effect = get_value
+		root = _coupon(apply_scope="Item Group", applicable_item_groups=[{"item_group": "All Item Groups"}])
+		shoes = _coupon(apply_scope="Item Group", applicable_item_groups=[{"item_group": "Shoes"}])
+		item = {"item_code": "A", "item_group": "Caps", "qty": 1, "price_list_rate": 10, "rate": 10}
+		with patch("posnext_promotions.api.coupon_engine.frappe.db", new=db):
+			self.assertEqual(len(get_coupon_eligible_items(root, [item])), 1)
+			self.assertEqual(len(get_coupon_eligible_items(shoes, [item])), 0)
 
 	def test_scope_brand_and_item_group(self):
 		brand_coupon = _coupon(apply_scope="Brand", applicable_brand="Nike")

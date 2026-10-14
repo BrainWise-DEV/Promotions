@@ -4,5 +4,5 @@
 from frappe.model.document import Document
 
 
-class POSAuthorizationLog(Document):
+class POSCouponApplicableItem(Document):
 	pass

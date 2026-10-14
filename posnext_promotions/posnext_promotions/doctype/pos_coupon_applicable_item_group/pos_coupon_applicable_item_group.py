@@ -1,5 +1,8 @@
 # Copyright (c) 2026, BrainWise and contributors
 # For license information, please see license.txt
 
+from frappe.model.document import Document
 
-from posnext_promotions.authorization.actions import sales_invoice
+
+class POSCouponApplicableItemGroup(Document):
+	pass

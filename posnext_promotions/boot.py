@@ -6,4 +6,3 @@
 
 def extend(bootinfo):
 	bootinfo["posnext_promotions"] = 1
-	bootinfo["posnext_promotions_auth"] = 1
