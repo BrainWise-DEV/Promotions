@@ -410,7 +410,9 @@ def _apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_
 				free_items_map.pop(key, None)
 
 		scheme_item_count = len(full_rule.get("items") or [])
-		aggregate = should_aggregate_gwp_quantities(full_rule.apply_on, scheme_item_count)
+		aggregate = should_aggregate_gwp_quantities(
+			full_rule.apply_on, scheme_item_count, cint(full_rule.get("mixed_conditions"))
+		)
 		paid_qty_basis = full_rule.get("gwp_paid_qty_basis") or GWP_BASIS_MAX
 		slab_free_qty = flt(full_rule.free_qty or 0)
 		promotional_scheme = rule_map[rule_name].get("promotional_scheme")
