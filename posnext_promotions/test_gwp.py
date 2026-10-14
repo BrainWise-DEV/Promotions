@@ -69,6 +69,8 @@ class TestGwpDiscount(unittest.TestCase):
 		self.assertTrue(should_aggregate_gwp_quantities("Item Group", 0))
 		self.assertTrue(should_aggregate_gwp_quantities("Item Code", 3))
 		self.assertFalse(should_aggregate_gwp_quantities("Item Code", 1))
+		self.assertTrue(should_aggregate_gwp_quantities("Brand", 0))
+		self.assertTrue(should_aggregate_gwp_quantities("Item Code", 1, mixed_conditions=1))
 
 	def test_item_group_matching_uses_child_table(self):
 		rule = {

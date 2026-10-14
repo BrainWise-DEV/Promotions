@@ -81,10 +81,18 @@ def item_matches_pricing_rule_apply_on(item, rule) -> bool:
 	return item_value in _pricing_rule_apply_on_values(rule)
 
 
-def should_aggregate_gwp_quantities(apply_on, scheme_item_count=0):
-	"""Aggregate cart qty when scheme targets an item group or multiple item codes."""
+def should_aggregate_gwp_quantities(apply_on, scheme_item_count=0, mixed_conditions=0):
+	"""Aggregate cart qty when scheme targets an item group, a brand, multiple
+	item codes, or has Mixed Conditions on.
+
+	Brand scopes must aggregate too: "Buy 2 get 1 (cheapest) free" on a brand
+	with three different SKUs at qty 1 each never reaches min_qty per line, so
+	the rule was reported as applied while no line got a discount.
+	"""
 	apply_on = (apply_on or "").strip()
-	if apply_on == "Item Group":
+	if apply_on in ("Item Group", "Brand"):
+		return True
+	if mixed_conditions and apply_on in ("Item Code", "Item Group", "Brand"):
 		return True
 	if apply_on == "Item Code" and flt(scheme_item_count) > 1:
 		return True
