@@ -360,6 +360,8 @@ def create_promotion(data):
 		)
 		if data.get("promotion_type") and hasattr(scheme, "promotion_type"):
 			scheme.promotion_type = data.get("promotion_type")
+		if "apply_with_ff" in data and hasattr(scheme, "apply_with_ff"):
+			scheme.apply_with_ff = cint(data.get("apply_with_ff"))
 
 		# Set applicable for
 		if data.get("applicable_for"):
@@ -493,6 +495,8 @@ def update_promotion(scheme_name, data):
 			scheme.disable = cint(data["disable"])
 		if "promotion_type" in data and hasattr(scheme, "promotion_type"):
 			scheme.promotion_type = data.get("promotion_type") or ""
+		if "apply_with_ff" in data and hasattr(scheme, "apply_with_ff"):
+			scheme.apply_with_ff = cint(data.get("apply_with_ff"))
 
 		if "gift_pool_items" in data and hasattr(scheme, "gift_pool_items"):
 			scheme.set("gift_pool_items", [])

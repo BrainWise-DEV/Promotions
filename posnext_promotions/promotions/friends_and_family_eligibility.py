@@ -32,6 +32,7 @@ from posnext_promotions.promotions.friends_and_family import (
 	FriendsAndFamilyProgram,
 	get_active_program,
 	get_settings,
+	profile_allows_ff,
 )
 
 BASIS_GROUP_OR_FLAG = "Customer Group or Flag"
@@ -58,6 +59,8 @@ CUSTOMER_FLAG_FIELD_SPEC = {
 
 REASON_NO_CUSTOMER = "no_customer"
 REASON_PROGRAM_INACTIVE = "program_inactive"
+# The POS Profile has "Allow F&F" unticked: F&F is off for the whole profile.
+REASON_PROFILE_NOT_ALLOWED = "profile_not_allowed"
 REASON_CUSTOMER_NOT_FOUND = "customer_not_found"
 REASON_CUSTOMER_DISABLED = "customer_disabled"
 REASON_CUSTOMER_GROUP = "customer_group"
@@ -85,6 +88,8 @@ class CustomerEligibility:
 			return _("Select a customer to check Friends & Family eligibility")
 		if self.reason == REASON_PROGRAM_INACTIVE:
 			return _("The Friends & Family program is not active")
+		if self.reason == REASON_PROFILE_NOT_ALLOWED:
+			return _("Friends & Family is not allowed on this POS Profile")
 		if self.reason == REASON_CUSTOMER_NOT_FOUND:
 			return _("Customer {0} not found").format(self.customer)
 		if self.reason == REASON_CUSTOMER_DISABLED:
@@ -157,9 +162,18 @@ def match_customer_group(customer_group: str | None, eligible_groups) -> str | N
 	return ancestors[0] if ancestors else None
 
 
-def get_customer_eligibility(customer: str | None, on_date=None) -> CustomerEligibility:
-	"""Whether ``customer`` gets Friends & Family on ``on_date`` (today when omitted), and why."""
+def get_customer_eligibility(
+	customer: str | None, on_date=None, pos_profile: str | None = None
+) -> CustomerEligibility:
+	"""Whether ``customer`` gets Friends & Family on ``on_date`` (today when omitted), and why.
+
+	With ``pos_profile`` the profile's **Allow F&F** check is enforced first: when
+	it is off nothing applies, whoever the customer is (``program`` stays ``None``
+	so every caller treats it as "no program").
+	"""
 	customer = cstr(customer).strip() or None
+	if not profile_allows_ff(pos_profile):
+		return CustomerEligibility(customer=customer, eligible=False, reason=REASON_PROFILE_NOT_ALLOWED)
 	if not customer:
 		return CustomerEligibility(customer=None, eligible=False, reason=REASON_NO_CUSTOMER)
 
@@ -197,13 +211,15 @@ def get_customer_eligibility(customer: str | None, on_date=None) -> CustomerElig
 	return CustomerEligibility(eligible=False, reason=REASON_NOT_ELIGIBLE, **result)
 
 
-def is_customer_eligible(customer: str | None, on_date=None) -> bool:
-	return get_customer_eligibility(customer, on_date).eligible
+def is_customer_eligible(customer: str | None, on_date=None, pos_profile: str | None = None) -> bool:
+	return get_customer_eligibility(customer, on_date, pos_profile).eligible
 
 
-def get_program_for_customer(customer: str | None, on_date=None) -> FriendsAndFamilyProgram | None:
+def get_program_for_customer(
+	customer: str | None, on_date=None, pos_profile: str | None = None
+) -> FriendsAndFamilyProgram | None:
 	"""The program to apply for this customer, or ``None``. The engine's single entry point."""
-	eligibility = get_customer_eligibility(customer, on_date)
+	eligibility = get_customer_eligibility(customer, on_date, pos_profile)
 	return eligibility.program if eligibility.eligible else None
 
 

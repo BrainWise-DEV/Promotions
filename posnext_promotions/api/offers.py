@@ -996,7 +996,11 @@ def get_active_coupons(customer: str | None = None, company: str | None = None) 
 
 @frappe.whitelist()
 def validate_coupon(
-	coupon_code: str, customer: str | None = None, company: str | None = None, items=None
+	coupon_code: str,
+	customer: str | None = None,
+	company: str | None = None,
+	items=None,
+	pos_profile: str | None = None,
 ) -> dict:
 	"""Validate a coupon code and optionally compute line-level discounts for cart items.
 
@@ -1004,15 +1008,20 @@ def validate_coupon(
 	single best discount (vs Friends & Family and existing promotions; tie →
 	F&F). The response carries a ``best_discount`` explanation; a coupon that
 	wins nothing returns ``valid: False`` with ``reason: better_discount_exists``.
+
+	``pos_profile`` (optional): a profile with **Allow F&F** off takes F&F out of the
+	comparison, so the coupon is never compared with (or suppressed by) F&F there.
 	"""
-	return _validate_coupon(coupon_code, customer, company, items=items, resolve_best=True)
+	return _validate_coupon(
+		coupon_code, customer, company, items=items, resolve_best=True, pos_profile=pos_profile
+	)
 
 
-def _fnf_hint(customer) -> dict | None:
+def _fnf_hint(customer, pos_profile=None) -> dict | None:
 	"""Without cart items we cannot compare — tell the POS the customer has F&F."""
 	from posnext_promotions.promotions.friends_and_family_eligibility import get_customer_eligibility
 
-	eligibility = get_customer_eligibility(customer)
+	eligibility = get_customer_eligibility(customer, pos_profile=pos_profile)
 	if not eligibility.eligible:
 		return None
 	pct = flt(eligibility.program.discount_percentage)
@@ -1030,7 +1039,9 @@ def _fnf_hint(customer) -> dict | None:
 	}
 
 
-def _validate_coupon(coupon_code, customer=None, company=None, items=None, resolve_best=True) -> dict:
+def _validate_coupon(
+	coupon_code, customer=None, company=None, items=None, resolve_best=True, pos_profile=None
+) -> dict:
 	if not customer:
 		return {"valid": False, "message": _("Customer is required")}
 	if not company:
@@ -1066,13 +1077,13 @@ def _validate_coupon(coupon_code, customer=None, company=None, items=None, resol
 	}
 
 	if items is None:
-		hint = _fnf_hint(customer)
+		hint = _fnf_hint(customer, pos_profile)
 		if hint:
 			response["friends_and_family"] = hint
 		return response
 
 	if resolve_best:
-		apply_result = resolve_coupon_best_discount(coupon, items, customer=customer)
+		apply_result = resolve_coupon_best_discount(coupon, items, customer=customer, pos_profile=pos_profile)
 	else:
 		apply_result = apply_coupon_to_items(coupon, items)
 	if not apply_result.get("valid"):
@@ -1142,6 +1153,7 @@ def calculate_coupon_discount(
 		customer=customer,
 		items=[_neutral_copy(i) for i in items],
 		posting_date=invoice.get("posting_date"),
+		pos_profile=invoice.get("pos_profile"),
 	)
 	fnf_total = sum(flt(line.get("discount_amount")) for line in fnf.get("items") or [] if line.get("applies"))
 	if fnf_total > 0:
@@ -1150,7 +1162,14 @@ def calculate_coupon_discount(
 		invoice["grand_total"] = 0
 		invoice["net_total"] = 0
 
-	validation = _validate_coupon(coupon_code, customer, company, items=items, resolve_best=False)
+	validation = _validate_coupon(
+		coupon_code,
+		customer,
+		company,
+		items=items,
+		resolve_best=False,
+		pos_profile=invoice.get("pos_profile"),
+	)
 	if not validation.get("valid"):
 		return validation
 

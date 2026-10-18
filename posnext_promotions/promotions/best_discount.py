@@ -35,6 +35,15 @@ rate-based promotion competes fairly with a percentage.
   (plus the other line discounts F&F would have replaced)" — and keeps the
   larger one. Tie → F&F.
 
+Promotional Scheme "Apply with F&F"
+-----------------------------------
+A promotion that comes from a Promotional Scheme only competes with F&F when
+the scheme has ``apply_with_ff`` ticked. When it is unticked and F&F covers the
+line, F&F is applied alone and the scheme is skipped for that line (the
+candidate is kept in the decision, flagged ``skipped``, so the cashier message
+and the log can explain it). Pricing Rules that do not belong to a scheme keep
+competing as before.
+
 Free items / GWP
 ----------------
 Gift and free-unit mechanics (``is_free_item`` rows, GWP and same-item free
@@ -91,6 +100,7 @@ _FNF_DISCOUNT_SOURCE = "friends_and_family"
 
 # Machine outcomes on a decision.
 OUTCOME_FNF_ONLY = "fnf_only"
+OUTCOME_FNF_EXCLUSIVE = "fnf_exclusive"  # scheme without "Apply with F&F": F&F alone
 OUTCOME_FNF_BETTER = "fnf_better"
 OUTCOME_TIE_FNF = "tie_fnf_wins"
 OUTCOME_OTHER_BETTER = "other_better"
@@ -197,9 +207,13 @@ class Candidate:
 	amount: float
 	percentage: float | None = None
 	code: str | None = None  # coupon code / rule name, for labels
+	# True when this candidate may not compete (Promotional Scheme with
+	# "Apply with F&F" unticked): it never wins and is reported as suppressed.
+	skipped: bool = False
 
 	def to_payload(self) -> dict:
 		return {
+			"skipped": self.skipped,
 			"source": self.source,
 			"amount": money(self.amount),
 			"percentage": flt(self.percentage) if self.percentage is not None else None,
@@ -211,7 +225,7 @@ class Candidate:
 
 def pick_best(candidates) -> Candidate | None:
 	"""Largest saving wins; exact tie (to the cent) → lowest tie priority (F&F first)."""
-	live = [c for c in candidates or [] if c and money(c.amount) > 0]
+	live = [c for c in candidates or [] if c and not c.skipped and money(c.amount) > 0]
 	if not live:
 		return None
 	return min(live, key=lambda c: (-money(c.amount), _TIE_PRIORITY.get(c.source, 99)))
@@ -236,6 +250,11 @@ class Decision:
 		return pick_best([c for c in self.candidates if c.source != SOURCE_FRIENDS_AND_FAMILY])
 
 	@property
+	def skipped_other(self) -> Candidate | None:
+		"""A competing candidate that was barred from the comparison (scheme without Apply with F&F)."""
+		return next((c for c in self.candidates if c.skipped and money(c.amount) > 0), None)
+
+	@property
 	def winner_source(self) -> str:
 		return self.winner.source if self.winner else SOURCE_NONE
 
@@ -256,6 +275,8 @@ class Decision:
 		fnf, other = self.fnf, self.best_other
 		fnf_amt = money(fnf.amount) if fnf else 0
 		other_amt = money(other.amount) if other else 0
+		if fnf_amt and self.skipped_other is not None and not other_amt:
+			return OUTCOME_FNF_EXCLUSIVE
 		if not fnf_amt and not other_amt:
 			return OUTCOME_NO_DISCOUNT
 		if not fnf_amt:
@@ -269,7 +290,7 @@ class Decision:
 		return OUTCOME_OTHER_BETTER
 
 	def messages(self) -> dict:
-		return build_messages(self.outcome, self.fnf, self.best_other)
+		return build_messages(self.outcome, self.fnf, self.best_other or self.skipped_other)
 
 	def to_payload(self) -> dict:
 		msgs = self.messages()
@@ -350,6 +371,9 @@ def build_messages(outcome: str, fnf: Candidate | None, other: Candidate | None)
 	elif outcome == OUTCOME_OTHER_BETTER:
 		en = "{1} ({2}) is better than the Friends & Family discount ({0}) — {1} applied instead of Friends & Family."
 		ar = "{1} ({2}) أفضل من خصم الأصدقاء والعائلة ({0}) — تم تطبيق {1} بدلاً من خصم الأصدقاء والعائلة."
+	elif outcome == OUTCOME_FNF_EXCLUSIVE:
+		en = "Friends & Family discount ({0}) applied — {1} ({2}) is not combined or compared with Friends & Family, so it was skipped."
+		ar = "تم تطبيق خصم الأصدقاء والعائلة ({0}) — {1} ({2}) لا يُقارن مع خصم الأصدقاء والعائلة، لذلك تم تجاهله."
 	elif outcome == OUTCOME_FNF_ONLY:
 		en = "Friends & Family discount ({0}) applied."
 		ar = "تم تطبيق خصم الأصدقاء والعائلة ({0})."

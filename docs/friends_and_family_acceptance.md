@@ -336,3 +336,46 @@ for the future e-mail/OTP enrolment; Customer Group / Flag eligibility is unchan
 
 QA: open `/app/friends-and-family-settings` → use the grid buttons, save; `/app/friends-and-family-message`
 → create the records you need (none by default); in a console, `is_approved_email("x@miraaya.com")` → True, `"x@gmail.com"` → False.
+
+## Apply with F&F (Promotional Scheme) & Allow F&F (POS Profile) (2026-10-18)
+
+### A. Promotional Scheme → **Apply with F&F** (`apply_with_ff`, Check, default 0)
+
+| Scheme check | Line is covered by F&F | Result |
+|---|---|---|
+| ☑ checked | yes | Scheme % vs F&F % (compared as money saved, so a fixed-amount slab competes fairly). **Larger wins, F&F wins a tie.** The loser is detached (same as PN-128). |
+| ☐ unchecked | yes | **F&F only.** The scheme is skipped for that line even if its % is bigger. `best_discount.outcome = fnf_exclusive`, the scheme is listed in `suppressed`, and its Pricing Rule is returned in `suppressed_pricing_rules`. |
+| any | no (excluded / out of scope / customer not eligible / program off / cap exhausted) | The scheme applies as usual. |
+
+Notes: only promotions that come from a Promotional Scheme are affected (the line's `pricing_rules`
+are traced to `Pricing Rule.promotional_scheme`); plain Pricing Rules, coupons and manual discounts
+still compete as before. If one line carries several schemes, a single unchecked scheme makes the
+line "F&F only". New schemes default to **unchecked**, so tick the box on every scheme that should
+compete with F&F (existing schemes are **not** back-filled).
+
+QA: scheme 10% / 40% with the box unticked + F&F 30% → the line gets 30% (F&F), not 40%. Tick the
+box → 40% scheme wins; scheme 30% → tie → F&F; scheme 10% → F&F.
+
+### B. POS Profile → **Allow F&F** (`allow_friends_family`, Check, default 1)
+
+Unticked = F&F is completely off on that profile:
+
+* no F&F discount on cart lines or on the saved invoice (a stale F&F stamp is stripped and the
+  discount it replaced comes back),
+* no F&F badge / messages in the POS (`check_friends_and_family_eligibility` →
+  `eligible: false`, `reason: profile_not_allowed`; `apply_friends_and_family_discount` and the
+  `friends_and_family` block of `apply_offers` → not applicable),
+* `get_friends_and_family_program(pos_profile=…)` → `{"active": false}`,
+* coupons are no longer compared with F&F on that profile (`validate_coupon(pos_profile=…)`),
+* nothing is written to the Friends and Family Log for those invoices.
+
+Default is **1** (ticked): existing profiles — and callers that send no `pos_profile` — keep working.
+The server derives the profile from the invoice (`pos_profile` on the POS Invoice / `apply_offers`
+payload); the POS front-end also sends it on the F&F / coupon calls.
+
+QA: `/app/pos-profile/<profile>` → untick **Allow F&F** → add an item for an F&F customer in the POS:
+no badge, full price; save/submit the invoice: no F&F rows in `/app/friends-and-family-log`.
+Tick it again → F&F applies.
+
+Automated: `bench --site <dev-site> run-tests --app posnext_promotions --module posnext_promotions.posnext_promotions.doctype.friends_and_family_settings.test_friends_and_family_scheme_profile`
+(known pre-existing failures unrelated to this change: `test_friends_and_family_best_discount.test_invoice_header_discount_weaker_than_fnf_is_removed`, `test_friends_and_family_acceptance.test_10_coupon_vs_fnf`).
