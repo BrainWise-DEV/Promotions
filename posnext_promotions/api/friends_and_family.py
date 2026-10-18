@@ -10,7 +10,7 @@ import json
 import frappe
 from frappe.utils import cstr
 
-from posnext_promotions.promotions.friends_and_family import get_active_program
+from posnext_promotions.promotions.friends_and_family import get_active_program, profile_allows_ff
 from posnext_promotions.promotions.friends_and_family_apply import (
 	apply_friends_and_family_to_items,
 	compute_friends_and_family_discounts,
@@ -33,14 +33,15 @@ def _parse_items(items):
 
 
 @frappe.whitelist()
-def get_friends_and_family_program(posting_date: str | None = None) -> dict:
+def get_friends_and_family_program(posting_date: str | None = None, pos_profile: str | None = None) -> dict:
 	"""The live program for ``posting_date`` (today when omitted).
 
 	Returns ``{"active": False}`` when the program is disabled, outside its
 	dates, or has nothing in scope. Clients should re-fetch rather than cache
 	indefinitely so admin changes take effect on the next recalculation.
+	A ``pos_profile`` with **Allow F&F** off always gets ``{"active": False}``.
 	"""
-	program = get_active_program(posting_date)
+	program = get_active_program(posting_date) if profile_allows_ff(pos_profile) else None
 	if program is None:
 		return {"active": False}
 	payload = program.to_client_payload()
@@ -49,12 +50,15 @@ def get_friends_and_family_program(posting_date: str | None = None) -> dict:
 
 
 @frappe.whitelist()
-def check_friends_and_family_eligibility(customer: str | None = None, posting_date: str | None = None) -> dict:
+def check_friends_and_family_eligibility(
+	customer: str | None = None, posting_date: str | None = None, pos_profile: str | None = None
+) -> dict:
 	"""Call when the cashier sets the invoice customer.
 
 	Returns ``eligible``, a machine ``reason`` (``customer_group``,
 	``customer_flag``, ``not_eligible``, ``program_inactive``, ``no_customer``,
-	``customer_not_found``, ``customer_disabled``), a cashier-facing ``message``,
+	``customer_not_found``, ``customer_disabled``, ``profile_not_allowed`` when
+	the POS Profile has **Allow F&F** off), a cashier-facing ``message``,
 	and — only when eligible — ``discount_percentage`` and the ``program``.
 
 	Informational only: server-side pricing re-checks through
@@ -65,7 +69,7 @@ def check_friends_and_family_eligibility(customer: str | None = None, posting_da
 	customer = cstr(customer).strip()
 	if customer and frappe.db.exists("Customer", customer):
 		frappe.has_permission("Customer", "read", doc=customer, throw=True)
-	return get_customer_eligibility(customer, posting_date).to_client_payload()
+	return get_customer_eligibility(customer, posting_date, pos_profile).to_client_payload()
 
 
 @frappe.whitelist()
@@ -74,6 +78,7 @@ def apply_friends_and_family_discount(
 	items=None,
 	posting_date: str | None = None,
 	mutate: int | str | None = 1,
+	pos_profile: str | None = None,
 ) -> dict:
 	"""Compute (and optionally stamp) Friends & Family line discounts.
 
@@ -89,6 +94,9 @@ def apply_friends_and_family_discount(
 	                ``discount_source``. Catalog fields are backfilled from Item.
 	        posting_date: Invoice posting date (defaults to today). After the
 	                program end date, auto-apply stops immediately.
+	        pos_profile: POS Profile of the sale. With **Allow F&F** off nothing is
+	                applied (``eligible`` false, ``reason`` ``profile_not_allowed``) and
+	                a stale F&F stamp on the lines is stripped.
 	        mutate: When truthy (default), return lines with F&F stamped where it
 	                wins. When falsy, return a read-only decision without mutating.
 
@@ -127,6 +135,10 @@ def apply_friends_and_family_discount(
 	from frappe.utils import cint
 
 	if cint(mutate):
-		return apply_friends_and_family_to_items(lines, customer=customer, posting_date=posting_date)
+		return apply_friends_and_family_to_items(
+			lines, customer=customer, posting_date=posting_date, pos_profile=pos_profile
+		)
 
-	return compute_friends_and_family_discounts(customer=customer, items=lines, posting_date=posting_date)
+	return compute_friends_and_family_discounts(
+		customer=customer, items=lines, posting_date=posting_date, pos_profile=pos_profile
+	)

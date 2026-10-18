@@ -245,6 +245,10 @@ def log_invoice_submit(doc, method=None):
 				)
 		return
 
+	if payload.get("reason") == "profile_not_allowed":
+		# POS Profile has "Allow F&F" off: F&F is disabled there — nothing to log.
+		return
+
 	lines = payload.get("items") or []
 	if not payload.get("eligible") and not any(ln.get("reason") == "stripped" for ln in lines):
 		return

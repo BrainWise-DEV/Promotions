@@ -1118,6 +1118,7 @@ def _friends_and_family_only_response(items, prepared_items, customer, invoice) 
 		prepared_items,
 		customer=customer,
 		posting_date=invoice.get("posting_date") or nowdate(),
+		pos_profile=invoice.get("pos_profile"),
 	)
 	if not ff_result.get("eligible"):
 		# Keep the cart as sent, minus any stale F&F stamp (e.g. customer
@@ -1809,6 +1810,7 @@ def apply_offers(invoice_data, selected_offers=None):
 			prepared_items,
 			customer=customer,
 			posting_date=invoice.get("posting_date") or nowdate(),
+			pos_profile=invoice.get("pos_profile"),
 		)
 
 		# Fold the item-level discounts decided above back into `pricing_items`

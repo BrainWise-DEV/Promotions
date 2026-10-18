@@ -131,8 +131,31 @@ class FriendsAndFamilyProgram:
 		}
 
 
+# Custom Field on POS Profile (posnext_promotions/custom/pos_profile.json).
+PROFILE_ALLOW_FIELD = "allow_friends_family"
+# Custom Field on Promotional Scheme (posnext_promotions/custom/promotional_scheme.json).
+SCHEME_APPLY_WITH_FF_FIELD = "apply_with_ff"
+
+
 def get_settings():
 	return frappe.get_cached_doc(SETTINGS_DOCTYPE)
+
+
+def profile_allows_ff(pos_profile) -> bool:
+	"""Whether F&F may run on ``pos_profile`` (the **Allow F&F** check).
+
+	No profile (desk / API calls without one), an unknown profile, or a site
+	where the field is not installed yet all mean "allowed", so existing setups
+	keep working. A blank value (row created before the field existed) counts as
+	allowed too; only an explicit 0 turns F&F off for the profile.
+	"""
+	pos_profile = cstr(pos_profile).strip()
+	if not pos_profile:
+		return True
+	if not frappe.get_meta("POS Profile").has_field(PROFILE_ALLOW_FIELD):
+		return True
+	value = frappe.db.get_value("POS Profile", pos_profile, PROFILE_ALLOW_FIELD)
+	return True if value is None else bool(cint(value))
 
 
 def is_within_dates(settings, on_date=None) -> bool:

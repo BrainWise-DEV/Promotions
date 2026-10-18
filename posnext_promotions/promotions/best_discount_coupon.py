@@ -63,13 +63,16 @@ def _neutral_copy(item):
 	return line
 
 
-def _capped_fnf_candidates(items, customer, posting_date) -> dict:
+def _capped_fnf_candidates(items, customer, posting_date, pos_profile=None) -> dict:
 	"""F&F the customer would get per line *without* the coupon — caps (PN-129) included.
 
 	The coupon then competes with that (possibly cap-reduced) F&F saving.
 	"""
 	plan = compute_friends_and_family_discounts(
-		customer=customer, items=[_neutral_copy(i) for i in items], posting_date=posting_date
+		customer=customer,
+		items=[_neutral_copy(i) for i in items],
+		posting_date=posting_date,
+		pos_profile=pos_profile,
 	)
 	candidates = {}
 	for line in plan.get("items") or []:
@@ -113,13 +116,13 @@ def is_line_level_coupon(coupon) -> bool:
 	return cstr(coupon.get("discount_type")) == "Percentage" and not flt(coupon.get("max_amount"))
 
 
-def resolve_coupon_best_discount(coupon, items, customer=None, posting_date=None) -> dict:
+def resolve_coupon_best_discount(coupon, items, customer=None, posting_date=None, pos_profile=None) -> dict:
 	"""Coupon result restricted to where the coupon is the best single discount."""
 	from posnext_promotions.api.coupon_engine import apply_coupon_to_items
 
 	code = cstr(coupon.get("coupon_code")).upper()
 	items = enrich_items_with_catalog([frappe._dict(dict(i)) for i in items or []])
-	eligibility = get_customer_eligibility(customer, posting_date)
+	eligibility = get_customer_eligibility(customer, posting_date, pos_profile)
 	program = eligibility.program if eligibility.eligible else None
 
 	result = apply_coupon_to_items(coupon, [_neutral_copy(i) for i in items])
@@ -127,7 +130,7 @@ def resolve_coupon_best_discount(coupon, items, customer=None, posting_date=None
 		result["best_discount"] = bd.summarize([])
 		return result
 
-	fnf_by_line = _capped_fnf_candidates(items, customer, posting_date) if program is not None else {}
+	fnf_by_line = _capped_fnf_candidates(items, customer, posting_date, pos_profile) if program is not None else {}
 	updates = list(result.get("line_updates") or [])
 	pct = flt(coupon.get("discount_percentage")) if cstr(coupon.get("discount_type")) == "Percentage" else None
 	rows = []
