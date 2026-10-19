@@ -216,3 +216,22 @@ class TestFriendsandFamilySettings(FrappeTestCase):
 		self._configure(excluded_brands=[{"brand": OTHER_BRAND}])
 		program = get_active_program("2026-10-05")
 		self.assertFalse(program.covers(_line(brand=OTHER_BRAND)))
+
+	def test_brand_placeholder_uses_default_company(self):
+		"""``{brand}`` in Friends and Family Message texts = the default Company (no Settings field)."""
+		from unittest.mock import patch
+
+		from frappe.utils import cstr
+
+		from posnext_promotions.promotions import friends_and_family_messages as ffm
+
+		company = cstr(
+			frappe.defaults.get_global_default("company")
+			or frappe.db.get_single_value("Global Defaults", "default_company")
+		)
+		self.assertEqual(ffm._default_brand(), company)
+		records = {ffm.EVENT_FF_ACTIVATED: {"ar": "", "en": "Enjoy shopping at {brand}!"}}
+		with patch.object(ffm, "_load_records", return_value=records):
+			msg = ffm.get_customer_message(ffm.EVENT_FF_ACTIVATED)
+			self.assertEqual(msg["en"], f"Enjoy shopping at {company}!")
+			self.assertEqual(ffm.get_customer_message(ffm.EVENT_FF_ACTIVATED, brand="X")["en"], "Enjoy shopping at X!")

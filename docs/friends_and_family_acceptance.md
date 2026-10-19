@@ -66,7 +66,6 @@ POS Coupons (لو POS Next متسطب): `FFDEMO15` (15%) و`FFDEMO40` (40%)، ا
 | Discount Scope | **Discount Scope** | Entire Cart |
 | Exclusions | **Excluded Items** | `FF Demo Gift Card` |
 | Exclusions | **Excluded Brands** | `FF Demo Brand X` |
-| Customer Messages | **Brand Name** | فاضي (بيستخدم اسم الـ Company في `{brand}`) |
 
 اضغط **Save**. من زرار **View** في نفس الصفحة هتلاقي: **Audit Log**، **Settings Changes**، **Version History**، **Performance Report**.
 
@@ -305,8 +304,8 @@ read-only event name / description / placeholders, `enabled`, `message_ar` (requ
 `message_en`. **No messages are seeded.** A message is used only if both it and its event are enabled.
 
 Helper: `promotions.friends_and_family_messages.get_customer_message(event_code, context=None)` →
-`{event, ar, en, message}` or `None`. `{percent}` = Settings %, `{brand}` = Settings → *Brand Name*,
-else default Company; any other `{key}` comes from `context`; unknown placeholders stay as typed.
+`{event, ar, en, message}` or `None`. `{percent}` = Settings %, `{brand}` = default Company name;
+any other `{key}` comes from `context`; unknown placeholders stay as typed.
 
 Adding a custom event: create a *Friends and Family Message Event* (e.g. `birthday_offer`), create a
 *Friends and Family Message* for it, then call from code or a hook:

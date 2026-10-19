@@ -35,9 +35,7 @@
   "exclusions_section",
   "excluded_items",
   "excluded_item_groups",
-  "excluded_brands",
-  "messages_section",
-  "brand_name"
+  "excluded_brands"
  ],
  "fields": [
   {
@@ -231,23 +229,11 @@
    "label": "Excluded Brands",
    "options": "Friends and Family Excluded Brand",
    "description": "Brands listed here stay at standard price when scope is Entire Cart."
-  },
-  {
-   "fieldname": "messages_section",
-   "description": "Customer-facing texts live in Friends and Family Message (one per Friends and Family Message Event).",
-   "fieldtype": "Section Break",
-   "label": "Customer Messages"
-  },
-  {
-   "fieldname": "brand_name",
-   "fieldtype": "Data",
-   "label": "Brand Name",
-   "description": "Replaces {brand} in Friends and Family Message texts. Blank = default Company name."
   }
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-10-19 14:30:00.000000",
+ "modified": "2026-10-19 16:10:00.000000",
  "modified_by": "Administrator",
  "module": "POSNext Promotions",
  "name": "Friends and Family Settings",

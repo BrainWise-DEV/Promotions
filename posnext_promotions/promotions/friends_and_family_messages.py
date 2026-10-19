@@ -12,7 +12,7 @@ Two doctypes:
 ``get_customer_message(event_code, context=None)`` returns
 ``{"event", "ar", "en", "message"}`` for an enabled message whose event is
 enabled, or ``None``. Placeholders: ``{percent}`` (Settings discount %),
-``{brand}`` (Settings "Brand Name", else default Company) plus any key in
+``{brand}`` (default Company name) plus any key in
 ``context``. Unknown placeholders are left untouched.
 """
 
@@ -139,10 +139,7 @@ def _settings_value(fieldname):
 
 
 def _default_brand() -> str:
-	"""Settings "Brand Name", else the default Company name, else empty."""
-	brand = cstr(_settings_value("brand_name")).strip()
-	if brand:
-		return brand
+	"""The default Company name (``{brand}``), else empty."""
 	try:
 		return cstr(frappe.defaults.get_global_default("company") or frappe.db.get_single_value("Global Defaults", "default_company"))
 	except Exception:

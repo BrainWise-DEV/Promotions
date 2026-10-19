@@ -394,8 +394,8 @@ class TestFriendsAndFamilyLog(FrappeTestCase):
 	def test_settings_diff_helper(self):
 		doc = frappe.get_single("Friends and Family Settings")
 		copy = frappe.copy_doc(doc)
-		copy.brand_name = "Changed {0}".format(doc.brand_name or "")
-		self.assertEqual(list(settings_diff(doc, copy)), ["brand_name"])
+		copy.discount_percentage = flt(doc.discount_percentage) + 1
+		self.assertEqual(list(settings_diff(doc, copy)), ["discount_percentage"])
 		self.assertEqual(settings_diff(doc, doc), {})
 
 	def test_settings_and_customer_have_version_history(self):

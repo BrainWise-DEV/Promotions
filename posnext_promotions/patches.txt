@@ -8,3 +8,4 @@ posnext_promotions.patches.v2_3_0.add_gift_pool_promotion_type
 posnext_promotions.patches.v2_3_0.rehome_gift_pool_item_doctype
 posnext_promotions.patches.v2_6_0.ff_message_event_to_link
 posnext_promotions.patches.v2_6_0.drop_ff_settings_user_message
+posnext_promotions.patches.v2_6_0.drop_ff_settings_brand_name
