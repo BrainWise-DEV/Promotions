@@ -83,7 +83,9 @@ class CustomerEligibility:
 	@property
 	def message(self) -> str:
 		if self.eligible:
-			return self.program.user_message or _("Customer is eligible for Friends & Family")
+			# Configured "ff_activated" Friends and Family Message, else a generic note.
+			customer_message = self.customer_message or {}
+			return customer_message.get("message") or _("Customer is eligible for Friends & Family")
 		if self.reason == REASON_NO_CUSTOMER:
 			return _("Select a customer to check Friends & Family eligibility")
 		if self.reason == REASON_PROGRAM_INACTIVE:

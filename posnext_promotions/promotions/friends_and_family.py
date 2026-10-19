@@ -56,7 +56,6 @@ class FriendsAndFamilyProgram:
 	excluded_item_groups: frozenset[str]
 	start_date: str | None
 	end_date: str | None
-	user_message: str
 	# PN-129 caps (money). 0 = no cap.
 	max_discount_per_order: float = 0.0
 	max_discount_per_customer_month: float = 0.0
@@ -125,7 +124,6 @@ class FriendsAndFamilyProgram:
 			"excluded_item_groups": sorted(self.excluded_item_groups),
 			"start_date": self.start_date,
 			"end_date": self.end_date,
-			"user_message": self.user_message,
 			"max_discount_per_order": self.max_discount_per_order,
 			"max_discount_per_customer_month": self.max_discount_per_customer_month,
 		}
@@ -226,7 +224,6 @@ def get_active_program(on_date=None) -> FriendsAndFamilyProgram | None:
 		excluded_item_groups=excluded_item_groups,
 		start_date=cstr(settings.start_date) if settings.get("start_date") else None,
 		end_date=cstr(settings.end_date) if settings.get("end_date") else None,
-		user_message=cstr(settings.get("user_message")),
 		max_discount_per_order=max(0.0, flt(settings.get("max_discount_per_order"))),
 		max_discount_per_customer_month=max(0.0, flt(settings.get("max_discount_per_customer_month"))),
 	)

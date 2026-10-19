@@ -96,7 +96,7 @@ REASON_CAP_REACHED = "cap_reached"
 def _coverage_message(program, items, applied_count: int, eligibility_message: str) -> str:
 	"""Cart-level note when the customer is eligible but nothing received F&F."""
 	if applied_count > 0:
-		return eligibility_message or (program.user_message if program else "")
+		return eligibility_message or ""
 	paid = [
 		i
 		for i in (items or [])
@@ -724,7 +724,6 @@ def _base_payload(eligibility, program) -> dict:
 		# Central rate. 0 when the customer cannot receive F&F on this date.
 		"discount_percentage": flt(program.discount_percentage) if program else 0.0,
 		"discount_scope": program.discount_scope if program else None,
-		"user_message": program.user_message if program else "",
 		"items": [],
 		"applied_count": 0,
 	}

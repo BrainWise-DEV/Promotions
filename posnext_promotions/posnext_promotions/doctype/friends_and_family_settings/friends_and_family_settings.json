@@ -37,7 +37,6 @@
   "excluded_item_groups",
   "excluded_brands",
   "messages_section",
-  "user_message",
   "brand_name"
  ],
  "fields": [
@@ -235,15 +234,9 @@
   },
   {
    "fieldname": "messages_section",
+   "description": "Customer-facing texts live in Friends and Family Message (one per Friends and Family Message Event).",
    "fieldtype": "Section Break",
-   "label": "Customer Message"
-  },
-  {
-   "default": "You have received the Miraaya Friends & Family offer!",
-   "description": "Shown to eligible customers after verification (engine/UI tasks later).",
-   "fieldname": "user_message",
-   "fieldtype": "Small Text",
-   "label": "User Message"
+   "label": "Customer Messages"
   },
   {
    "fieldname": "brand_name",
@@ -254,7 +247,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-10-13 14:20:00.000000",
+ "modified": "2026-10-19 14:30:00.000000",
  "modified_by": "Administrator",
  "module": "POSNext Promotions",
  "name": "Friends and Family Settings",

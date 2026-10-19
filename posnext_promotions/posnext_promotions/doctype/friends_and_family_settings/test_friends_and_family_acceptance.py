@@ -38,6 +38,7 @@ from posnext_promotions.promotions.friends_and_family_caps import (
 )
 from posnext_promotions.promotions.friends_and_family_demo import build_demo_data, setup_demo_data
 from posnext_promotions.promotions.friends_and_family_eligibility import FLAG_FIELD
+from posnext_promotions.promotions.friends_and_family_messages import EVENT_FF_ACTIVATED, get_customer_message
 
 PREFIX = "_Test FF Acc"
 FNF = "friends_and_family"
@@ -221,7 +222,12 @@ class TestFriendsAndFamilyAcceptance(FrappeTestCase):
 		self.assertEqual(laptop.get(FIELD_DISCOUNT_SOURCE), FNF)
 		self.assertEqual(flt(laptop.get(FIELD_FNF_AMOUNT)), 300)
 		self.assertEqual(flt(phone.get(FIELD_FNF_AMOUNT)), 300)
-		self.assertEqual(self._payload(doc)["message"], frappe.get_single("Friends and Family Settings").user_message)
+		# Eligible message = the configured "ff_activated" Friends and Family Message, else the generic note.
+		activated = get_customer_message(EVENT_FF_ACTIVATED, percent=friends_and_family_demo.DISCOUNT_PERCENTAGE) or {}
+		self.assertEqual(
+			self._payload(doc)["message"],
+			activated.get("message") or frappe._("Customer is eligible for Friends & Family"),
+		)
 		logs = self._logs(doc)
 		self.assertEqual({(log.log_type, log.item_code) for log in logs}, {
 			("Discount Applied", self.items["laptop"]),
@@ -304,7 +310,7 @@ class TestFriendsAndFamilyAcceptance(FrappeTestCase):
 		"no promotion applies" path and the full pricing path."""
 		block_keys = {
 			"eligible", "discount_percentage", "applied_count", "message", "reason",
-			"user_message", "items", "caps", "cap_hit",
+			"items", "caps", "cap_hit",
 		}
 
 		def call(customer, *keys):

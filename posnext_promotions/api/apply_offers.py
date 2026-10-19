@@ -1102,7 +1102,6 @@ def _friends_and_family_response_block(ff_result) -> dict:
 		"applied_count": ff_result.get("applied_count"),
 		"message": ff_result.get("message"),
 		"reason": ff_result.get("reason"),
-		"user_message": ff_result.get("user_message"),
 		"items": ff_result.get("items"),
 		# PN-129: per-order / monthly caps — limits, usage, remaining, EN/AR message.
 		"caps": ff_result.get("caps"),

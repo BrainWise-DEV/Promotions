@@ -136,7 +136,6 @@ class TestFriendsAndFamilyLog(FrappeTestCase):
 				"excluded_item_groups": [],
 				"eligibility_basis": "Customer Group or Flag",
 				"eligible_customer_groups": [{"customer_group": FF_GROUP}],
-				"user_message": "Friends & Family applied",
 				"max_discount_per_order": 0,
 				"max_discount_per_customer_month": 0,
 			}
@@ -395,8 +394,8 @@ class TestFriendsAndFamilyLog(FrappeTestCase):
 	def test_settings_diff_helper(self):
 		doc = frappe.get_single("Friends and Family Settings")
 		copy = frappe.copy_doc(doc)
-		copy.user_message = "Changed"
-		self.assertEqual(list(settings_diff(doc, copy)), ["user_message"])
+		copy.brand_name = "Changed {0}".format(doc.brand_name or "")
+		self.assertEqual(list(settings_diff(doc, copy)), ["brand_name"])
 		self.assertEqual(settings_diff(doc, doc), {})
 
 	def test_settings_and_customer_have_version_history(self):

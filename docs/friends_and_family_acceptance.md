@@ -66,7 +66,7 @@ POS Coupons (لو POS Next متسطب): `FFDEMO15` (15%) و`FFDEMO40` (40%)، ا
 | Discount Scope | **Discount Scope** | Entire Cart |
 | Exclusions | **Excluded Items** | `FF Demo Gift Card` |
 | Exclusions | **Excluded Brands** | `FF Demo Brand X` |
-| Customer Message | **User Message** | `Friends & Family discount applied / تم تطبيق خصم الأصدقاء والعائلة` |
+| Customer Messages | **Brand Name** | فاضي (بيستخدم اسم الـ Company في `{brand}`) |
 
 اضغط **Save**. من زرار **View** في نفس الصفحة هتلاقي: **Audit Log**، **Settings Changes**، **Version History**، **Performance Report**.
 
@@ -97,7 +97,7 @@ POS Coupons (لو POS Next متسطب): `FFDEMO15` (15%) و`FFDEMO40` (40%)، ا
 - Laptop: **Discount (%)** = 30، **Rate** = 700.
 - Phone: Rate = 350 (لكل واحدة).
 - **Net Total** = 1400 (بدل 2000).
-- الرسالة = الـ User Message.
+- الرسالة = نص **Friends and Family Message** للـ event `ff_activated` لو متعرّف، وإلا "Customer is eligible for Friends & Family".
 - بعد Submit: في الـ Log سطرين **Discount Applied** (Laptop 300، Phone 300)، Discount Source = `friends_and_family`. المجموع 600.
 
 **1b — مؤهل بالـ flag:** نفس الحالة مع `FF Demo Flagged` و Laptop × 1 → Rate = 700.
@@ -229,7 +229,7 @@ POS Coupons (لو POS Next متسطب): `FFDEMO15` (15%) و`FFDEMO40` (40%)، ا
 response.items[]                      ← السطور بعد التسعير (rate / discount_percentage / discount_amount)
 response.friends_and_family = {
   eligible, discount_percentage, applied_count,
-  message, reason, user_message,
+  message, reason,
   items[] = { item_code, idx, applies, discount_percentage, discount_amount, rate, reason,
               competing_source, competing_amount, fnf_uncapped_amount, capped,
               best_discount{ winner, outcome, candidates[], suppressed[], message_en, message_ar } },
@@ -251,7 +251,7 @@ response.best_discount = { winner, lines[], order, fnf_total, suppressed[], stac
 
 | # | الخطوات | المتوقع في الـ UI | الحقل |
 |---|---|---|---|
-| P1 | اختار `FF Demo Staff` وضيف Laptop | Badge "Friends & Family 30%" على العميل/السلة؛ السطر 1000 مشطوبة ← 700؛ الـ User Message ظاهرة | `eligible`، `discount_percentage`، `items[].applies`، `message` |
+| P1 | اختار `FF Demo Staff` وضيف Laptop | Badge "Friends & Family 30%" على العميل/السلة؛ السطر 1000 مشطوبة ← 700؛ رسالة `ff_activated` ظاهرة (لو متعرّفة) | `eligible`، `discount_percentage`، `items[].applies`، `message` |
 | P2 | اختار `FF Demo Public` | مفيش badge؛ السعر 1000 | `eligible=false` |
 | P3 | P1 وبعدين غيّر العميل لـ Public | السطر يرجع 1000 فورًا من غير F&F | `response.items[]` |
 | P4 | Staff + Gift Card + Headset + Laptop | Gift Card وHeadset عليهم "Excluded" ومن غير خصم؛ Laptop 700 | `items[].reason = excluded` |

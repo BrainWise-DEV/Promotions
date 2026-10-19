@@ -188,7 +188,6 @@ def build_demo_data(prefix: str = DEFAULT_PREFIX, company: str | None = None, pr
 			"excluded_brands": [{"brand": brands["x"]}],
 			"max_discount_per_order": 0,
 			"max_discount_per_customer_month": 0,
-			"user_message": "Friends & Family discount applied / تم تطبيق خصم الأصدقاء والعائلة",
 		}
 	)
 	settings.save(ignore_permissions=True)

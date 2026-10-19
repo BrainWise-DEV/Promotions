@@ -32,6 +32,7 @@ from posnext_promotions.promotions.friends_and_family_eligibility import (
 	FLAG_FIELD,
 	ensure_customer_flag_field,
 )
+from posnext_promotions.promotions.friends_and_family_messages import EVENT_FF_ACTIVATED, get_customer_message
 
 DATE = "2026-10-05"
 FF_GROUP = "_Test FF Caps Customer Group"
@@ -104,7 +105,6 @@ class TestFriendsAndFamilyCaps(FrappeTestCase):
 				"excluded_item_groups": [],
 				"eligibility_basis": "Customer Group",
 				"eligible_customer_groups": [{"customer_group": FF_GROUP}],
-				"user_message": "Friends & Family applied",
 				"max_discount_per_order": 0,
 				"max_discount_per_customer_month": 0,
 			}
@@ -202,7 +202,9 @@ class TestFriendsAndFamilyCaps(FrappeTestCase):
 		self.assertFalse(caps["capped"])
 		self.assertEqual(caps["fnf_applied_total"], 60)
 		self.assertEqual(caps["allowance"], 100)
-		self.assertEqual(payload["message"], "Friends & Family applied")
+		# Eligible message = the "ff_activated" Friends and Family Message, else the generic note.
+		activated = get_customer_message(EVENT_FF_ACTIVATED, percent=30) or {}
+		self.assertEqual(payload["message"], activated.get("message") or frappe._("Customer is eligible for Friends & Family"))
 		self.assertEqual([ln[FIELD_FNF_AMOUNT] for ln in lines], [30, 30])
 		self.assertEqual([ln[FIELD_DISCOUNT_SOURCE] for ln in lines], [DISCOUNT_SOURCE_FRIENDS_AND_FAMILY] * 2)
 

@@ -121,7 +121,6 @@ class TestFriendsAndFamilyApply(FrappeTestCase):
 				"excluded_item_groups": [],
 				"eligibility_basis": "Customer Group",
 				"eligible_customer_groups": [{"customer_group": FF_GROUP}],
-				"user_message": "Friends & Family applied",
 			}
 		)
 		doc.update(values)
