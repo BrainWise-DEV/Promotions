@@ -423,7 +423,9 @@ def _apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_
 				free_items_map.pop(key, None)
 
 		scheme_item_count = len(full_rule.get("items") or [])
-		aggregate = should_aggregate_gwp_quantities(full_rule.apply_on, scheme_item_count)
+		aggregate = should_aggregate_gwp_quantities(
+			full_rule.apply_on, scheme_item_count, cint(full_rule.get("mixed_conditions"))
+		)
 		paid_qty_basis = full_rule.get("gwp_paid_qty_basis") or GWP_BASIS_MAX
 		slab_free_qty = flt(full_rule.free_qty or 0)
 		promotional_scheme = rule_map[rule_name].get("promotional_scheme")
@@ -1795,6 +1797,15 @@ def apply_offers(invoice_data, selected_offers=None):
 		# Surface Min/Max rules in the response so the frontend tracks them as applied.
 		if erpnext_get_applied_pricing_rules:
 			for prepared_item in prepared_items:
+				# Free-gift rows carry the pricing_rules the *previous* response
+				# stamped on them; they are echoed back by the cart, not decided by
+				# this pass. Counting them reported a gift rule (e.g. a min_amt
+				# "spend X get Y" Transaction rule) as applied while free_items was
+				# empty, leaving a stale APPLIED offer in the POS and feeding the
+				# apply/remove loop. Free-item rules are surfaced by the free-item
+				# paths above when they genuinely fire.
+				if prepared_item.get("is_free_item"):
+					continue
 				if not prepared_item.get("pricing_rules"):
 					continue
 				for pr_name in erpnext_get_applied_pricing_rules(prepared_item.get("pricing_rules")):
