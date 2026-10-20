@@ -140,6 +140,16 @@ class FriendsandFamilySettings(Document):
 			seen[domain] = row.idx
 			row.email_domain = domain
 			row.company = (row.company or "").strip()
+		if cint(self.enabled) and not any(
+			cint(row.enabled) and row.email_domain for row in self.get("approved_domains") or []
+		):
+			frappe.throw(
+				_(
+					"Add at least one enabled Approved Domain: Friends & Family members must have a "
+					"verified email on an approved company domain"
+				),
+				title=_("Approved Domain Required"),
+			)
 
 
 def get_friends_and_family_settings():

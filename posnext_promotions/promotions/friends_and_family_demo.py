@@ -29,7 +29,10 @@ Creates (idempotently) everything the manual QA script in
 * POS Coupons ``<CODE>15`` (15%) and ``<CODE>40`` (40%) when the POS Coupon
   DocType (POS Next) is installed.
 * Friends and Family Settings: enabled, 30%, Entire Cart, eligibility
-  "Customer Group or Flag", excluded item Gift Card, excluded brand X, no caps.
+  "Customer Group or Flag", excluded item Gift Card, excluded brand X, no caps,
+  Approved Domain ``ffdemo.example``.
+* Every demo customer gets a verified email ``<name>@ffdemo.example`` (Approved
+  Domains + a verified email are mandatory for F&F).
 
 Run on a dev site only::
 
@@ -49,9 +52,11 @@ from posnext_promotions.promotions.friends_and_family_eligibility import (
 	FLAG_FIELD,
 	ensure_customer_flag_field,
 )
+from posnext_promotions.promotions.friends_and_family_testing import approved_domain_rows, give_verified_email
 
 DEFAULT_PREFIX = "FF Demo"
 DISCOUNT_PERCENTAGE = 30
+DEMO_EMAIL_DOMAIN = "ffdemo.example"
 
 ITEMS = (
 	# key, label, price, brand key, promotion %
@@ -132,6 +137,7 @@ def build_demo_data(prefix: str = DEFAULT_PREFIX, company: str | None = None, pr
 			).insert(ignore_permissions=True)
 		# Direct write: the flag guard (manager-only) is about cashiers, not this seed.
 		frappe.db.set_value("Customer", name, {"customer_group": group, FLAG_FIELD: flag, "disabled": 0})
+		give_verified_email(name, DEMO_EMAIL_DOMAIN)
 		customers[key] = name
 
 	brands = {key: _ensure("Brand", f"{prefix} Brand {key.upper()}", {"brand": f"{prefix} Brand {key.upper()}"}) for key in ("a", "x")}
@@ -188,6 +194,7 @@ def build_demo_data(prefix: str = DEFAULT_PREFIX, company: str | None = None, pr
 			"excluded_brands": [{"brand": brands["x"]}],
 			"max_discount_per_order": 0,
 			"max_discount_per_customer_month": 0,
+			"approved_domains": approved_domain_rows(DEMO_EMAIL_DOMAIN, "F&F Demo"),
 		}
 	)
 	settings.save(ignore_permissions=True)
@@ -197,6 +204,7 @@ def build_demo_data(prefix: str = DEFAULT_PREFIX, company: str | None = None, pr
 		"price_list": price_list,
 		"customer_groups": {"staff": staff_group, "public": public_group},
 		"customers": customers,
+		"email_domain": DEMO_EMAIL_DOMAIN,
 		"brands": brands,
 		"item_group": item_group,
 		"items": items,

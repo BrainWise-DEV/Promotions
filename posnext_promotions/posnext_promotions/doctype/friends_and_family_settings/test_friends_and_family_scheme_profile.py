@@ -15,6 +15,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import flt, nowdate
 
+from posnext_promotions.promotions.friends_and_family_testing import approved_domain_rows, give_verified_email
 from posnext_promotions.api.friends_and_family import (
 	apply_friends_and_family_discount,
 	check_friends_and_family_eligibility,
@@ -71,6 +72,7 @@ class TestFriendsAndFamilySchemeAndProfile(FrappeTestCase):
 				{"doctype": "Customer", "customer_name": ELIGIBLE, "customer_group": FF_GROUP}
 			).insert()
 		frappe.db.set_value("Customer", ELIGIBLE, {FLAG_FIELD: 0, "disabled": 0})
+		give_verified_email(ELIGIBLE)
 		item_group = frappe.db.get_value("Item Group", {"is_group": 0}) or "Products"
 		if not frappe.db.exists("Item", ITEM):
 			frappe.get_doc(
@@ -89,6 +91,7 @@ class TestFriendsAndFamilySchemeAndProfile(FrappeTestCase):
 		doc.update(
 			{
 				"enabled": 1,
+				"approved_domains": approved_domain_rows(),
 				"discount_percentage": 30,
 				"discount_scope": "Entire Cart",
 				"start_date": None,

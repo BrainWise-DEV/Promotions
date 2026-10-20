@@ -22,6 +22,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import add_days, flt, nowdate
 
+from posnext_promotions.promotions.friends_and_family_testing import approved_domain_rows
 from posnext_promotions.api.apply_offers import apply_offers
 from posnext_promotions.api.friends_and_family import apply_friends_and_family_discount
 from posnext_promotions.api.offers import validate_coupon
@@ -103,6 +104,7 @@ class TestFriendsAndFamilyAcceptance(FrappeTestCase):
 		doc.update(
 			{
 				"enabled": 1,
+				"approved_domains": approved_domain_rows(self.demo["email_domain"]),
 				"discount_percentage": 30,
 				"discount_scope": "Entire Cart",
 				"start_date": None,

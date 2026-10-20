@@ -9,6 +9,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import flt
 
+from posnext_promotions.promotions.friends_and_family_testing import approved_domain_rows, give_verified_email
 from posnext_promotions.promotions import best_discount as bd
 from posnext_promotions.promotions.friends_and_family_apply import (
 	DISCOUNT_SOURCE_FRIENDS_AND_FAMILY,
@@ -94,6 +95,7 @@ class TestFriendsAndFamilyLog(FrappeTestCase):
 			if not frappe.db.exists("Customer", name):
 				frappe.get_doc({"doctype": "Customer", "customer_name": name, "customer_group": group}).insert()
 			frappe.db.set_value("Customer", name, {FLAG_FIELD: 0, "disabled": 0, "customer_group": group})
+			give_verified_email(name)
 		item_group = frappe.db.get_value("Item Group", {"is_group": 0}) or "Products"
 		for code in (ITEM, ITEM_2, EXCLUDED_ITEM):
 			if not frappe.db.exists("Item", code):
@@ -124,6 +126,7 @@ class TestFriendsAndFamilyLog(FrappeTestCase):
 		doc.update(
 			{
 				"enabled": 1,
+				"approved_domains": approved_domain_rows(),
 				"discount_percentage": 30,
 				"discount_scope": "Entire Cart",
 				"start_date": None,

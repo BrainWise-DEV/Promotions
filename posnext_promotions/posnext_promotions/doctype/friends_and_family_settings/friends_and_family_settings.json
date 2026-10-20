@@ -138,7 +138,7 @@
    "fieldname": "approved_domains_section",
    "fieldtype": "Section Break",
    "label": "Approved Domains",
-   "description": "Optional company email domains (e.g. company.com). When at least one enabled domain is listed, a customer who matches the eligibility rule above must also have an email on one of these domains (exact match, sub-domains not included); when POS customer email verification is on, that email must be verified (OTP). Leave empty to not restrict by email."
+   "description": "Required while the program is enabled. A customer who matches the eligibility rule above gets Friends & Family only with an OTP-verified email on one of these domains. Exact match only: sub-domains are NOT included automatically and must be added as separate rows (e.g. add both miraaya.com and mail.miraaya.com). With no enabled domain nobody gets Friends & Family."
   },
   {
    "fieldname": "approved_domains",
@@ -233,7 +233,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-10-20 15:30:00.000000",
+ "modified": "2026-10-20 16:30:00.000000",
  "modified_by": "Administrator",
  "module": "POSNext Promotions",
  "name": "Friends and Family Settings",

@@ -12,13 +12,15 @@ the customer matches the criterion configured on **Friends and Family Settings**
 - **Customer Flag** — the ``Friends & Family Member`` checkbox on the Customer.
 - **Customer Group or Flag** — either of the above.
 
-**Approved email domains** (Settings → Approved Domains): when at least one
-enabled domain is listed, a customer who matches the Group / Flag rule must ALSO
-have an email (``Customer.email_id``) whose domain is exactly one of them
-(case-insensitive, no sub-domains). When POSNext customer email verification is
-on (``POS Settings.enable_customer_email_verification``) that email must also be
-OTP-verified and unchanged since (``custom_email_verified`` = 1 and
-``custom_verified_email`` = ``email_id``). An empty list restricts nothing.
+**Approved email domains are mandatory.** A customer who matches the Group /
+Flag rule (an *F&F member*) must ALSO have an email (``Customer.email_id``)
+whose domain is exactly one of the enabled Approved Domains (case-insensitive;
+sub-domains must be listed as their own rows), and that email must be
+OTP-verified through POSNext and unchanged since (``custom_email_verified`` = 1
+and ``custom_verified_email`` = ``email_id``) — always, independent of
+``POS Settings.enable_customer_email_verification``. With no enabled domain
+nobody gets F&F (``no_approved_domains``). Non-members are never asked for an
+email or verification.
 
 Disabled customers are never eligible. The server is the authority: the discount
 engine must call :func:`get_program_for_customer` with the invoice's customer and
@@ -78,7 +80,9 @@ REASON_NOT_ELIGIBLE = "not_eligible"
 # Approved-domain gate (customer matched Group / Flag but the email fails).
 REASON_EMAIL_DOMAIN_NOT_APPROVED = "email_domain_not_approved"
 REASON_EMAIL_NOT_VERIFIED = "email_not_verified"
-EMAIL_REASONS = (REASON_EMAIL_DOMAIN_NOT_APPROVED, REASON_EMAIL_NOT_VERIFIED)
+# F&F is on but Settings has no enabled Approved Domain: nobody gets F&F.
+REASON_NO_APPROVED_DOMAINS = "no_approved_domains"
+EMAIL_REASONS = (REASON_EMAIL_DOMAIN_NOT_APPROVED, REASON_EMAIL_NOT_VERIFIED, REASON_NO_APPROVED_DOMAINS)
 
 # POSNext customer email OTP verification (read defensively; pos_next is optional).
 VERIFIED_FLAG_FIELD = "custom_email_verified"
@@ -98,6 +102,9 @@ class CustomerEligibility:
 	program: FriendsAndFamilyProgram | None = None
 	# Approved domain the customer's email matched (when the domain gate is on).
 	email_domain: str | None = None
+	# Matches the Group / Flag rule (whether or not the email rule then passed).
+	# POSNext uses it to offer email OTP verification for F&F.
+	ff_member: bool = False
 
 	@property
 	def message(self) -> str:
@@ -123,6 +130,8 @@ class CustomerEligibility:
 			return _(
 				"No Friends & Family: verify the email of customer {0} (OTP) first"
 			).format(self.customer)
+		if self.reason == REASON_NO_APPROVED_DOMAINS:
+			return _("Friends & Family has no approved email domains configured")
 		return _("Customer {0} is not eligible for Friends & Family").format(self.customer)
 
 	def to_client_payload(self) -> dict:
@@ -134,6 +143,7 @@ class CustomerEligibility:
 			"customer_group": self.customer_group,
 			"matched_customer_group": self.matched_customer_group,
 			"email_domain": self.email_domain,
+			"ff_member": self.ff_member,
 			"program_active": self.program is not None,
 			"discount_percentage": self.program.discount_percentage if self.eligible else 0,
 			"program": self.program.to_client_payload() if self.eligible else None,
@@ -250,8 +260,19 @@ def get_customer_eligibility(
 
 	email_failure, email_domain = check_customer_email(row, settings)
 	if email_failure:
-		return CustomerEligibility(eligible=False, reason=email_failure, **result)
-	return CustomerEligibility(eligible=True, reason=member_reason, email_domain=email_domain, **result)
+		return CustomerEligibility(eligible=False, reason=email_failure, ff_member=True, **result)
+	return CustomerEligibility(
+		eligible=True, reason=member_reason, email_domain=email_domain, ff_member=True, **result
+	)
+
+
+def is_customer_ff_member(customer: str | None, pos_profile: str | None = None) -> bool:
+	"""Customer matches the live program's Group / Flag rule (email rule not applied).
+
+	POSNext calls this to allow email OTP verification for F&F members even when
+	its general verification switch is off.
+	"""
+	return bool(get_customer_eligibility(customer, pos_profile=pos_profile).ff_member)
 
 
 def is_customer_eligible(customer: str | None, on_date=None, pos_profile: str | None = None) -> bool:
@@ -285,7 +306,7 @@ def get_eligibility_rules_payload(settings=None) -> dict:
 		"flag_field": FLAG_FIELD if basis != BASIS_GROUP else None,
 		# Approved-domain gate: empty = no email restriction.
 		"approved_domains": get_approved_domains(settings),
-		"requires_verified_email": bool(get_approved_domains(settings)) and email_verification_required(),
+		"requires_verified_email": True,
 	}
 
 
@@ -399,31 +420,22 @@ def has_verification_fields() -> bool:
 	return meta.has_field(VERIFIED_FLAG_FIELD) and meta.has_field(VERIFIED_EMAIL_FIELD)
 
 
-def email_verification_required() -> bool:
-	"""Verified email needed: the fields exist and any enabled POS Settings turns verification on."""
-	if not has_verification_fields():
-		return False
-	if not frappe.db.has_column("POS Settings", "enable_customer_email_verification"):
-		return False
-	return bool(
-		frappe.db.exists("POS Settings", {"enabled": 1, "enable_customer_email_verification": 1})
-	)
-
-
 def check_customer_email(row, settings) -> tuple[str | None, str | None]:
-	"""Approved-domain gate for a Group / Flag member. Returns ``(failure_reason, matched_domain)``.
+	"""Mandatory email gate for a Group / Flag member. Returns ``(failure_reason, matched_domain)``.
 
-	``(None, None)`` when no domains are configured (gate off).
+	1. No enabled approved domain → ``no_approved_domains``.
+	2. ``email_id`` missing / not exactly on an approved domain → ``email_domain_not_approved``.
+	3. Not OTP-verified, or changed since verification (or the POSNext
+	   verification fields are missing, so it cannot be verified) → ``email_not_verified``.
 	"""
 	approved = get_approved_domains(settings)
 	if not approved:
-		return None, None
+		return REASON_NO_APPROVED_DOMAINS, None
 	email = cstr(row.get("email_id")).strip().lower()
 	domain = email_domain_of(email)
 	if not domain or domain not in approved:
 		return REASON_EMAIL_DOMAIN_NOT_APPROVED, None
-	if email_verification_required():
-		verified_email = cstr(row.get(VERIFIED_EMAIL_FIELD)).strip().lower()
-		if not cint(row.get(VERIFIED_FLAG_FIELD)) or verified_email != email:
-			return REASON_EMAIL_NOT_VERIFIED, None
+	verified_email = cstr(row.get(VERIFIED_EMAIL_FIELD)).strip().lower()
+	if not cint(row.get(VERIFIED_FLAG_FIELD)) or verified_email != email:
+		return REASON_EMAIL_NOT_VERIFIED, None
 	return None, domain

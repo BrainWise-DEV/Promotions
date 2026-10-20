@@ -4,6 +4,7 @@
 import frappe
 from frappe.tests.utils import FrappeTestCase
 
+from posnext_promotions.promotions.friends_and_family_testing import approved_domain_rows
 from posnext_promotions.api.friends_and_family import get_friends_and_family_program
 from posnext_promotions.promotions.friends_and_family import get_active_program
 
@@ -47,6 +48,7 @@ class TestFriendsandFamilySettings(FrappeTestCase):
 		doc.update(
 			{
 				"enabled": 1,
+				"approved_domains": approved_domain_rows(),
 				"discount_percentage": 30,
 				"discount_scope": "Entire Cart",
 				"start_date": None,

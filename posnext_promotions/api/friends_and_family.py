@@ -59,8 +59,9 @@ def check_friends_and_family_eligibility(
 	``customer_flag``, ``not_eligible``, ``program_inactive``, ``no_customer``,
 	``customer_not_found``, ``customer_disabled``, ``profile_not_allowed`` when
 	the POS Profile has **Allow F&F** off, ``email_domain_not_approved`` /
-	``email_not_verified`` when Approved Domains are configured and the member's
-	email fails them), a cashier-facing ``message``,
+	``email_not_verified`` / ``no_approved_domains`` when an F&F member fails the
+	mandatory verified-email-on-an-approved-domain rule), ``ff_member``, a
+	cashier-facing ``message``,
 	and — only when eligible — ``discount_percentage`` and the ``program``.
 
 	Informational only: server-side pricing re-checks through

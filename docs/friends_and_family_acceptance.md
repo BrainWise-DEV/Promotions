@@ -66,6 +66,9 @@ POS Coupons (لو POS Next متسطب): `FFDEMO15` (15%) و`FFDEMO40` (40%)، ا
 | Discount Scope | **Discount Scope** | Entire Cart |
 | Exclusions | **Excluded Items** | `FF Demo Gift Card` |
 | Exclusions | **Excluded Brands** | `FF Demo Brand X` |
+| Approved Domains | **Email Domain** | `ffdemo.example` (إجباري طول ما البرنامج مفعّل) |
+
+> كل عملاء الديمو بياخدوا إيميل متحقق منه `<name>@ffdemo.example` (مثلًا `ff.demo.staff@ffdemo.example`). من غير إيميل متحقق على نطاق معتمد مفيش F&F.
 
 اضغط **Save**. من زرار **View** في نفس الصفحة هتلاقي: **Audit Log**، **Settings Changes**، **Version History**، **Performance Report**.
 
@@ -379,32 +382,37 @@ Tick it again → F&F applies.
 Automated: `bench --site <dev-site> run-tests --app posnext_promotions --module posnext_promotions.posnext_promotions.doctype.friends_and_family_settings.test_friends_and_family_scheme_profile`
 (known pre-existing failures unrelated to this change: `test_friends_and_family_best_discount.test_invoice_header_discount_weaker_than_fnf_is_removed`, `test_friends_and_family_acceptance.test_10_coupon_vs_fnf`).
 
-## Approved Domains enforced on the customer's email (2026-10-20)
+## Approved Domains + verified email are mandatory (2026-10-20, rev. 2)
 
-When **at least one enabled** Approved Domain is listed, a customer who matches *Eligible When*
-(Group / Flag) must ALSO pass the email rule; an empty list restricts nothing.
+Rules (server = `friends_and_family_eligibility.get_customer_eligibility`):
 
-- Email checked: `Customer.email_id`, trimmed, case-insensitive. Its domain must be **exactly** an
-  approved domain — `ali@miraaya.com` ✔, `ali@mail.miraaya.com` ✘ (no sub-domains), `ali@gmail.com` ✘,
-  no email ✘ → reason `email_domain_not_approved`.
-- When POSNext customer email verification is on (any enabled *POS Settings* with
-  *Enable Customer Email Verification*) the email must also be OTP-verified and unchanged since:
-  `custom_email_verified = 1` and `custom_verified_email = email_id` → else `email_not_verified`.
-  POSNext already clears the verified flag when `email_id` changes.
-- Non-members keep `not_eligible` (no email message for them).
-- Payload: `reason` + translated `message`; eligible payloads add `email_domain`. The offline rules
-  payload adds `approved_domains` / `requires_verified_email`. The apply/apply_offers F&F block
-  carries the same `message`.
-- Settings save normalises rows (`" @Miraaya.COM "`, `https://www.miraaya.com/` → `miraaya.com`) and
-  rejects invalid hostnames (`miraaya`, `user@miraaya.com`, spaces, `-bad.com`) and duplicates.
-- POS: on selecting such a customer a warning toast shows the message, and the cart F&F box shows
-  it while there are items. After the cashier verifies the email (OTP) in the customer dialog, F&F is
-  re-checked and the cart re-priced.
+1. Only **F&F members** are checked (match *Eligible When*: Customer Group / Flag). Non-members keep
+   `not_eligible` and are never asked for an email or OTP for F&F.
+2. **No enabled Approved Domain → nobody gets F&F**: reason `no_approved_domains`,
+   message "Friends & Family has no approved email domains configured". Saving Settings with
+   **Enable Program** ✔ and no enabled domain is refused ("Add at least one enabled Approved Domain…").
+3. `Customer.email_id` (trimmed, case-insensitive) must be **exactly** on an enabled approved domain.
+   Sub-domains are NOT included automatically — add them as their own rows (e.g. `miraaya.com` and
+   `mail.miraaya.com`). Missing / other domain → `email_domain_not_approved`.
+4. The email must be **OTP-verified** and unchanged since (`custom_email_verified = 1` and
+   `custom_verified_email = email_id`) — **always**, independent of
+   *POS Settings → Enable Customer Email Verification* → else `email_not_verified`.
+   POSNext clears the verified flag when `email_id` changes.
+5. Payload: `reason`, translated `message`, `ff_member` (true for members, also when the email rule
+   failed), `email_domain` when eligible. `is_customer_ff_member(customer, pos_profile)` is used by POSNext.
+6. POS: warning toast on selecting such a member + warning in the cart F&F box. The email
+   verification panel (edit customer, and the "verify now" step after creating a customer) is shown for
+   F&F members even when the general POS verification switch is off; the server allows send/verify OTP
+   for them. After verification F&F is re-checked and the cart re-priced.
+7. Settings save normalises rows (`" @Miraaya.COM "`, `https://www.miraaya.com/` → `miraaya.com`) and
+   rejects invalid hostnames and duplicates.
 
 | # | Setup | Expected |
 |---|---|---|
-| D1 | No approved domains; `FF Demo Staff` | F&F as before |
-| D2 | Domain `miraaya.com`; Staff email `x@gmail.com` | No F&F; "needs an email on an approved company domain" |
-| D3 | Staff email `x@miraaya.com`, verification on, not verified | No F&F; "verify the email … (OTP) first" |
+| D1 | Program enabled, remove every Approved Domain, Save | Error "Add at least one enabled Approved Domain…" |
+| D2 | Domain `miraaya.com`; Staff email `x@gmail.com` (or empty, or `x@mail.miraaya.com`) | No F&F; "needs an email on an approved company domain" |
+| D3 | Staff email `x@miraaya.com`, not verified (POS verification switch on or off) | No F&F; "verify the email … (OTP) first"; verify panel visible in Edit Customer |
 | D4 | D3 then verify via OTP in POS | F&F applied without reselecting the customer |
 | D5 | Verified, then email changed to `y@miraaya.com` | No F&F until verified again |
+| D6 | `FF Demo Public` (non-member) with any email, POS switch off | Normal price, no F&F message, no verify panel |
+| D7 | Add `mail.miraaya.com` as a 2nd row; Staff `x@mail.miraaya.com` verified | F&F applied |
