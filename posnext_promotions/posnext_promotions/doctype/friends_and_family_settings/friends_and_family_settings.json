@@ -138,7 +138,7 @@
    "fieldname": "approved_domains_section",
    "fieldtype": "Section Break",
    "label": "Approved Domains",
-   "description": "Company email domains (e.g. company.com, lowercase, no @) whose employees can join Friends & Family via email/OTP. Not used by Customer Group / Flag eligibility."
+   "description": "Optional company email domains (e.g. company.com). When at least one enabled domain is listed, a customer who matches the eligibility rule above must also have an email on one of these domains (exact match, sub-domains not included); when POS customer email verification is on, that email must be verified (OTP). Leave empty to not restrict by email."
   },
   {
    "fieldname": "approved_domains",
@@ -233,7 +233,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-10-19 16:10:00.000000",
+ "modified": "2026-10-20 15:30:00.000000",
  "modified_by": "Administrator",
  "module": "POSNext Promotions",
  "name": "Friends and Family Settings",

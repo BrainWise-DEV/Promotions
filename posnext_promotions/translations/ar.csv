@@ -1,0 +1,6 @@
+"No Friends & Family: customer {0} needs an email on an approved company domain","لا يوجد خصم الأصدقاء والعائلة: العميل {0} يحتاج بريدًا إلكترونيًا على نطاق شركة معتمد",""
+"No Friends & Family: verify the email of customer {0} (OTP) first","لا يوجد خصم الأصدقاء والعائلة: يجب التحقق من بريد العميل {0} (OTP) أولًا",""
+"Approved Domains row {0}: {1} is not a valid email domain. Use only the part after @, for example company.com","النطاقات المعتمدة صف {0}: {1} ليس نطاق بريد إلكتروني صالحًا. استخدم الجزء بعد @ فقط، مثل company.com",""
+"Approved Domains row {0}: {1} is already listed in row {2}","النطاقات المعتمدة صف {0}: {1} مُدرج بالفعل في الصف {2}",""
+"Invalid Email Domain","نطاق بريد إلكتروني غير صالح",""
+"Duplicate Email Domain","نطاق بريد إلكتروني مكرر",""

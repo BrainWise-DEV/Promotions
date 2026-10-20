@@ -1,6 +1,8 @@
 # Copyright (c) 2026, BrainWise and contributors
 # For license information, please see license.txt
 
+from unittest.mock import patch
+
 import frappe
 from frappe.tests.utils import FrappeTestCase
 
@@ -8,8 +10,11 @@ from posnext_promotions.api.friends_and_family import (
 	check_friends_and_family_eligibility,
 	get_friends_and_family_program,
 )
+from posnext_promotions.promotions import friends_and_family_eligibility as eligibility_module
 from posnext_promotions.promotions.friends_and_family_eligibility import (
 	FLAG_FIELD,
+	REASON_EMAIL_DOMAIN_NOT_APPROVED,
+	REASON_EMAIL_NOT_VERIFIED,
 	REASON_CUSTOMER_DISABLED,
 	REASON_CUSTOMER_FLAG,
 	REASON_CUSTOMER_GROUP,
@@ -108,6 +113,7 @@ class TestFriendsandFamilyEligibility(FrappeTestCase):
 					{"customer_group": FF_GROUP},
 					{"customer_group": FF_PARENT_GROUP},
 				],
+				"approved_domains": [],
 			}
 		)
 		doc.update(values)
@@ -242,3 +248,106 @@ class TestFriendsandFamilyEligibility(FrappeTestCase):
 		customer.save(ignore_permissions=True)
 		frappe.set_user("Administrator")
 		frappe.db.set_value("Customer", PLAIN_CUSTOMER, FLAG_FIELD, 0)
+
+	# ---- approved email domains ------------------------------------------
+
+	def test_domain_rows_normalised_and_validated(self):
+		doc = self._configure(
+			approved_domains=[
+				{"email_domain": "  @Miraaya.COM ", "company": " Miraaya "},
+				{"email_domain": "https://www.Partner.co.uk/", "enabled": 1},
+			]
+		)
+		self.assertEqual([r.email_domain for r in doc.approved_domains], ["miraaya.com", "partner.co.uk"])
+		self.assertEqual(doc.approved_domains[0].company, "Miraaya")
+		for bad in ("miraaya", "user@miraaya.com", "mira aya.com", "-bad.com", "miraaya.c0m", "@", "miraaya..com"):
+			with self.assertRaises(frappe.ValidationError, msg=bad):
+				self._configure(approved_domains=[{"email_domain": bad}])
+		with self.assertRaises(frappe.ValidationError):
+			self._configure(approved_domains=[{"email_domain": "miraaya.com"}, {"email_domain": "@MIRAAYA.com"}])
+
+	def test_email_domain_matching_is_exact(self):
+		settings = frappe._dict(approved_domains=[frappe._dict(email_domain="miraaya.com", enabled=1)])
+		self.assertTrue(eligibility_module.is_approved_email(" Ali@Miraaya.COM ", settings))
+		self.assertFalse(eligibility_module.is_approved_email("ali@mail.miraaya.com", settings))
+		self.assertFalse(eligibility_module.is_approved_email("ali@miraaya.com.evil.io", settings))
+		self.assertFalse(eligibility_module.is_approved_email("ali@notmiraaya.com", settings))
+		self.assertFalse(eligibility_module.is_approved_email("a@b@miraaya.com", settings))
+		self.assertFalse(eligibility_module.is_approved_email("", settings))
+		disabled = frappe._dict(approved_domains=[frappe._dict(email_domain="miraaya.com", enabled=0)])
+		self.assertFalse(eligibility_module.is_approved_email("ali@miraaya.com", disabled))
+
+	def _set_email(self, customer, email, verified=None):
+		frappe.db.set_value("Customer", customer, "email_id", email)
+		if eligibility_module.has_verification_fields():
+			frappe.db.set_value(
+				"Customer",
+				customer,
+				{
+					eligibility_module.VERIFIED_FLAG_FIELD: 1 if verified else 0,
+					eligibility_module.VERIFIED_EMAIL_FIELD: verified or None,
+				},
+			)
+
+	def test_empty_domain_list_does_not_restrict(self):
+		self._configure()
+		self._set_email(GROUP_CUSTOMER, "someone@gmail.com")
+		result = self._check(GROUP_CUSTOMER)
+		self.assertTrue(result.eligible)
+		self.assertIsNone(result.email_domain)
+
+	def test_domain_gate_without_verification(self):
+		self._configure(approved_domains=[{"email_domain": "miraaya.com"}])
+		with patch.object(eligibility_module, "email_verification_required", return_value=False):
+			self._set_email(GROUP_CUSTOMER, "Staff@Miraaya.com")
+			result = self._check(GROUP_CUSTOMER)
+			self.assertTrue(result.eligible)
+			self.assertEqual(result.reason, REASON_CUSTOMER_GROUP)
+			self.assertEqual(result.email_domain, "miraaya.com")
+
+			self._set_email(GROUP_CUSTOMER, "staff@gmail.com")
+			result = self._check(GROUP_CUSTOMER)
+			self.assertFalse(result.eligible)
+			self.assertEqual(result.reason, REASON_EMAIL_DOMAIN_NOT_APPROVED)
+			self.assertIsNone(get_program_for_customer(GROUP_CUSTOMER, DATE))
+			self.assertIn("approved company domain", result.message)
+
+			self._set_email(FLAG_CUSTOMER, "")
+			self.assertEqual(self._check(FLAG_CUSTOMER).reason, REASON_EMAIL_DOMAIN_NOT_APPROVED)
+			self._set_email(FLAG_CUSTOMER, "x@sub.miraaya.com")
+			self.assertEqual(self._check(FLAG_CUSTOMER).reason, REASON_EMAIL_DOMAIN_NOT_APPROVED)
+
+			# Non-members keep the plain "not eligible" reason (no email noise).
+			self._set_email(PLAIN_CUSTOMER, "x@gmail.com")
+			self.assertEqual(self._check(PLAIN_CUSTOMER).reason, REASON_NOT_ELIGIBLE)
+
+	def test_domain_gate_requires_verified_unchanged_email(self):
+		if not eligibility_module.has_verification_fields():
+			self.skipTest("POSNext email verification fields are not installed")
+		self._configure(approved_domains=[{"email_domain": "miraaya.com"}])
+		with patch.object(eligibility_module, "email_verification_required", return_value=True):
+			self._set_email(GROUP_CUSTOMER, "staff@miraaya.com", verified=None)
+			result = self._check(GROUP_CUSTOMER)
+			self.assertEqual(result.reason, REASON_EMAIL_NOT_VERIFIED)
+			self.assertIn("verify the email", result.message)
+
+			self._set_email(GROUP_CUSTOMER, "staff@miraaya.com", verified="Staff@Miraaya.com")
+			self.assertTrue(self._check(GROUP_CUSTOMER).eligible)
+
+			# Email changed after verification -> treated as not verified.
+			self._set_email(GROUP_CUSTOMER, "other@miraaya.com", verified="staff@miraaya.com")
+			self.assertEqual(self._check(GROUP_CUSTOMER).reason, REASON_EMAIL_NOT_VERIFIED)
+
+			# Unapproved domain is reported first, even when verified.
+			self._set_email(GROUP_CUSTOMER, "staff@gmail.com", verified="staff@gmail.com")
+			self.assertEqual(self._check(GROUP_CUSTOMER).reason, REASON_EMAIL_DOMAIN_NOT_APPROVED)
+
+	def test_domain_gate_in_api_payload(self):
+		self._configure(approved_domains=[{"email_domain": "miraaya.com"}])
+		with patch.object(eligibility_module, "email_verification_required", return_value=False):
+			self._set_email(GROUP_CUSTOMER, "staff@gmail.com")
+			payload = check_friends_and_family_eligibility(GROUP_CUSTOMER, DATE)
+			self.assertFalse(payload["eligible"])
+			self.assertEqual(payload["reason"], REASON_EMAIL_DOMAIN_NOT_APPROVED)
+			self.assertTrue(payload["message"])
+			self.assertEqual(payload["discount_percentage"], 0)

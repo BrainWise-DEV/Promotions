@@ -17,7 +17,7 @@
    "label": "Email Domain",
    "reqd": 1,
    "in_list_view": 1,
-   "description": "e.g. miraaya.com (lowercase, no @)"
+   "description": "Only the part after @, e.g. miraaya.com. Exact match: sub-domains (mail.miraaya.com) are not included."
   },
   {
    "fieldname": "company",
@@ -34,7 +34,7 @@
   }
  ],
  "links": [],
- "modified": "2026-10-13 12:00:00.000000",
+ "modified": "2026-10-20 15:30:00.000000",
  "modified_by": "Administrator",
  "module": "POSNext Promotions",
  "name": "Friends and Family Approved Domain",

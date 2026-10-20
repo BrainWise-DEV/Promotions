@@ -12,6 +12,14 @@ the customer matches the criterion configured on **Friends and Family Settings**
 - **Customer Flag** — the ``Friends & Family Member`` checkbox on the Customer.
 - **Customer Group or Flag** — either of the above.
 
+**Approved email domains** (Settings → Approved Domains): when at least one
+enabled domain is listed, a customer who matches the Group / Flag rule must ALSO
+have an email (``Customer.email_id``) whose domain is exactly one of them
+(case-insensitive, no sub-domains). When POSNext customer email verification is
+on (``POS Settings.enable_customer_email_verification``) that email must also be
+OTP-verified and unchanged since (``custom_email_verified`` = 1 and
+``custom_verified_email`` = ``email_id``). An empty list restricts nothing.
+
 Disabled customers are never eligible. The server is the authority: the discount
 engine must call :func:`get_program_for_customer` with the invoice's customer and
 posting date rather than trust a client-side flag, so a cashier cannot force F&F
@@ -20,6 +28,7 @@ onto an ineligible customer.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 import frappe
@@ -66,6 +75,14 @@ REASON_CUSTOMER_DISABLED = "customer_disabled"
 REASON_CUSTOMER_GROUP = "customer_group"
 REASON_CUSTOMER_FLAG = "customer_flag"
 REASON_NOT_ELIGIBLE = "not_eligible"
+# Approved-domain gate (customer matched Group / Flag but the email fails).
+REASON_EMAIL_DOMAIN_NOT_APPROVED = "email_domain_not_approved"
+REASON_EMAIL_NOT_VERIFIED = "email_not_verified"
+EMAIL_REASONS = (REASON_EMAIL_DOMAIN_NOT_APPROVED, REASON_EMAIL_NOT_VERIFIED)
+
+# POSNext customer email OTP verification (read defensively; pos_next is optional).
+VERIFIED_FLAG_FIELD = "custom_email_verified"
+VERIFIED_EMAIL_FIELD = "custom_verified_email"
 
 
 @dataclass(frozen=True)
@@ -79,6 +96,8 @@ class CustomerEligibility:
 	# The live program, when there is one — set even for an ineligible customer
 	# so callers can tell "program off" from "customer not covered".
 	program: FriendsAndFamilyProgram | None = None
+	# Approved domain the customer's email matched (when the domain gate is on).
+	email_domain: str | None = None
 
 	@property
 	def message(self) -> str:
@@ -96,6 +115,14 @@ class CustomerEligibility:
 			return _("Customer {0} not found").format(self.customer)
 		if self.reason == REASON_CUSTOMER_DISABLED:
 			return _("Customer {0} is disabled").format(self.customer)
+		if self.reason == REASON_EMAIL_DOMAIN_NOT_APPROVED:
+			return _(
+				"No Friends & Family: customer {0} needs an email on an approved company domain"
+			).format(self.customer)
+		if self.reason == REASON_EMAIL_NOT_VERIFIED:
+			return _(
+				"No Friends & Family: verify the email of customer {0} (OTP) first"
+			).format(self.customer)
 		return _("Customer {0} is not eligible for Friends & Family").format(self.customer)
 
 	def to_client_payload(self) -> dict:
@@ -106,6 +133,7 @@ class CustomerEligibility:
 			"message": self.message,
 			"customer_group": self.customer_group,
 			"matched_customer_group": self.matched_customer_group,
+			"email_domain": self.email_domain,
 			"program_active": self.program is not None,
 			"discount_percentage": self.program.discount_percentage if self.eligible else 0,
 			"program": self.program.to_client_payload() if self.eligible else None,
@@ -184,9 +212,11 @@ def get_customer_eligibility(
 		return CustomerEligibility(customer=customer, eligible=False, reason=REASON_PROGRAM_INACTIVE)
 
 	flag_available = has_flag_field()
-	fields = ["name", "customer_group", "disabled"]
+	fields = ["name", "customer_group", "disabled", "email_id"]
 	if flag_available:
 		fields.append(FLAG_FIELD)
+	if has_verification_fields():
+		fields += [VERIFIED_FLAG_FIELD, VERIFIED_EMAIL_FIELD]
 	row = frappe.db.get_value("Customer", customer, fields, as_dict=True)
 	if not row:
 		return CustomerEligibility(
@@ -200,17 +230,28 @@ def get_customer_eligibility(
 	settings = get_settings()
 	basis = get_eligibility_basis(settings)
 
+	member_reason = None
 	if basis in (BASIS_GROUP, BASIS_GROUP_OR_FLAG):
 		matched = match_customer_group(row.customer_group, get_configured_customer_groups(settings))
 		if matched:
-			return CustomerEligibility(
-				eligible=True, reason=REASON_CUSTOMER_GROUP, matched_customer_group=matched, **result
-			)
+			member_reason = REASON_CUSTOMER_GROUP
+			result["matched_customer_group"] = matched
 
-	if basis in (BASIS_FLAG, BASIS_GROUP_OR_FLAG) and flag_available and cint(row.get(FLAG_FIELD)):
-		return CustomerEligibility(eligible=True, reason=REASON_CUSTOMER_FLAG, **result)
+	if (
+		member_reason is None
+		and basis in (BASIS_FLAG, BASIS_GROUP_OR_FLAG)
+		and flag_available
+		and cint(row.get(FLAG_FIELD))
+	):
+		member_reason = REASON_CUSTOMER_FLAG
 
-	return CustomerEligibility(eligible=False, reason=REASON_NOT_ELIGIBLE, **result)
+	if member_reason is None:
+		return CustomerEligibility(eligible=False, reason=REASON_NOT_ELIGIBLE, **result)
+
+	email_failure, email_domain = check_customer_email(row, settings)
+	if email_failure:
+		return CustomerEligibility(eligible=False, reason=email_failure, **result)
+	return CustomerEligibility(eligible=True, reason=member_reason, email_domain=email_domain, **result)
 
 
 def is_customer_eligible(customer: str | None, on_date=None, pos_profile: str | None = None) -> bool:
@@ -242,6 +283,9 @@ def get_eligibility_rules_payload(settings=None) -> dict:
 		"basis": basis,
 		"customer_groups": sorted(groups),
 		"flag_field": FLAG_FIELD if basis != BASIS_GROUP else None,
+		# Approved-domain gate: empty = no email restriction.
+		"approved_domains": get_approved_domains(settings),
+		"requires_verified_email": bool(get_approved_domains(settings)) and email_verification_required(),
 	}
 
 
@@ -281,45 +325,105 @@ def ensure_customer_flag_field():
 	create_custom_fields({"Customer": [CUSTOMER_FLAG_FIELD_SPEC]}, update=True)
 
 
-# ---- approved email domains (company e-mail eligibility, future OTP flow) ----
+# ---- approved email domains -------------------------------------------------
+
+_HOSTNAME_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
 
 def normalize_email_domain(value) -> str:
-	domain = (value or "").strip().lower()
-	while domain.startswith("@"):
-		domain = domain[1:]
-	return domain.strip().rstrip(".")
+	"""``" @Miraaya.COM "`` / ``"https://www.miraaya.com/"`` → ``"miraaya.com"``.
+
+	Lowercase, trimmed, without leading ``@``, protocol, ``www.``, path or
+	trailing dot. Validity is checked separately (:func:`is_valid_email_domain`).
+	"""
+	domain = cstr(value).strip().lower()
+	domain = re.sub(r"^[a-z][a-z0-9+.-]*://", "", domain)
+	domain = domain.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+	domain = domain.lstrip("@").strip().rstrip(".")
+	if domain.startswith("www."):
+		domain = domain[4:]
+	return domain
+
+
+def is_valid_email_domain(domain) -> bool:
+	"""Hostname with at least one dot, letters-only TLD, no ``@`` / spaces."""
+	domain = cstr(domain)
+	if not domain or len(domain) > 253 or "." not in domain:
+		return False
+	labels = domain.split(".")
+	if not all(_HOSTNAME_LABEL.match(label) for label in labels):
+		return False
+	return labels[-1].isalpha() and len(labels[-1]) >= 2
+
+
+def email_domain_of(email) -> str | None:
+	"""Domain part of a syntactically plausible email, normalised; else None."""
+	email = cstr(email).strip().lower()
+	if email.count("@") != 1 or any(ch.isspace() for ch in email):
+		return None
+	local, domain = email.split("@")
+	domain = domain.rstrip(".")
+	if not local or not is_valid_email_domain(domain):
+		return None
+	return domain
 
 
 def get_approved_domains(settings=None) -> list[str]:
-	"""Enabled approved domains from Friends and Family Settings."""
+	"""Enabled approved domains from Friends and Family Settings (normalised)."""
 	settings = settings or frappe.get_cached_doc("Friends and Family Settings")
-	return [
-		normalize_email_domain(row.email_domain)
-		for row in (settings.get("approved_domains") or [])
-		if cint(row.get("enabled")) and row.get("email_domain")
-	]
+	domains = []
+	for row in settings.get("approved_domains") or []:
+		if cint(row.get("enabled")) and row.get("email_domain"):
+			domain = normalize_email_domain(row.email_domain)
+			if domain and domain not in domains:
+				domains.append(domain)
+	return domains
 
 
 def get_approved_domain_for_email(email, settings=None) -> str | None:
-	"""Matching approved domain for ``email`` (exact domain or a sub-domain of it), else None."""
-	email = (email or "").strip().lower()
-	if email.count("@") != 1:
+	"""The approved domain ``email`` belongs to — exact match only (no sub-domains)."""
+	domain = email_domain_of(email)
+	if not domain:
 		return None
-	local, domain = email.split("@")
-	domain = normalize_email_domain(domain)
-	if not local or not domain:
-		return None
-	for approved in get_approved_domains(settings):
-		if domain == approved or domain.endswith("." + approved):
-			return approved
-	return None
+	return domain if domain in get_approved_domains(settings) else None
 
 
 def is_approved_email(email, settings=None) -> bool:
-	"""True when the e-mail belongs to an enabled approved company domain.
-
-	Not yet part of ``get_customer_eligibility`` (Group / Flag rules are
-	unchanged); intended for the e-mail + OTP enrolment flow.
-	"""
+	"""True when the email's domain is exactly an enabled approved domain."""
 	return get_approved_domain_for_email(email, settings) is not None
 
+
+def has_verification_fields() -> bool:
+	"""POSNext's customer email verification fields exist on Customer."""
+	meta = frappe.get_meta("Customer")
+	return meta.has_field(VERIFIED_FLAG_FIELD) and meta.has_field(VERIFIED_EMAIL_FIELD)
+
+
+def email_verification_required() -> bool:
+	"""Verified email needed: the fields exist and any enabled POS Settings turns verification on."""
+	if not has_verification_fields():
+		return False
+	if not frappe.db.has_column("POS Settings", "enable_customer_email_verification"):
+		return False
+	return bool(
+		frappe.db.exists("POS Settings", {"enabled": 1, "enable_customer_email_verification": 1})
+	)
+
+
+def check_customer_email(row, settings) -> tuple[str | None, str | None]:
+	"""Approved-domain gate for a Group / Flag member. Returns ``(failure_reason, matched_domain)``.
+
+	``(None, None)`` when no domains are configured (gate off).
+	"""
+	approved = get_approved_domains(settings)
+	if not approved:
+		return None, None
+	email = cstr(row.get("email_id")).strip().lower()
+	domain = email_domain_of(email)
+	if not domain or domain not in approved:
+		return REASON_EMAIL_DOMAIN_NOT_APPROVED, None
+	if email_verification_required():
+		verified_email = cstr(row.get(VERIFIED_EMAIL_FIELD)).strip().lower()
+		if not cint(row.get(VERIFIED_FLAG_FIELD)) or verified_email != email:
+			return REASON_EMAIL_NOT_VERIFIED, None
+	return None, domain

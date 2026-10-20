@@ -116,17 +116,28 @@ class FriendsandFamilySettings(Document):
 			self.set(fieldname, value)
 
 	def _validate_approved_domains(self):
-		"""Normalise domains (lowercase, no leading @ / spaces) and reject duplicates."""
-		seen = set()
+		"""Normalise domains (lowercase; no spaces, leading @, protocol, www. or path),
+		reject invalid hostnames and duplicates."""
+		seen = {}
 		for row in list(self.get("approved_domains") or []):
-			domain = eligibility.normalize_email_domain(row.email_domain)
-			if not domain or "." not in domain or "@" in domain or " " in domain:
+			raw = (row.email_domain or "").strip()
+			domain = eligibility.normalize_email_domain(raw)
+			if "@" in domain or any(ch.isspace() for ch in domain) or not eligibility.is_valid_email_domain(domain):
 				frappe.throw(
-					_("Row {0}: {1} is not a valid email domain").format(row.idx, frappe.bold(row.email_domain or ""))
+					_(
+						"Approved Domains row {0}: {1} is not a valid email domain. "
+						"Use only the part after @, for example company.com"
+					).format(row.idx, frappe.bold(frappe.utils.escape_html(raw))),
+					title=_("Invalid Email Domain"),
 				)
 			if domain in seen:
-				frappe.throw(_("Approved Domain {0} is listed more than once").format(frappe.bold(domain)))
-			seen.add(domain)
+				frappe.throw(
+					_("Approved Domains row {0}: {1} is already listed in row {2}").format(
+						row.idx, frappe.bold(domain), seen[domain]
+					),
+					title=_("Duplicate Email Domain"),
+				)
+			seen[domain] = row.idx
 			row.email_domain = domain
 			row.company = (row.company or "").strip()
 
