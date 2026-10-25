@@ -374,6 +374,16 @@ def _apply_bundled_same_item_free_discounts(prepared_items, free_items_map, rule
 			):
 				continue
 
+			# The gift is an extra scanned unit, never one of the min_qty paid units
+			if get_gwp_same_item_free_qty:
+				free_qty = get_gwp_same_item_free_qty(
+					free_qty,
+					item_doc.get("qty") or item_doc.get("quantity") or 0,
+					full_rule.min_qty,
+					full_rule.max_qty,
+				)
+				if free_qty <= 0:
+					break
 			price_list_rate = flt(
 				item_doc.get("price_list_rate") or item_doc.get("rate") or 0
 			)
