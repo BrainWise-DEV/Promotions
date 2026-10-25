@@ -343,7 +343,7 @@ def _recompute_recursive_product_free_items(prepared_items, free_items_map, rule
 		if not line_gave_free and applied_rules is not None:
 			applied_rules.discard(rule_name)
 
-def _apply_bundled_same_item_free_discounts(prepared_items, free_items_map, rule_map) -> None:
+def _apply_bundled_same_item_free_discounts(prepared_items, free_items_map, rule_map, applied_rules=None) -> None:
 	"""Bundle non-GWP same-item free gifts onto the paid line instead of a separate row."""
 	if not calculate_gwp_discount_amount:
 		return
@@ -383,6 +383,10 @@ def _apply_bundled_same_item_free_discounts(prepared_items, free_items_map, rule
 					full_rule.max_qty,
 				)
 				if free_qty <= 0:
+					# No gift yet: drop the rule so the POS does not show it as applied
+					remove_pricing_rule(item_doc, rule_name)
+					if applied_rules is not None:
+						applied_rules.discard(rule_name)
 					break
 			price_list_rate = flt(
 				item_doc.get("price_list_rate") or item_doc.get("rate") or 0
@@ -1638,7 +1642,7 @@ def apply_offers(invoice_data, selected_offers=None):
 		_recompute_recursive_product_free_items(
 			prepared_items, free_items_map, rule_map, applied_rules
 		)
-		_apply_bundled_same_item_free_discounts(prepared_items, free_items_map, rule_map)
+		_apply_bundled_same_item_free_discounts(prepared_items, free_items_map, rule_map, applied_rules)
 		_apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_rules)
 		_apply_gift_pool_free_items(
 			prepared_items,
