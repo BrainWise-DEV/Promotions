@@ -83,23 +83,59 @@ POS_COUPON_EXTRA_FIELDS = [
 		"default": "1",
 		"insert_after": "maximum_use_per_customer",
 	},
+	{
+		"dt": "POS Coupon",
+		"fieldname": "promotion_conflict",
+		"label": "When a Line Already Has a Discount",
+		"fieldtype": "Select",
+		"options": "\nSkip the line\nAdd on top\nBetter of the two",
+		"description": "Skip the line: the coupon leaves it alone. Add on top: the coupon also applies after the "
+		"existing discount. Better of the two: the line gets whichever saves the customer more.",
+		"insert_after": "exclude_already_discounted_items",
+	},
+	{
+		"dt": "POS Settings",
+		"fieldname": "default_coupon_promotion_conflict",
+		"label": "Default for New Coupons: When a Line Already Has a Discount",
+		"fieldtype": "Select",
+		"options": "Skip the line\nAdd on top\nBetter of the two",
+		"default": "Skip the line",
+		"insert_after": "allow_user_to_edit_item_discount",
+	},
 ]
 
 
 def after_migrate():
 	_ensure_pos_coupon_extras()
+	_backfill_coupon_promotion_conflict()
+
+
+def _backfill_coupon_promotion_conflict():
+	"""Give coupons saved before the setting existed their old behaviour: checked skips, unchecked stacks."""
+	if not frappe.get_meta("POS Coupon").has_field("promotion_conflict"):
+		return
+	for excluded, mode in ((1, "Skip the line"), (0, "Add on top")):
+		frappe.db.set_value(
+			"POS Coupon",
+			{"promotion_conflict": ["is", "not set"], "exclude_already_discounted_items": excluded},
+			"promotion_conflict",
+			mode,
+			update_modified=False,
+		)
 
 
 def _ensure_pos_coupon_extras():
 	if not frappe.db.exists("DocType", "POS Coupon"):
 		return
 
-	meta = frappe.get_meta("POS Coupon")
 	for spec in POS_COUPON_EXTRA_FIELDS:
+		if not frappe.db.exists("DocType", spec["dt"]):
+			continue
+		meta = frappe.get_meta(spec["dt"])
 		fieldname = spec["fieldname"]
 		# Skip when the column already exists as a native POS Coupon field
 		# (staging pos_next) or as a Custom Field from a previous migrate.
-		if meta.has_field(fieldname) or frappe.db.exists("Custom Field", f"POS Coupon-{fieldname}"):
+		if meta.has_field(fieldname) or frappe.db.exists("Custom Field", f"{spec['dt']}-{fieldname}"):
 			continue
 		if fieldname == "excluded_brands" and not frappe.db.exists(
 			"DocType", "POS Coupon Excluded Brand"
@@ -117,3 +153,4 @@ def _ensure_pos_coupon_extras():
 			frappe.clear_last_message()
 			continue
 	frappe.clear_cache(doctype="POS Coupon")
+	frappe.clear_cache(doctype="POS Settings")
