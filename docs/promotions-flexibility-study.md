@@ -83,7 +83,8 @@ These facts were verified by running #5 (20/20 coupon tests) and #13 (26/26 coup
 
 - **Interaction matrix** (`api/promotion_exclusions.py:38-57`): a `(line state × target) → allowed` table, where every target is per line.
   - Item Level and manual discounts block Auto and coupons.
-  - Accumulative and *transaction* Auto stack, but a *targeted* Auto rule defeats Accumulative on that line.
+  - Accumulative and *transaction* Auto stack, for example 8% + 10% = 18% (`test_auto_discount_stacks_on_top_of_accumulative`).
+  - **A targeted rule beats Accumulative on its line, decided by specificity, not by priority or size.** "Targeted" means either a scoped Auto Discount (`get_targeted_auto_discount_lines`, `promotions/engine.py:359`) or any other Pricing Rule that ERPNext already put on the line (`get_line_baseline(item) > 0`, `engine.py:520`). Neither path compares priority or amount. The claimed line also **stops contributing its scope** to the other lines' accumulated percentage. Tests that pin this: `test_targeted_rule_wins_outright_over_accumulative`, `test_item_scoped_auto_discount_wins_outright`, `test_scoped_auto_line_does_not_contribute_its_scope`, `test_targeted_line_does_not_contribute_its_scope`. All pass on the baseline.
   - Gifts combine with everything.
   - Unknown pairs default to allowed.
   - Auto Discount is applied per line even when its rule is `apply_on = Transaction` (`filter_auto_discount_from_header`, `promotions/engine.py:558`).
@@ -96,7 +97,11 @@ These facts were verified by running #5 (20/20 coupon tests) and #13 (26/26 coup
   - ERPNext coupon-code Pricing Rules
   - order promotions
 
-  So an order promotion and a whole-cart coupon are combined by last writer, not by a rule.
+  So an order promotion and a whole-cart coupon are combined by last writer, not by a rule. **Measured in the client store** (a 1,000 cart, a 100 order discount, a 50 coupon):
+  - With the coupon applied first, the next offer pass writes the header with 100. The total is 900, and the coupon still shows as applied while contributing 0.
+  - With the order discount first, applying the coupon overwrites it with 50. The total goes from 900 to **950**, so the coupon raised the total. That is bug D in §5.
+
+  They never combine today, so no "current" order of bases exists to preserve.
 - **No offline coupon engine.** Offline, POSNext evaluates cached promotional offers only (`stores/posOffers.js:290`). Entering a coupon always calls the server.
 - **Submission does not re-check coupon money.** `invoices.py:1260` checks that the coupon exists and is usable (`check_coupon_code`), then accepts the amounts the invoice already carries.
 
@@ -171,9 +176,9 @@ Every group must declare its bases. PR 1 pins **today's** values in tests first,
 
 | Basis | Must be declared |
 |---|---|
-| Threshold amount | Gross, or net of line discounts; tax-inclusive or tax-exclusive |
+| Threshold amount | Gross, or net of line discounts; tax-inclusive or tax-exclusive. **Today (verified in code), always tax-exclusive:** <ul><li>Promotions Auto and Accumulative passes: gross list price × qty of the whole cart, excluding free and zero-qty lines (`get_pre_discount_subtotal`, `promotion_exclusions.py:320`).</li><li>ERPNext Item, Group or Brand rules: list price × qty of the matching lines only (`pricing_rule/utils.py:284`).</li><li>ERPNext Transaction rules: `doc.total`, which is **after** line discounts (`utils.py:572`).</li><li>Line coupons: list price × qty of the eligible lines (`_item_base_amount`, `coupon_engine.py:240`).</li><li>Legacy whole-cart coupons: net total, or grand total when `apply_on = Grand Total` (`coupon_engine.py:445-462`).</li></ul> |
 | Threshold membership | Whether excluded or non-discountable items count toward it. Trigger lines and rewarded lines are listed separately. |
-| Threshold stability | **Proposal:** thresholds are evaluated once, on the pre-resolver base, so a discount chosen by the resolver can't knock out another offer's eligibility. Without this, resolution can oscillate. |
+| Threshold stability | **Proposal:** thresholds are evaluated once, on the pre-resolver base, so a discount chosen by the resolver can't knock out another offer's eligibility. Without this, resolution can oscillate. **Today this already holds for every basis except ERPNext Transaction rules.** Those gate on `doc.total` after line discounts, so a line discount *can* make an order offer stop qualifying today. Adopting the proposal changes that case, so it must appear in the PR 2 report and the release note. |
 | Returns | Lines with negative quantity yield no effects. A return reverses the original invoice's recorded effects, through the redemption ledger. |
 
 Numeric rules shared by Python and JavaScript:
@@ -197,14 +202,14 @@ The defaults are symmetric, so the mutual rule changes nothing by default. ✓ m
 | **Gift** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | **Coupon** | per coupon | per coupon | per coupon | per coupon | per coupon | ✓ | ✗ one per invoice |
 
-`Exclusive` combines with nothing, including `Gift`. A targeted Auto rule beating Accumulative is today's behaviour, so the default keeps it: targeted Auto has a higher default priority, and the two conflict on that line.
+`Exclusive` combines with nothing, including `Gift`. A targeted rule beating Accumulative is today's behaviour, and it is decided by **specificity, not priority**. The model keeps it as a **fixed precedence** that applies under both policies, not as a priority default: a targeted effect on a line removes the Accumulative effect from that line. Because the claimed line also stops contributing its scope, an Accumulative effect's percentage depends on which lines remain. Its money is therefore computed for each candidate set during simulation, not once up front. Whether "Best for customer" should be allowed to override this precedence is a review decision.
 
 **The per-coupon setting covers line discounts and the order discount alike.** It is **not** derived from today's last-writer behaviour; PR 1 pins that behaviour as "current", not as contract.
 
 | `promotion_conflict` | Against line-scoped groups | Against `Order` |
 |---|---|---|
 | Skip the line | {Gift} only. The coupon skips lines that already carry a discount. | Conflict, and the Priority winner applies |
-| Add on top | Combines (the `stacked` line update exists) | Combines. **The order of bases is a review decision.** Proposal: the order discount applies first, and a whole-cart coupon applies to the net after it. |
+| Add on top | Combines (the `stacked` line update exists) | Combines. **The order of bases is a review decision; nothing exists today to preserve** (§2, "Today"). Proposal: the order discount applies first, and a whole-cart coupon applies to the net after it. ERPNext has a single header field, so both are summed into it with attribution. |
 | Better of the two | Per line, the lower payable total wins | Simulate order-only, coupon-only, and the allowed combination, globally |
 
 Whole-cart coupons are **an effect, not a header write.** In v4, one header slot holds the sum of the chosen header effects, and the trace attributes it to each source.
@@ -249,7 +254,7 @@ Delivery is in §6.
 
 ## 4. Risks
 
-- **Money correctness.** Every new knob multiplies the combinations. Three money bugs surfaced in one session (§5).
+- **Money correctness.** Every new knob multiplies the combinations. Four money bugs surfaced in one session (§5).
   - Gate every engine change on a table-driven test matrix: offer type × combine setting × cart shape, asserting the totals the customer pays.
   - Invariants checked in `apply_offers`: no line net is below 0, and no discount exceeds its base.
   - **Coupon guard: "adding a coupon never raises the grand total".** This would have caught bug B. It runs at two points, because the request alone can't prove it.
@@ -278,8 +283,9 @@ Delivery is in §6.
 | A | **Same-item gift carved below `min_qty`.** With "buy 2 get 1" and exactly 2 scanned, `_apply_bundled_same_item_free_discounts` made one of the two paid units free. The customer paid 15 for 2 instead of 30. The GWP path already had the guard (`gwp.get_gwp_same_item_free_qty`). | Fixed in Promotions PR #12 (`eb022b3`, `3b0f5b0`). The rule is no longer reported as applied until the gift is earned. |
 | B | **An untyped scheme is replaced by a coupon** (PR #5 only). A blank-type Samsung 10% scheme didn't block a coupon, and the coupon engine priced the line from list price as coupon-only. The 10% vanished and the customer paid EGP 780 more for using a coupon. | Fixed by the per-coupon `promotion_conflict` in Promotions #13, stacked on #5. §2 removes the class of bug. |
 | C | **Coupon share key mismatch.** The engine sends `coupon_only_discount`, but the POS read `coupon_discount_amount`. A coupon stacked on a promo showed 1,379.90 instead of 300 on its chip and in totals. | Fixed in POSNext #427. |
+| D | **An order discount and a whole-cart coupon overwrite each other in the client** (`posCart.applyHeaderDiscountFromServer`, `useInvoice.applyDiscount`). Applying a 50 coupon after a 100 order discount raised the total from 900 to 950. Applying it before leaves the coupon shown as applied while worth 0. | **Open.** Measured with a store-level test, 2026-10-26. The §4 guard would block the first case. The fix is part of the conflict model (header effects summed with attribution, PR 4), or a stop-gap that refuses one when the other is present. |
 
-All three are field-name and semantic drift between separate code paths: the GWP vs bundled paths, the matrix vs the coupon engine, the server vs the client. That's the strongest argument for the single resolver and the shared test matrix in §2 and §4.
+All four are field-name and semantic drift between separate code paths: the GWP vs bundled paths, the matrix vs the coupon engine, the server vs the client. That's the strongest argument for the single resolver and the shared test matrix in §2 and §4.
 
 ## 6. Delivery plan
 
