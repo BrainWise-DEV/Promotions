@@ -764,22 +764,25 @@ class TestPromotions(FrappeTestCase):
 			free_item_uom="Nos",
 			free_item_rate=0,
 		)
-		payload = _cart_payload(self.ctx, [_line(self.ctx, ITEM_A, qty=2)])
+		# ITEM_A is 50/unit. The gift is an extra unit on top of min_qty, never carved
+		# out of it: 2 scanned pay for 2, and 3 scanned are 2 paid + 1 free = 100.
+		two = _apply_offers_and_stamp(_cart_payload(self.ctx, [_line(self.ctx, ITEM_A, qty=2)]), [rule])
+		self.assertFalse(flt(two["items"][0].get("free_qty")))
+
+		payload = _cart_payload(self.ctx, [_line(self.ctx, ITEM_A, qty=3)])
 		resp = _apply_offers_and_stamp(payload, [rule])
 		self.assertEqual(resp.get("free_items"), [])
 		self.assertEqual(flt(resp["items"][0].get("free_qty")), 1)
 
-		# ITEM_A is 50/unit. Cart qty=2, 1 of which is free (carved out of the 2, not
-		# an extra 3rd unit) -> 1 unit actually paid for = 50, not 100.
-		final = _submit_invoice(self.ctx, payload, paid_amount=50)
+		final = _submit_invoice(self.ctx, payload, paid_amount=100)
 
 		self.assertEqual(final.status, "Paid")
-		self.assertAlmostEqual(flt(final.grand_total), 50, places=2)
+		self.assertAlmostEqual(flt(final.grand_total), 100, places=2)
 
 		paid_lines = [it for it in final.items if not it.is_free_item]
 		free_lines = [it for it in final.items if it.is_free_item]
 		self.assertEqual(len(paid_lines), 1)
-		self.assertAlmostEqual(flt(paid_lines[0].qty), 1, places=2)
+		self.assertAlmostEqual(flt(paid_lines[0].qty), 2, places=2)
 		self.assertEqual(len(free_lines), 1)
 		self.assertEqual(free_lines[0].item_code, ITEM_A)
 		self.assertAlmostEqual(flt(free_lines[0].qty), 1, places=2)
