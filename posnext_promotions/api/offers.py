@@ -1042,6 +1042,7 @@ def validate_coupon(
 				"line_updates": [],
 				"eligible_item_codes": apply_result.get("eligible_item_codes") or [],
 				"total_discount": 0,
+				"kept_promotion_items": apply_result.get("kept_promotion_items") or [],
 			}
 		response.update(
 			{
@@ -1049,6 +1050,7 @@ def validate_coupon(
 				"eligible_item_codes": apply_result.get("eligible_item_codes") or [],
 				"total_discount": apply_result.get("total_discount") or 0,
 				"eligible_subtotal": apply_result.get("eligible_subtotal") or 0,
+				"kept_promotion_items": apply_result.get("kept_promotion_items") or [],
 				"message": apply_result.get("message"),
 			}
 		)
