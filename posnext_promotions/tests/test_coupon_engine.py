@@ -550,3 +550,68 @@ class TestPOSCoupon(unittest.TestCase):
 
 if __name__ == "__main__":
 	unittest.main()
+
+
+def _promo_line(code="PHONE", base=1000, pct=10, **extra):
+	"""A line already discounted by an untyped Promotional Scheme rule."""
+	return {
+		"item_code": code,
+		"brand": "B1",
+		"item_group": "G1",
+		"qty": 1,
+		"price_list_rate": base,
+		"rate": base * (1 - pct / 100),
+		"discount_percentage": pct,
+		"discount_amount": base * pct / 100,
+		"pricing_rules": "PRLE-UNTYPED",
+		"discount_source": "pricing_rule",
+		"is_already_discounted": 0,
+		**extra,
+	}
+
+
+def _plain_line(code="CABLE", base=100):
+	return {"item_code": code, "brand": "B1", "item_group": "G1", "qty": 1, "price_list_rate": base, "rate": base}
+
+
+class TestCouponPromotionConflict(unittest.TestCase):
+	"""What a coupon does on a line that already carries a promotion."""
+
+	def test_skip_leaves_a_promoted_line_alone(self):
+		coupon = _coupon(discount_percentage=10, promotion_conflict="Skip the line")
+		result = apply_coupon_to_items(coupon, [_promo_line(), _plain_line()])
+		self.assertEqual([u["item_code"] for u in result["line_updates"]], ["CABLE"])
+		self.assertAlmostEqual(result["total_discount"], 10.0)
+
+	def test_blank_setting_skips(self):
+		result = apply_coupon_to_items(_coupon(discount_percentage=10), [_promo_line()])
+		self.assertFalse(result["valid"])
+		self.assertEqual(result["line_updates"], [])
+
+	def test_add_on_top_keeps_the_promotion_and_discounts_what_is_left(self):
+		coupon = _coupon(discount_percentage=10, promotion_conflict="Add on top")
+		[update] = apply_coupon_to_items(coupon, [_promo_line()])["line_updates"]
+		# 10% promo leaves 900; the coupon takes 10% of that: 90
+		self.assertAlmostEqual(update["coupon_only_discount"], 90.0)
+		self.assertAlmostEqual(update["discount_amount"], 190.0)
+		self.assertAlmostEqual(update["rate"], 810.0)
+		self.assertTrue(update["stacked"])
+
+	def test_better_replaces_a_smaller_promotion(self):
+		coupon = _coupon(discount_percentage=20, promotion_conflict="Better of the two")
+		[update] = apply_coupon_to_items(coupon, [_promo_line(pct=10)])["line_updates"]
+		self.assertAlmostEqual(update["discount_amount"], 200.0)
+		self.assertFalse(update.get("stacked"))
+
+	def test_better_keeps_a_larger_promotion(self):
+		coupon = _coupon(discount_percentage=10, promotion_conflict="Better of the two")
+		result = apply_coupon_to_items(coupon, [_promo_line(pct=30), _plain_line()])
+		self.assertEqual([u["item_code"] for u in result["line_updates"]], ["CABLE"])
+		self.assertEqual(result["kept_promotion_items"], ["PHONE"])
+
+	def test_better_rechecks_after_the_cap(self):
+		# 15% of 1000 = 150 beats the 100 promo, but the 80 cap brings it under: promo stays
+		coupon = _coupon(discount_percentage=15, max_amount=80, promotion_conflict="Better of the two")
+		result = apply_coupon_to_items(coupon, [_promo_line(pct=10)])
+		self.assertFalse(result["valid"])
+		self.assertEqual(result["kept_promotion_items"], ["PHONE"])

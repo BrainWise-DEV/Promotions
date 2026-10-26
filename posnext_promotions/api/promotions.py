@@ -7,6 +7,10 @@ import frappe
 from frappe import _
 from frappe.utils import cint, cstr, flt, getdate, nowdate
 
+from posnext_promotions.api.coupon_engine import (
+	PROMOTION_CONFLICT_OPTIONS,
+	PROMOTION_CONFLICT_SKIP,
+)
 from posnext_promotions.api.gwp import GWP_BASIS_MAX
 
 
@@ -887,8 +891,9 @@ def create_coupon(data):
 				"maximum_use": cint(data.get("maximum_use", 0)) or None,
 				"one_use": cint(data.get("one_use", 0)),
 				"maximum_use_per_customer": cint(data.get("maximum_use_per_customer", 0)) or 0,
+				"promotion_conflict": _promotion_conflict_for_new_coupon(data),
 				"exclude_already_discounted_items": cint(
-					data.get("exclude_already_discounted_items", 1)
+					_promotion_conflict_for_new_coupon(data) == PROMOTION_CONFLICT_SKIP
 				),
 				"campaign": data.get("campaign"),
 			}
@@ -909,6 +914,16 @@ def create_coupon(data):
 		frappe.db.rollback()
 		frappe.log_error(title=_("Coupon Creation Failed"), message=frappe.get_traceback())
 		frappe.throw(_("Failed to create coupon: {0}").format(str(e)))
+
+
+def _promotion_conflict_for_new_coupon(data) -> str:
+	"""The choice sent with the coupon, else the POS Profile's default, else skip the line."""
+	if data.get("promotion_conflict") in PROMOTION_CONFLICT_OPTIONS:
+		return data["promotion_conflict"]
+	default = data.get("pos_profile") and frappe.db.get_value(
+		"POS Settings", {"pos_profile": data["pos_profile"]}, "default_coupon_promotion_conflict"
+	)
+	return default if default in PROMOTION_CONFLICT_OPTIONS else PROMOTION_CONFLICT_SKIP
 
 
 @frappe.whitelist()
@@ -966,6 +981,9 @@ def update_coupon(coupon_name, data):
 			coupon.maximum_use_per_customer = cint(data["maximum_use_per_customer"]) or 0
 		if "exclude_already_discounted_items" in data:
 			coupon.exclude_already_discounted_items = cint(data["exclude_already_discounted_items"])
+		if data.get("promotion_conflict") in PROMOTION_CONFLICT_OPTIONS:
+			coupon.promotion_conflict = data["promotion_conflict"]
+			coupon.exclude_already_discounted_items = cint(coupon.promotion_conflict == PROMOTION_CONFLICT_SKIP)
 		if "disabled" in data:
 			coupon.disabled = cint(data["disabled"])
 		if "description" in data:
