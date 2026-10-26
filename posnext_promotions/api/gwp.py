@@ -142,28 +142,27 @@ def get_gwp_slab_free_qty(slab_free_qty, total_qty, min_qty, max_qty):
 	return max(0, int(math.floor(min(free_qty, total_qty))))
 
 
-def get_gwp_same_item_free_qty(slab_free_qty, total_qty, min_qty, max_qty):
-	"""Free units for same-SKU GWP that must be extra scanned, not carved from min_qty.
+def get_gwp_same_item_free_qty(
+	slab_free_qty, paid_qty, min_qty, max_qty, is_recursive=0, recurse_for=0, apply_recursion_over=0
+):
+	"""Free units for same-SKU GWP, granted ON TOP of the paid quantity.
 
-	Buy 2 get 1 free (min_qty=2, free_qty=1) needs 3 scanned units: 2 paid + 1 free.
-	Paid qty after the gift is granted must stay within [min_qty, max_qty].
+	``paid_qty`` must exclude echoed free rows (``is_free_item``). Mirrors
+	ERPNext's same_item product discount: buy 2 get 1 (min_qty=2, free_qty=1)
+	qualifies at 2 paid units and adds 1 free unit as a separate row.
+	Recursive rules grant ``free_qty`` for every ``recurse_for`` paid units.
 	"""
 	free_qty = max(0, int(math.floor(flt(slab_free_qty))))
-	total_qty = flt(total_qty)
-	min_qty = flt(min_qty)
-	max_qty = flt(max_qty)
-	if free_qty <= 0 or total_qty <= 0:
+	paid_qty = flt(paid_qty)
+	if free_qty <= 0 or paid_qty <= 0:
 		return 0
-	if total_qty < min_qty + free_qty:
+	if not is_gwp_total_qty_eligible(paid_qty, min_qty, max_qty):
 		return 0
-	paid_qty = total_qty - free_qty
-	if paid_qty <= 0:
-		return 0
-	if min_qty > 0 and paid_qty < min_qty:
-		return 0
-	if max_qty > 0 and paid_qty > max_qty:
-		return 0
-	return min(free_qty, int(math.floor(total_qty)))
+	recurse_for = flt(recurse_for)
+	if is_recursive and recurse_for > 0:
+		effective = max(0, paid_qty - flt(apply_recursion_over))
+		return max(0, int(math.floor(effective // recurse_for * free_qty)))
+	return free_qty
 
 
 def normalize_gwp_paid_qty_basis(paid_qty_basis):
