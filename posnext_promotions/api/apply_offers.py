@@ -385,9 +385,9 @@ def _apply_bundled_same_item_free_discounts(prepared_items, free_items_map, rule
 def _apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_rules=None) -> None:
 	"""Apply GWP: same-SKU gifts as a free row; mixed SKUs as line discounts.
 
-	Same item (one SKU in the cart): free units must be extra scanned items,
-	not carved from min_qty. Buy 2 get 1 free requires 3 scans — 2 paid + 1
-	free row with a free-item badge.
+	Same item (one SKU in the cart): paid qty (excluding echoed free rows)
+	must reach min_qty; free units are added on top as a separate free row.
+	Buy 2 get 1 free: 2 paid scans -> +1 free row.
 
 	Multi-item / item-group with mixed SKUs: total qty must fall between
 	min_qty and max_qty; free_qty is discounted on cheapest (Max Price basis)
@@ -433,12 +433,19 @@ def _apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_
 		same_item_split = len(item_codes) == 1 and bool(get_gwp_same_item_free_qty)
 
 		if same_item_split:
-			line_qtys = [
-				flt(item_doc.get("qty") or item_doc.get("quantity") or 0) for item_doc in matching_lines
-			]
-			total_qty = sum(line_qtys)
+			# Only paid units qualify; echoed free rows (is_free_item) never count
+			# toward min_qty — the gift is added on top (ERPNext same_item style).
+			paid_qty = sum(
+				flt(item_doc.get("qty") or item_doc.get("quantity") or 0) for item_doc in paid_lines
+			)
 			total_free = get_gwp_same_item_free_qty(
-				slab_free_qty, total_qty, full_rule.min_qty, full_rule.max_qty
+				slab_free_qty,
+				paid_qty,
+				full_rule.min_qty,
+				full_rule.max_qty,
+				is_recursive=cint(full_rule.get("is_recursive")),
+				recurse_for=full_rule.get("recurse_for"),
+				apply_recursion_over=full_rule.get("apply_recursion_over"),
 			)
 			if total_free <= 0:
 				for item_doc in paid_lines:

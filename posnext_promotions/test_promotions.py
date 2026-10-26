@@ -810,8 +810,8 @@ class TestPromotions(FrappeTestCase):
 		self.assertEqual(len(free_lines), 1)
 		self.assertEqual(free_lines[0].item_code, ITEM_C)
 
-	def test_gwp_same_item_requires_extra_scan(self):
-		"""Buy 2 get 1 free of the same SKU: 2 scans do not grant; 3 scans add a free row."""
+	def test_gwp_same_item_paid_qty_qualifies(self):
+		"""Buy 2 get 1 free of the same SKU: paid qty (excl. free rows) >= min_qty grants the free row on top."""
 		import json
 
 		rule = _make_rule(
@@ -827,14 +827,30 @@ class TestPromotions(FrappeTestCase):
 			free_item_rate=0,
 			promotion_type="GWP",
 		)
-		two_scans = _cart_payload(self.ctx, [_line(self.ctx, ITEM_A, qty=2)])
-		resp_two = apply_offers(
-			invoice_data=json.dumps(two_scans),
-			selected_offers=json.dumps([rule]),
-		)
-		self.assertEqual(resp_two.get("free_items") or [], [])
-		self.assertEqual(flt(resp_two["items"][0].get("gwp_free_qty") or 0), 0)
-		self.assertNotIn(rule, resp_two.get("applied_pricing_rules") or [])
+		one_scan = _cart_payload(self.ctx, [_line(self.ctx, ITEM_A, qty=1)])
+		resp_one = apply_offers(invoice_data=json.dumps(one_scan), selected_offers=json.dumps([rule]))
+		self.assertEqual(resp_one.get("free_items") or [], [])
+		self.assertNotIn(rule, resp_one.get("applied_pricing_rules") or [])
+
+		def _free_qty(resp):
+			return sum(flt(f.get("qty")) for f in resp.get("free_items") or [])
+
+		for paid in (2, 3, 4):
+			resp = apply_offers(
+				invoice_data=json.dumps(_cart_payload(self.ctx, [_line(self.ctx, ITEM_A, qty=paid)])),
+				selected_offers=json.dumps([rule]),
+			)
+			self.assertEqual(_free_qty(resp), 1, paid)
+			self.assertIn(rule, resp.get("applied_pricing_rules") or [])
+
+		# Echoed free row must not count toward min_qty (no double counting).
+		free_echo = dict(_line(self.ctx, ITEM_A, qty=1), rate=0, price_list_rate=0, is_free_item=1)
+		echo2 = _cart_payload(self.ctx, [_line(self.ctx, ITEM_A, qty=2), dict(free_echo)])
+		resp_echo2 = apply_offers(invoice_data=json.dumps(echo2), selected_offers=json.dumps([rule]))
+		self.assertEqual(_free_qty(resp_echo2), 1)
+		echo1 = _cart_payload(self.ctx, [_line(self.ctx, ITEM_A, qty=1), dict(free_echo)])
+		resp_echo1 = apply_offers(invoice_data=json.dumps(echo1), selected_offers=json.dumps([rule]))
+		self.assertEqual(_free_qty(resp_echo1), 0)
 
 		three_scans = _cart_payload(self.ctx, [_line(self.ctx, ITEM_A, qty=3)])
 		resp_three = _apply_offers_and_stamp(three_scans, [rule])
