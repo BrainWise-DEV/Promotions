@@ -83,3 +83,4 @@ doc_events = {
 # are installed. Keep the task module for sites that call it explicitly.
 
 before_install = "posnext_promotions.install.before_install"
+after_migrate = "posnext_promotions.install.after_migrate"
