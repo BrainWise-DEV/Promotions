@@ -133,7 +133,14 @@ def build_demo_data(prefix: str = DEFAULT_PREFIX, company: str | None = None, pr
 		name = f"{prefix} {key.title()}"
 		if not frappe.db.exists("Customer", name):
 			frappe.get_doc(
-				{"doctype": "Customer", "customer_name": name, "customer_group": group, "customer_type": "Individual"}
+				{
+					"doctype": "Customer",
+					"customer_name": name,
+					"customer_group": group,
+					"customer_type": "Individual",
+					# explicit: the field defaults to 1 for new customers
+					FLAG_FIELD: flag,
+				}
 			).insert(ignore_permissions=True)
 		# Direct write: the flag guard (manager-only) is about cashiers, not this seed.
 		frappe.db.set_value("Customer", name, {"customer_group": group, FLAG_FIELD: flag, "disabled": 0})

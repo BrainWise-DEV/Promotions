@@ -255,6 +255,44 @@ class TestFriendsandFamilyEligibility(FrappeTestCase):
 		frappe.set_user("Administrator")
 		frappe.db.set_value("Customer", PLAIN_CUSTOMER, FLAG_FIELD, 0)
 
+	# ---- flag default (new customers = 1) ----------------------------------
+
+	def test_flag_field_default_is_one_after_sync(self):
+		from posnext_promotions.promotions.friends_and_family_eligibility import (
+			ensure_customer_flag_field,
+		)
+
+		cf = frappe.db.get_value("Custom Field", {"dt": "Customer", "fieldname": FLAG_FIELD}, "name")
+		frappe.db.set_value("Custom Field", cf, "default", "0")
+		before = frappe.db.get_value("Customer", PLAIN_CUSTOMER, FLAG_FIELD)
+		ensure_customer_flag_field()
+		self.assertEqual(frappe.db.get_value("Custom Field", cf, "default"), "1")
+		# Existing customers are never backfilled.
+		self.assertEqual(frappe.db.get_value("Customer", PLAIN_CUSTOMER, FLAG_FIELD), before)
+
+	def test_new_customer_defaults_to_flagged_and_cashier_can_create(self):
+		from posnext_promotions.promotions.friends_and_family_eligibility import (
+			ensure_customer_flag_field,
+		)
+
+		ensure_customer_flag_field()
+		frappe.clear_cache(doctype="Customer")
+		frappe.set_user(CASHIER_USER)
+		customer = frappe.get_doc(
+			{
+				"doctype": "Customer",
+				"customer_name": "FF Default Flag New",
+				"customer_group": frappe.db.get_value("Customer", PLAIN_CUSTOMER, "customer_group"),
+				"customer_type": "Individual",
+			}
+		)
+		customer.insert(ignore_permissions=True)
+		frappe.set_user("Administrator")
+		try:
+			self.assertEqual(frappe.db.get_value("Customer", customer.name, FLAG_FIELD), 1)
+		finally:
+			frappe.delete_doc("Customer", customer.name, force=1, ignore_permissions=True)
+
 	# ---- approved email domains (mandatory) --------------------------------
 
 	def test_domain_rows_normalised_and_validated(self):

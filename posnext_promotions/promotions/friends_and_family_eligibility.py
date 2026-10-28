@@ -61,7 +61,8 @@ CUSTOMER_FLAG_FIELD_SPEC = {
 	"module": "POSNext Promotions",
 	"label": "Friends & Family Member",
 	"fieldtype": "Check",
-	"default": "0",
+	# New customers are flagged by default; existing customers keep their value.
+	"default": "1",
 	"insert_after": "customer_group",
 	"in_standard_filter": 1,
 	"description": "Eligible for the Friends & Family discount when the program allows the Customer Flag. "
@@ -313,6 +314,11 @@ def get_eligibility_rules_payload(settings=None) -> dict:
 # ---- Customer hooks ---------------------------------------------------------
 
 
+def _flag_default(doc) -> int:
+	field = doc.meta.get_field(FLAG_FIELD)
+	return cint(field.default) if field and field.default not in (None, "") else 0
+
+
 def guard_flag_changes(doc, method=None):
 	"""Customer.validate — only managers may change the Friends & Family flag.
 
@@ -325,7 +331,9 @@ def guard_flag_changes(doc, method=None):
 		return
 
 	before = doc.get_doc_before_save()
-	old_value = cint(before.get(FLAG_FIELD)) if before else 0
+	# A new customer starts from the field default (1), so creating one with the
+	# default value is not a "change" and stays open to cashiers.
+	old_value = cint(before.get(FLAG_FIELD)) if before else _flag_default(doc)
 	if cint(doc.get(FLAG_FIELD)) == old_value:
 		return
 	if set(frappe.get_roles()) & set(FLAG_MANAGER_ROLES):
