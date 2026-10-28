@@ -82,10 +82,8 @@ def compute_product_recursive_free_qty(
 	if not is_recursive:
 		return floor_free_qty(min(slab_free, purchased_qty)) if purchased_qty > 0 else 0
 
-	if same_item:
-		return compute_included_recursive_free_qty(
-			purchased_qty, slab_free, recurse_for, apply_recursion_over
-		)
+	# Same-item and other-item frees are both added on top of the paid qty;
+	# ``same_item`` is kept for callers but no longer changes the formula.
 	return compute_additional_recursive_free_qty(
 		purchased_qty, slab_free, recurse_for, apply_recursion_over
 	)
