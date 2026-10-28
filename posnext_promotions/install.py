@@ -28,3 +28,25 @@ def before_install():
 		if not frappe.db.exists("Module Def", module):
 			continue
 		frappe.delete_doc("Module Def", module, force=1, ignore_permissions=True)
+
+
+def after_migrate():
+	"""Runs after sync_customizations, so the custom/*.json fields exist by now."""
+	_backfill_coupon_promotion_conflict()
+
+
+def _backfill_coupon_promotion_conflict():
+	"""Give coupons saved before `promotion_conflict` existed their old behaviour:
+	checked exclude_already_discounted_items skips, unchecked stacks (from #13). Idempotent."""
+	if not frappe.db.exists("DocType", "POS Coupon"):
+		return
+	if not frappe.get_meta("POS Coupon").has_field("promotion_conflict"):
+		return
+	for excluded, mode in ((1, "Skip the line"), (0, "Add on top")):
+		frappe.db.set_value(
+			"POS Coupon",
+			{"promotion_conflict": ["is", "not set"], "exclude_already_discounted_items": excluded},
+			"promotion_conflict",
+			mode,
+			update_modified=False,
+		)
