@@ -805,10 +805,6 @@ def _filter_out_of_stock_free_items(
 			leftover[stock_key] = available - paid_demand.get(stock_key, 0)
 
 		if leftover[stock_key] < requested:
-			# Same-SKU GWP free units are carved from already-scanned paid qty,
-			# so they do not need extra warehouse stock beyond the paid demand.
-			if cint(free_doc.get("gwp_same_item_row")) and paid_demand.get(stock_key, 0) >= requested:
-				continue
 			free_items_map.pop(key, None)
 			skipped.append(
 				{

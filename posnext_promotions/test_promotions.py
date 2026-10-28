@@ -1975,10 +1975,16 @@ class TestPromotionMatrix14214(FrappeTestCase):
 				self._line_14214(companion, qty=3),
 			],
 		)
-		resp = apply_offers(
-			invoice_data=json.dumps(payload),
-			selected_offers=json.dumps([item_rule, gwp_rule]),
-		)
+		# The gift sits on top of the 3 paid units, so 4 must be in stock.
+		# The test warehouse has none for this real item; stub stock so the
+		# test checks stacking, not site inventory.
+		from unittest.mock import patch
+
+		with patch("posnext_promotions.api.apply_offers._get_available_stock", return_value=10):
+			resp = apply_offers(
+				invoice_data=json.dumps(payload),
+				selected_offers=json.dumps([item_rule, gwp_rule]),
+			)
 		self.assertTrue(resp["items"][0].get("is_already_discounted"))
 		companion_line = next(it for it in resp["items"] if it.get("item_code") == companion)
 		self.assertEqual(flt(companion_line.get("gwp_free_qty") or 0), 0)
