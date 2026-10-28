@@ -148,23 +148,6 @@ def _stamp_gwp_line_discount(item_doc, line_free_qty, price_list_rate) -> None:
 	item_doc.rate = flt(price_list_rate - (line_discount / purchased_qty))
 
 
-def _stamp_bundled_same_item_free_discount(item_doc, line_free_qty, price_list_rate) -> None:
-	"""Apply same-item free gift on the purchased line (1 of N units free, no extra row)."""
-	line_free_qty = _floor_free_item_qty(line_free_qty)
-	purchased_qty = flt(item_doc.get("qty") or item_doc.get("quantity") or 0)
-	price_list_rate = flt(price_list_rate)
-	line_discount = calculate_gwp_discount_amount(line_free_qty, price_list_rate)
-	if line_discount <= 0 or purchased_qty <= 0:
-		return
-
-	item_doc.discount_amount = line_discount
-	item_doc.discount_percentage = 0
-	item_doc.gwp_free_qty = 0
-	item_doc.free_qty = line_free_qty
-	item_doc.discount_source = DISCOUNT_SOURCE_FREE_ITEM
-	item_doc.rate = flt(price_list_rate - (line_discount / purchased_qty))
-
-
 def _make_free_item_doc(item_code, qty, rule_name, full_rule, promotional_scheme=None, **extra):
 	"""Build a free-item payload for ``free_items_map``."""
 	item_data = frappe.get_cached_value(
@@ -199,13 +182,13 @@ def _recompute_recursive_product_free_items(prepared_items, free_items_map, rule
 	   is rejected). Item Code other-item scopes evaluate each line alone and
 	   sum free gifts.
 
-	3. Same-item free qty uses the included cycle
-	   (recurse_for + free_qty; qty 3 → 1 free / pay 2). Bundled on the paid
-	   line as amount discount + free badge — no percentage.
+	3. Same-item free qty is added on top of the paid qty
+	   (paid // recurse_for * free_qty; buy 2 get 1 → 2 paid + 1 free row),
+	   matching ERPNext same_item semantics and the same-SKU GWP path.
 
 	4. When free qty is 0, strip the rule from lines / applied_rules so the UI
 	   does not show "Applied" without a discount (e.g. qty 2 with min_qty 2
-	   but cycle needs 3).
+	   but recurse_for needs more).
 	"""
 	if not compute_product_recursive_free_qty or not should_aggregate_product_quantities:
 		return
@@ -342,45 +325,6 @@ def _recompute_recursive_product_free_items(prepared_items, free_items_map, rule
 
 		if not line_gave_free and applied_rules is not None:
 			applied_rules.discard(rule_name)
-
-def _apply_bundled_same_item_free_discounts(prepared_items, free_items_map, rule_map) -> None:
-	"""Bundle non-GWP same-item free gifts onto the paid line instead of a separate row."""
-	if not calculate_gwp_discount_amount:
-		return
-
-	for key in list(free_items_map.keys()):
-		item_code, rule_name = key
-		if rule_name not in rule_map:
-			continue
-		if rule_promotion_type(rule_map[rule_name]) in (PROMOTION_TYPE_GWP, PROMOTION_TYPE_GIFT_POOL):
-			continue
-
-		full_rule = frappe.get_cached_doc("Pricing Rule", rule_name)
-		if full_rule.price_or_product_discount != "Product" or not full_rule.same_item:
-			continue
-
-		free_item_doc = free_items_map.pop(key)
-		free_qty = _floor_free_item_qty(free_item_doc.get("qty"))
-		if free_qty <= 0:
-			continue
-
-		for item_doc in prepared_items:
-			if item_doc.get("is_free_item"):
-				continue
-			if item_doc.get("item_code") != item_code:
-				continue
-			if not _item_matches_gwp_rule(item_doc, full_rule) and rule_name not in _item_pricing_rule_names(
-				item_doc
-			):
-				continue
-
-			price_list_rate = flt(
-				item_doc.get("price_list_rate") or item_doc.get("rate") or 0
-			)
-			_stamp_bundled_same_item_free_discount(item_doc, free_qty, price_list_rate)
-			append_pricing_rule(item_doc, rule_name)
-			break
-
 
 def _apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_rules=None) -> None:
 	"""Apply GWP: same-SKU gifts as a free row; mixed SKUs as line discounts.
@@ -805,10 +749,6 @@ def _filter_out_of_stock_free_items(
 			leftover[stock_key] = available - paid_demand.get(stock_key, 0)
 
 		if leftover[stock_key] < requested:
-			# Same-SKU GWP free units are carved from already-scanned paid qty,
-			# so they do not need extra warehouse stock beyond the paid demand.
-			if cint(free_doc.get("gwp_same_item_row")) and paid_demand.get(stock_key, 0) >= requested:
-				continue
 			free_items_map.pop(key, None)
 			skipped.append(
 				{
@@ -1631,11 +1571,11 @@ def apply_offers(invoice_data, selected_offers=None):
 		applied_rules.update(txn_result.get("applied_rules", set()))
 
 		# Recursive product free must run after per-item + txn free rows are
-		# collected, then bundle same-item gifts / apply GWP line discounts.
+		# collected, then apply GWP line discounts. Same-item Product frees
+		# stay as separate free rows (gift on top of paid qty, like ERPNext).
 		_recompute_recursive_product_free_items(
 			prepared_items, free_items_map, rule_map, applied_rules
 		)
-		_apply_bundled_same_item_free_discounts(prepared_items, free_items_map, rule_map)
 		_apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_rules)
 		_apply_gift_pool_free_items(
 			prepared_items,
