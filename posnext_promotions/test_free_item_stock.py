@@ -9,7 +9,7 @@ from unittest.mock import patch
 import frappe
 from frappe.tests.utils import FrappeTestCase
 
-from posnext_promotions.api.invoices import (
+from posnext_promotions.api.apply_offers import (
 	_filter_out_of_stock_free_items,
 	_free_item_row_names_blocked_by_stock,
 	_strip_out_of_stock_free_items_from_invoice,
@@ -85,10 +85,10 @@ class TestFilterOutOfStockFreeItems(FrappeTestCase):
 			return 0 if item.get("item_code") == "OOS" else 10
 
 		with (
-			patch("posnext_promotions.api.invoices._should_block", return_value=True),
-			patch("posnext_promotions.api.invoices._item_is_stock_item", return_value=True),
-			patch("posnext_promotions.api.invoices._get_item_negative_stock_allow_set", return_value=set()),
-			patch("posnext_promotions.api.invoices._get_available_stock", side_effect=stock),
+			patch("posnext_promotions.api.apply_offers._should_block", return_value=True),
+			patch("posnext_promotions.api.apply_offers._item_is_stock_item", return_value=True),
+			patch("posnext_promotions.api.apply_offers._get_item_negative_stock_allow_set", return_value=set()),
+			patch("posnext_promotions.api.apply_offers._get_available_stock", side_effect=stock),
 		):
 			skipped = _filter_out_of_stock_free_items(
 				free_items_map,
@@ -111,10 +111,10 @@ class TestFilterOutOfStockFreeItems(FrappeTestCase):
 		paid = [{"item_code": "MOUSE", "qty": 1, "warehouse": "WH", "conversion_factor": 1}]
 
 		with (
-			patch("posnext_promotions.api.invoices._should_block", return_value=True),
-			patch("posnext_promotions.api.invoices._item_is_stock_item", return_value=True),
-			patch("posnext_promotions.api.invoices._get_item_negative_stock_allow_set", return_value=set()),
-			patch("posnext_promotions.api.invoices._get_available_stock", return_value=1),
+			patch("posnext_promotions.api.apply_offers._should_block", return_value=True),
+			patch("posnext_promotions.api.apply_offers._item_is_stock_item", return_value=True),
+			patch("posnext_promotions.api.apply_offers._get_item_negative_stock_allow_set", return_value=set()),
+			patch("posnext_promotions.api.apply_offers._get_available_stock", return_value=1),
 		):
 			skipped = _filter_out_of_stock_free_items(
 				free_items_map, "WH", paid, "PROFILE"
@@ -127,7 +127,7 @@ class TestFilterOutOfStockFreeItems(FrappeTestCase):
 		free_items_map = {
 			("OOS", "RULE1"): frappe._dict({"item_code": "OOS", "qty": 1}),
 		}
-		with patch("posnext_promotions.api.invoices._should_block", return_value=False):
+		with patch("posnext_promotions.api.apply_offers._should_block", return_value=False):
 			skipped = _filter_out_of_stock_free_items(free_items_map, "WH", [], "PROFILE")
 		self.assertEqual(len(free_items_map), 1)
 		self.assertEqual(skipped, [])
@@ -192,8 +192,8 @@ class TestApplyOffersSkipsOosFreeItem(FrappeTestCase):
 			return 100
 
 		with (
-			patch("posnext_promotions.api.invoices._should_block", return_value=True),
-			patch("posnext_promotions.api.invoices._get_available_stock", side_effect=stock),
+			patch("posnext_promotions.api.apply_offers._should_block", return_value=True),
+			patch("posnext_promotions.api.apply_offers._get_available_stock", side_effect=stock),
 		):
 			resp = apply_offers(
 				invoice_data=json.dumps(payload),
@@ -221,8 +221,8 @@ class TestApplyOffersSkipsOosFreeItem(FrappeTestCase):
 		payload = _cart_payload(self.ctx, [_line(self.ctx, ITEM_B, qty=1)])
 
 		with (
-			patch("posnext_promotions.api.invoices._should_block", return_value=True),
-			patch("posnext_promotions.api.invoices._get_available_stock", return_value=50),
+			patch("posnext_promotions.api.apply_offers._should_block", return_value=True),
+			patch("posnext_promotions.api.apply_offers._get_available_stock", return_value=50),
 		):
 			resp = apply_offers(
 				invoice_data=json.dumps(payload),

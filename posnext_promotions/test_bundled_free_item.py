@@ -7,7 +7,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import flt
 
-from posnext_promotions.api.invoices import apply_offers
+from posnext_promotions.api.apply_offers import apply_offers
 from posnext_promotions.test_promotions import ITEM_A, _cart_payload, _ctx, _line, _make_rule
 
 

@@ -9,7 +9,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import flt
 
-from posnext_promotions.api.invoices import apply_offers
+from posnext_promotions.api.apply_offers import apply_offers
 from posnext_promotions.api.product_free import (
 	compute_additional_recursive_free_qty,
 	compute_included_recursive_free_qty,
