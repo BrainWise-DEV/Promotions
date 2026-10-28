@@ -37,10 +37,23 @@ class TestGwpDiscount(unittest.TestCase):
 
 	def test_same_item_requires_extra_scanned_qty(self):
 		# Buy 2 get 1 free: 2 scans are not enough; 3 scans grant 1 free.
-		self.assertEqual(get_gwp_same_item_free_qty(1, 2, 2, 0), 0)
+		# Paid qty only; gift on top (buy 2 get 1).
+		self.assertEqual(get_gwp_same_item_free_qty(1, 1, 2, 0), 0)
+		self.assertEqual(get_gwp_same_item_free_qty(1, 2, 2, 0), 1)
 		self.assertEqual(get_gwp_same_item_free_qty(1, 3, 2, 0), 1)
-		self.assertEqual(get_gwp_same_item_free_qty(1, 3, 2, 2), 1)
-		self.assertEqual(get_gwp_same_item_free_qty(1, 4, 2, 2), 0)
+		self.assertEqual(get_gwp_same_item_free_qty(1, 4, 2, 0), 1)
+		self.assertEqual(get_gwp_same_item_free_qty(1, 2, 2, 2), 1)
+		self.assertEqual(get_gwp_same_item_free_qty(1, 3, 2, 2), 0)
+
+	def test_same_item_free_qty_recursive(self):
+		# recurse_for 2, free 1: one free per 2 paid units, on top.
+		self.assertEqual(get_gwp_same_item_free_qty(1, 1, 2, 0, 1, 2), 0)
+		self.assertEqual(get_gwp_same_item_free_qty(1, 2, 2, 0, 1, 2), 1)
+		self.assertEqual(get_gwp_same_item_free_qty(1, 3, 2, 0, 1, 2), 1)
+		self.assertEqual(get_gwp_same_item_free_qty(1, 4, 2, 0, 1, 2), 2)
+		self.assertEqual(get_gwp_same_item_free_qty(1, 7, 2, 0, 1, 2), 3)
+		# recurse_for 0 falls back to non-recursive.
+		self.assertEqual(get_gwp_same_item_free_qty(1, 6, 2, 0, 1, 0), 1)
 
 	def test_distribute_max_basis_on_cheapest(self):
 		self.assertEqual(
