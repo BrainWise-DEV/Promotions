@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import frappe
+from frappe.custom.doctype.property_setter.property_setter import make_property_setter
 
 # Module Def names this app owns. They may already exist on a site that ran
 # staging pos_next (promotions lived there before the split).
@@ -154,3 +155,6 @@ def _ensure_pos_coupon_extras():
 			continue
 	frappe.clear_cache(doctype="POS Coupon")
 	frappe.clear_cache(doctype="POS Settings")
+	# promotion_conflict replaces this checkbox on the form; the column stays for older readers
+	if frappe.get_meta("POS Coupon").has_field("exclude_already_discounted_items"):
+		make_property_setter("POS Coupon", "exclude_already_discounted_items", "hidden", 1, "Check")
