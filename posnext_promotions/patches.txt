@@ -9,3 +9,5 @@ posnext_promotions.patches.v2_3_0.rehome_gift_pool_item_doctype
 posnext_promotions.patches.v2_6_0.ff_message_event_to_link
 posnext_promotions.patches.v2_6_0.drop_ff_settings_user_message
 posnext_promotions.patches.v2_6_0.drop_ff_settings_brand_name
+posnext_promotions.patches.v2_6_0.force_apply_with_ff_default
+posnext_promotions.patches.v2_6_0.hide_ff_group_flag_eligibility

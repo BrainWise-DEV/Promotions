@@ -321,40 +321,40 @@ def log_invoice_cancel(doc, method=None):
 # ---- customer eligibility -------------------------------------------------
 
 
-def _member_under_settings(customer_group, flag, disabled) -> tuple[bool, str | None]:
-	"""Membership under the current Settings, ignoring enabled / dates (that is the program, not the member)."""
+def _email_eligible_snapshot(doc) -> tuple[bool, str | None]:
+	"""Eligible under current Settings from email domain + verification (ignores program dates)."""
 	from posnext_promotions.promotions import friends_and_family_eligibility as elig
 	from posnext_promotions.promotions.friends_and_family import get_settings
 
-	if cint(disabled):
-		return False, "customer_disabled"
+	if cint(doc.get("disabled")):
+		return False, elig.REASON_CUSTOMER_DISABLED
 	settings = get_settings()
-	basis = elig.get_eligibility_basis(settings)
-	if basis in (elig.BASIS_GROUP, elig.BASIS_GROUP_OR_FLAG) and elig.match_customer_group(
-		customer_group, elig.get_configured_customer_groups(settings)
-	):
-		return True, elig.REASON_CUSTOMER_GROUP
-	if basis in (elig.BASIS_FLAG, elig.BASIS_GROUP_OR_FLAG) and cint(flag):
-		return True, elig.REASON_CUSTOMER_FLAG
-	return False, elig.REASON_NOT_ELIGIBLE
+	failure, _domain, _domain_ok = elig.check_customer_email(doc, settings)
+	if failure:
+		return False, failure
+	return True, elig.REASON_EMAIL_VERIFIED
 
 
 @_safe
 def log_customer_eligibility_change(doc, method=None):
-	"""Customer ``on_update`` — log when membership flips (flag / group / disabled)."""
-	from posnext_promotions.promotions.friends_and_family_eligibility import FLAG_FIELD
+	"""Customer ``on_update`` — log when email-based F&F eligibility flips."""
+	from posnext_promotions.promotions.friends_and_family_eligibility import (
+		VERIFIED_EMAIL_FIELD,
+		VERIFIED_FLAG_FIELD,
+		has_verification_fields,
+	)
 
 	before = doc.get_doc_before_save()
-	watched = ("customer_group", FLAG_FIELD, "disabled")
+	watched = ["email_id", "disabled"]
+	if has_verification_fields():
+		watched += [VERIFIED_FLAG_FIELD, VERIFIED_EMAIL_FIELD]
 	old = {f: (before.get(f) if before else None) for f in watched}
 	new = {f: doc.get(f) for f in watched}
 	if before and all(cstr(old[f]) == cstr(new[f]) for f in watched):
 		return
 
-	was, was_reason = (
-		_member_under_settings(old["customer_group"], old[FLAG_FIELD], old["disabled"]) if before else (False, None)
-	)
-	now, now_reason = _member_under_settings(new["customer_group"], new[FLAG_FIELD], new["disabled"])
+	was, was_reason = _email_eligible_snapshot(before) if before else (False, None)
+	now, now_reason = _email_eligible_snapshot(doc)
 	if was == now:
 		return
 
@@ -366,9 +366,9 @@ def log_customer_eligibility_change(doc, method=None):
 		reference_name=doc.name,
 		reason=now_reason if now else was_reason,
 		message=(
-			_("Customer {0} is now a Friends & Family member ({1})").format(doc.name, now_reason)
+			_("Customer {0} is now eligible for Friends & Family ({1})").format(doc.name, now_reason)
 			if now
-			else _("Customer {0} is no longer a Friends & Family member ({1})").format(doc.name, now_reason)
+			else _("Customer {0} is no longer eligible for Friends & Family ({1})").format(doc.name, now_reason)
 		),
 		details={"changes": changes, "before": was_reason, "after": now_reason},
 	)

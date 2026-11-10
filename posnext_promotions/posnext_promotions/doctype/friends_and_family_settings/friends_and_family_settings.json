@@ -109,28 +109,32 @@
    "description": "Maximum cumulative Friends & Family discount one customer can receive in a calendar month (submitted invoices, net of returns). 0 = no cap."
   },
   {
-   "description": "Who gets Friends & Family. \"Customer Flag\" is the Friends & Family Member checkbox on the Customer form.",
+   "description": "Legacy. Eligibility is approved email domain + verified email only; these fields are hidden and ignored.",
    "fieldname": "eligibility_section",
    "fieldtype": "Section Break",
+   "hidden": 1,
    "label": "Customer Eligibility"
   },
   {
    "default": "Customer Group or Flag",
    "fieldname": "eligibility_basis",
    "fieldtype": "Select",
+   "hidden": 1,
    "label": "Eligible When",
    "options": "Customer Group or Flag\nCustomer Group\nCustomer Flag",
-   "reqd": 1
+   "reqd": 0
   },
   {
    "fieldname": "column_break_eligibility",
-   "fieldtype": "Column Break"
+   "fieldtype": "Column Break",
+   "hidden": 1
   },
   {
    "depends_on": "eval:doc.eligibility_basis!=\"Customer Flag\"",
-   "description": "Customers in these groups, including their child groups, are eligible.",
+   "description": "Legacy. Ignored — eligibility uses Approved Domains only.",
    "fieldname": "eligible_customer_groups",
    "fieldtype": "Table",
+   "hidden": 1,
    "label": "Eligible Customer Groups",
    "options": "Friends and Family Customer Group"
   },
@@ -138,7 +142,7 @@
    "fieldname": "approved_domains_section",
    "fieldtype": "Section Break",
    "label": "Approved Domains",
-   "description": "Required while the program is enabled. A customer who matches the eligibility rule above gets Friends & Family only with an OTP-verified email on one of these domains. Exact match only: sub-domains are NOT included automatically and must be added as separate rows (e.g. add both miraaya.com and mail.miraaya.com). With no enabled domain nobody gets Friends & Family."
+   "description": "Required while the program is enabled. A customer gets Friends & Family only with an OTP-verified email on one of these domains. Exact match only: sub-domains are NOT included automatically and must be added as separate rows (e.g. add both miraaya.com and mail.miraaya.com). With no enabled domain nobody gets Friends & Family."
   },
   {
    "fieldname": "approved_domains",

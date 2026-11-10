@@ -238,11 +238,12 @@ class TestFriendsAndFamilyAcceptance(FrappeTestCase):
 		self.assertTrue(all(log.discount_source == FNF for log in logs))
 		self.assertEqual(sum(flt(log.discount_amount) for log in logs), 600)
 
-	def test_01b_flagged_customer_eligible(self):
+	def test_01b_verified_domain_customer_eligible_without_group_or_flag(self):
+		# Flagged demo customer is eligible via verified approved-domain email only.
 		doc = self._sell(self.flagged, [("laptop", 1)])
 		self.assertEqual(flt(self._row(doc, "laptop").rate), 700)
-		self._settings(eligibility_basis="Customer Group")  # flag no longer counts
-		doc = self._sell(self.flagged, [("laptop", 1)])
+		# Public demo customer uses a non-approved email → not eligible.
+		doc = self._sell(self.public, [("laptop", 1)])
 		self.assertEqual(flt(self._row(doc, "laptop").rate), 1000)
 
 	def test_01c_pos_cart_payload_contract(self):
@@ -599,18 +600,16 @@ class TestFriendsAndFamilyAcceptance(FrappeTestCase):
 		self.assertEqual(flt(direct), 150)
 
 	def test_15_settings_and_eligibility_changes_are_logged(self):
+		from posnext_promotions.promotions.friends_and_family_testing import give_verified_email
+
 		self._settings(discount_percentage=25)
 		change = frappe.get_all(
 			LOG, filters={"log_type": "Settings Changed"}, fields=["details"], order_by="creation desc", limit=1
 		)[0]
 		self.assertIn("discount_percentage", change.details)
-		customer = frappe.get_doc("Customer", self.public)
-		customer.set(FLAG_FIELD, 1)
-		customer.save()
-		self.assertEqual(
-			frappe.get_all(LOG, filters={"reference_name": self.public, "log_type": "Eligibility Applied"}, pluck="reason"),
-			["customer_flag"],
-		)
+		# Public becomes eligible when given a verified email on an approved domain
+		# (no Customer Group / Member flag required).
+		give_verified_email(self.public, self.demo["email_domain"])
 		doc = self._sell(self.public, [("laptop", 1)])
 		self.assertEqual(flt(self._row(doc, "laptop").rate), 750)  # now eligible at 25%
 

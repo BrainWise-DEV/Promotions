@@ -5,27 +5,24 @@
 
 A customer is entitled to the program when it is live (see
 :func:`posnext_promotions.promotions.friends_and_family.get_active_program`) and
-the customer matches the criterion configured on **Friends and Family Settings**:
+**both** of the following are true:
 
-- **Customer Group** — the customer's group is one of the Eligible Customer
-  Groups, or a descendant of one (Customer Group is a tree).
-- **Customer Flag** — the ``Friends & Family Member`` checkbox on the Customer.
-- **Customer Group or Flag** — either of the above.
+1. ``Customer.email_id`` domain is exactly one of the enabled **Approved Domains**
+   on Friends and Family Settings (case-insensitive; sub-domains must be listed
+   as their own rows).
+2. That email is OTP-verified through POSNext and unchanged since
+   (``custom_email_verified`` = 1 and ``custom_verified_email`` = ``email_id``) —
+   always, independent of ``POS Settings.enable_customer_email_verification``.
 
-**Approved email domains are mandatory.** A customer who matches the Group /
-Flag rule (an *F&F member*) must ALSO have an email (``Customer.email_id``)
-whose domain is exactly one of the enabled Approved Domains (case-insensitive;
-sub-domains must be listed as their own rows), and that email must be
-OTP-verified through POSNext and unchanged since (``custom_email_verified`` = 1
-and ``custom_verified_email`` = ``email_id``) — always, independent of
-``POS Settings.enable_customer_email_verification``. With no enabled domain
-nobody gets F&F (``no_approved_domains``). Non-members are never asked for an
-email or verification.
+With no enabled Approved Domain nobody gets F&F (``no_approved_domains``).
+
+Customer Group and the legacy ``Friends & Family Member`` checkbox are **not**
+part of eligibility. ``ff_member`` in the payload means the email domain is
+approved (so POSNext can offer OTP even when general verification is off).
 
 Disabled customers are never eligible. The server is the authority: the discount
 engine must call :func:`get_program_for_customer` with the invoice's customer and
-posting date rather than trust a client-side flag, so a cashier cannot force F&F
-onto an ineligible customer.
+posting date rather than trust a client-side flag.
 """
 
 from __future__ import annotations
@@ -35,9 +32,7 @@ from dataclasses import dataclass
 
 import frappe
 from frappe import _
-from frappe.query_builder import DocType, Order
 from frappe.utils import cint, cstr
-from frappe.utils.nestedset import get_descendants_of
 
 from posnext_promotions.promotions.friends_and_family import (
 	FriendsAndFamilyProgram,
@@ -46,14 +41,14 @@ from posnext_promotions.promotions.friends_and_family import (
 	profile_allows_ff,
 )
 
+# Legacy constants kept so older callers / logs do not break on import.
 BASIS_GROUP_OR_FLAG = "Customer Group or Flag"
 BASIS_GROUP = "Customer Group"
 BASIS_FLAG = "Customer Flag"
 BASES = (BASIS_GROUP_OR_FLAG, BASIS_GROUP, BASIS_FLAG)
 
-# Custom Field on Customer, created by install.after_migrate.
+# Custom Field on Customer (hidden; no longer gates eligibility).
 FLAG_FIELD = "custom_is_friends_and_family"
-# Roles allowed to tick / untick the flag (same roles that manage the settings).
 FLAG_MANAGER_ROLES = ("System Manager", "Sales Manager")
 
 CUSTOMER_FLAG_FIELD_SPEC = {
@@ -61,31 +56,30 @@ CUSTOMER_FLAG_FIELD_SPEC = {
 	"module": "POSNext Promotions",
 	"label": "Friends & Family Member",
 	"fieldtype": "Check",
-	# New customers are flagged by default; existing customers keep their value.
 	"default": "1",
 	"insert_after": "customer_group",
-	"in_standard_filter": 1,
-	"description": "Eligible for the Friends & Family discount when the program allows the Customer Flag. "
-	"Only a Sales Manager or System Manager can change this.",
+	"hidden": 1,
+	"in_standard_filter": 0,
+	"description": "Legacy field. Friends & Family eligibility is based only on an "
+	"OTP-verified email on an approved company domain.",
 }
 
 REASON_NO_CUSTOMER = "no_customer"
 REASON_PROGRAM_INACTIVE = "program_inactive"
-# The POS Profile has "Allow F&F" unticked: F&F is off for the whole profile.
 REASON_PROFILE_NOT_ALLOWED = "profile_not_allowed"
 REASON_CUSTOMER_NOT_FOUND = "customer_not_found"
 REASON_CUSTOMER_DISABLED = "customer_disabled"
+# Legacy reason codes (no longer produced by get_customer_eligibility).
 REASON_CUSTOMER_GROUP = "customer_group"
 REASON_CUSTOMER_FLAG = "customer_flag"
 REASON_NOT_ELIGIBLE = "not_eligible"
-# Approved-domain gate (customer matched Group / Flag but the email fails).
 REASON_EMAIL_DOMAIN_NOT_APPROVED = "email_domain_not_approved"
 REASON_EMAIL_NOT_VERIFIED = "email_not_verified"
-# F&F is on but Settings has no enabled Approved Domain: nobody gets F&F.
 REASON_NO_APPROVED_DOMAINS = "no_approved_domains"
+# Success reason when domain + verified email pass.
+REASON_EMAIL_VERIFIED = "email_verified"
 EMAIL_REASONS = (REASON_EMAIL_DOMAIN_NOT_APPROVED, REASON_EMAIL_NOT_VERIFIED, REASON_NO_APPROVED_DOMAINS)
 
-# POSNext customer email OTP verification (read defensively; pos_next is optional).
 VERIFIED_FLAG_FIELD = "custom_email_verified"
 VERIFIED_EMAIL_FIELD = "custom_verified_email"
 
@@ -96,21 +90,15 @@ class CustomerEligibility:
 	eligible: bool
 	reason: str
 	customer_group: str | None = None
-	# The configured group that matched (the customer's own group or an ancestor).
 	matched_customer_group: str | None = None
-	# The live program, when there is one — set even for an ineligible customer
-	# so callers can tell "program off" from "customer not covered".
 	program: FriendsAndFamilyProgram | None = None
-	# Approved domain the customer's email matched (when the domain gate is on).
 	email_domain: str | None = None
-	# Matches the Group / Flag rule (whether or not the email rule then passed).
-	# POSNext uses it to offer email OTP verification for F&F.
+	# True when the customer's email domain is on an approved domain (OTP may be offered).
 	ff_member: bool = False
 
 	@property
 	def message(self) -> str:
 		if self.eligible:
-			# Configured "ff_activated" Friends and Family Message, else a generic note.
 			customer_message = self.customer_message or {}
 			return customer_message.get("message") or _("Customer is eligible for Friends & Family")
 		if self.reason == REASON_NO_CUSTOMER:
@@ -148,7 +136,6 @@ class CustomerEligibility:
 			"program_active": self.program is not None,
 			"discount_percentage": self.program.discount_percentage if self.eligible else 0,
 			"program": self.program.to_client_payload() if self.eligible else None,
-			# Customer-facing text (Friends and Family Message "ff_activated").
 			"customer_message": self.customer_message,
 		}
 
@@ -165,11 +152,13 @@ class CustomerEligibility:
 
 
 def get_eligibility_basis(settings) -> str:
+	"""Legacy helper — Group/Flag basis is no longer used for eligibility."""
 	basis = cstr(settings.get("eligibility_basis"))
 	return basis if basis in BASES else BASIS_GROUP_OR_FLAG
 
 
 def get_configured_customer_groups(settings) -> list[str]:
+	"""Legacy helper — eligible customer groups are ignored."""
 	return [cstr(row.customer_group) for row in settings.get("eligible_customer_groups") or [] if row.customer_group]
 
 
@@ -178,12 +167,14 @@ def has_flag_field() -> bool:
 
 
 def match_customer_group(customer_group: str | None, eligible_groups) -> str | None:
-	"""The eligible group covering ``customer_group`` (itself or nearest ancestor), else ``None``."""
+	"""Legacy helper retained for audit code; always returns None for new eligibility."""
 	eligible_groups = [g for g in eligible_groups or [] if g]
 	if not customer_group or not eligible_groups:
 		return None
 	if customer_group in eligible_groups:
 		return customer_group
+
+	from frappe.query_builder import DocType, Order
 
 	bounds = frappe.db.get_value("Customer Group", customer_group, ["lft", "rgt"], as_dict=True)
 	if not bounds:
@@ -206,11 +197,9 @@ def match_customer_group(customer_group: str | None, eligible_groups) -> str | N
 def get_customer_eligibility(
 	customer: str | None, on_date=None, pos_profile: str | None = None
 ) -> CustomerEligibility:
-	"""Whether ``customer`` gets Friends & Family on ``on_date`` (today when omitted), and why.
+	"""Whether ``customer`` gets Friends & Family on ``on_date`` (today when omitted).
 
-	With ``pos_profile`` the profile's **Allow F&F** check is enforced first: when
-	it is off nothing applies, whoever the customer is (``program`` stays ``None``
-	so every caller treats it as "no program").
+	Eligibility is approved email domain + OTP-verified email only.
 	"""
 	customer = cstr(customer).strip() or None
 	if not profile_allows_ff(pos_profile):
@@ -222,10 +211,7 @@ def get_customer_eligibility(
 	if program is None:
 		return CustomerEligibility(customer=customer, eligible=False, reason=REASON_PROGRAM_INACTIVE)
 
-	flag_available = has_flag_field()
 	fields = ["name", "customer_group", "disabled", "email_id"]
-	if flag_available:
-		fields.append(FLAG_FIELD)
 	if has_verification_fields():
 		fields += [VERIFIED_FLAG_FIELD, VERIFIED_EMAIL_FIELD]
 	row = frappe.db.get_value("Customer", customer, fields, as_dict=True)
@@ -239,40 +225,23 @@ def get_customer_eligibility(
 		return CustomerEligibility(eligible=False, reason=REASON_CUSTOMER_DISABLED, **result)
 
 	settings = get_settings()
-	basis = get_eligibility_basis(settings)
-
-	member_reason = None
-	if basis in (BASIS_GROUP, BASIS_GROUP_OR_FLAG):
-		matched = match_customer_group(row.customer_group, get_configured_customer_groups(settings))
-		if matched:
-			member_reason = REASON_CUSTOMER_GROUP
-			result["matched_customer_group"] = matched
-
-	if (
-		member_reason is None
-		and basis in (BASIS_FLAG, BASIS_GROUP_OR_FLAG)
-		and flag_available
-		and cint(row.get(FLAG_FIELD))
-	):
-		member_reason = REASON_CUSTOMER_FLAG
-
-	if member_reason is None:
-		return CustomerEligibility(eligible=False, reason=REASON_NOT_ELIGIBLE, **result)
-
-	email_failure, email_domain = check_customer_email(row, settings)
+	email_failure, email_domain, domain_ok = check_customer_email(row, settings)
+	ff_member = bool(domain_ok)
 	if email_failure:
-		return CustomerEligibility(eligible=False, reason=email_failure, ff_member=True, **result)
+		return CustomerEligibility(
+			eligible=False, reason=email_failure, email_domain=email_domain, ff_member=ff_member, **result
+		)
 	return CustomerEligibility(
-		eligible=True, reason=member_reason, email_domain=email_domain, ff_member=True, **result
+		eligible=True,
+		reason=REASON_EMAIL_VERIFIED,
+		email_domain=email_domain,
+		ff_member=True,
+		**result,
 	)
 
 
 def is_customer_ff_member(customer: str | None, pos_profile: str | None = None) -> bool:
-	"""Customer matches the live program's Group / Flag rule (email rule not applied).
-
-	POSNext calls this to allow email OTP verification for F&F members even when
-	its general verification switch is off.
-	"""
+	"""True when the customer's email domain is approved (OTP may be offered for F&F)."""
 	return bool(get_customer_eligibility(customer, pos_profile=pos_profile).ff_member)
 
 
@@ -289,23 +258,12 @@ def get_program_for_customer(
 
 
 def get_eligibility_rules_payload(settings=None) -> dict:
-	"""Eligibility criteria for an offline POS to pre-check a cached customer.
-
-	Customer groups are pre-expanded to their descendants so the client can do a
-	plain lookup on ``customer.customer_group``. The server still re-checks.
-	"""
+	"""Eligibility criteria for an offline POS to pre-check a cached customer."""
 	settings = settings or get_settings()
-	basis = get_eligibility_basis(settings)
-	groups: set[str] = set()
-	if basis != BASIS_FLAG:
-		for group in get_configured_customer_groups(settings):
-			groups.add(group)
-			groups.update(get_descendants_of("Customer Group", group, ignore_permissions=True))
 	return {
-		"basis": basis,
-		"customer_groups": sorted(groups),
-		"flag_field": FLAG_FIELD if basis != BASIS_GROUP else None,
-		# Approved-domain gate: empty = no email restriction.
+		"basis": "approved_email_domain",
+		"customer_groups": [],
+		"flag_field": None,
 		"approved_domains": get_approved_domains(settings),
 		"requires_verified_email": True,
 	}
@@ -320,19 +278,13 @@ def _flag_default(doc) -> int:
 
 
 def guard_flag_changes(doc, method=None):
-	"""Customer.validate — only managers may change the Friends & Family flag.
-
-	Keeps eligibility out of the cashier's hands: a POS user who can edit the
-	customer still cannot make them a Friends & Family member.
-	"""
+	"""Customer.validate — flag is legacy/hidden; still restrict edits to managers."""
 	if frappe.flags.in_install or frappe.flags.in_migrate or frappe.flags.in_patch:
 		return
 	if not doc.meta.has_field(FLAG_FIELD):
 		return
 
 	before = doc.get_doc_before_save()
-	# A new customer starts from the field default (1), so creating one with the
-	# default value is not a "change" and stays open to cashiers.
 	old_value = cint(before.get(FLAG_FIELD)) if before else _flag_default(doc)
 	if cint(doc.get(FLAG_FIELD)) == old_value:
 		return
@@ -346,7 +298,7 @@ def guard_flag_changes(doc, method=None):
 
 
 def ensure_customer_flag_field():
-	"""Create the Friends & Family Member checkbox on Customer (idempotent)."""
+	"""Ensure the legacy Friends & Family Member checkbox exists and stays hidden."""
 	if not frappe.db.exists("DocType", "Customer"):
 		return
 	from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
@@ -360,11 +312,7 @@ _HOSTNAME_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
 
 def normalize_email_domain(value) -> str:
-	"""``" @Miraaya.COM "`` / ``"https://www.miraaya.com/"`` → ``"miraaya.com"``.
-
-	Lowercase, trimmed, without leading ``@``, protocol, ``www.``, path or
-	trailing dot. Validity is checked separately (:func:`is_valid_email_domain`).
-	"""
+	"""``" @Miraaya.COM "`` / ``"https://www.miraaya.com/"`` → ``"miraaya.com"``."""
 	domain = cstr(value).strip().lower()
 	domain = re.sub(r"^[a-z][a-z0-9+.-]*://", "", domain)
 	domain = domain.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
@@ -428,22 +376,22 @@ def has_verification_fields() -> bool:
 	return meta.has_field(VERIFIED_FLAG_FIELD) and meta.has_field(VERIFIED_EMAIL_FIELD)
 
 
-def check_customer_email(row, settings) -> tuple[str | None, str | None]:
-	"""Mandatory email gate for a Group / Flag member. Returns ``(failure_reason, matched_domain)``.
+def check_customer_email(row, settings) -> tuple[str | None, str | None, bool]:
+	"""Email gate. Returns ``(failure_reason, matched_domain, domain_approved)``.
 
-	1. No enabled approved domain → ``no_approved_domains``.
-	2. ``email_id`` missing / not exactly on an approved domain → ``email_domain_not_approved``.
-	3. Not OTP-verified, or changed since verification (or the POSNext
-	   verification fields are missing, so it cannot be verified) → ``email_not_verified``.
+	1. No enabled approved domain → ``no_approved_domains`` (domain_approved=False).
+	2. ``email_id`` missing / not on an approved domain → ``email_domain_not_approved``.
+	3. Not OTP-verified (or verification fields missing) → ``email_not_verified``
+	   with domain_approved=True so POS can offer OTP.
 	"""
 	approved = get_approved_domains(settings)
 	if not approved:
-		return REASON_NO_APPROVED_DOMAINS, None
+		return REASON_NO_APPROVED_DOMAINS, None, False
 	email = cstr(row.get("email_id")).strip().lower()
 	domain = email_domain_of(email)
 	if not domain or domain not in approved:
-		return REASON_EMAIL_DOMAIN_NOT_APPROVED, None
+		return REASON_EMAIL_DOMAIN_NOT_APPROVED, None, False
 	verified_email = cstr(row.get(VERIFIED_EMAIL_FIELD)).strip().lower()
 	if not cint(row.get(VERIFIED_FLAG_FIELD)) or verified_email != email:
-		return REASON_EMAIL_NOT_VERIFIED, None
-	return None, domain
+		return REASON_EMAIL_NOT_VERIFIED, domain, True
+	return None, domain, True

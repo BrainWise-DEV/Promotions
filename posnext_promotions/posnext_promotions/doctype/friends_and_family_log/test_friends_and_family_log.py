@@ -95,7 +95,16 @@ class TestFriendsAndFamilyLog(FrappeTestCase):
 			if not frappe.db.exists("Customer", name):
 				frappe.get_doc({"doctype": "Customer", "customer_name": name, "customer_group": group}).insert()
 			frappe.db.set_value("Customer", name, {FLAG_FIELD: 0, "disabled": 0, "customer_group": group})
-			give_verified_email(name)
+		# Eligible via verified approved-domain email only (group/flag ignored).
+		give_verified_email(CUSTOMER)
+		# PLAIN stays ineligible (non-approved domain) for "ineligible customer" cases.
+		frappe.db.set_value("Customer", PLAIN, "email_id", "plain.log@gmail.com")
+		if frappe.get_meta("Customer").has_field("custom_email_verified"):
+			frappe.db.set_value(
+				"Customer",
+				PLAIN,
+				{"custom_email_verified": 0, "custom_verified_email": None},
+			)
 		item_group = frappe.db.get_value("Item Group", {"is_group": 0}) or "Products"
 		for code in (ITEM, ITEM_2, EXCLUDED_ITEM):
 			if not frappe.db.exists("Item", code):
@@ -199,7 +208,7 @@ class TestFriendsAndFamilyLog(FrappeTestCase):
 		self.assertEqual(str(log.posting_date), DATE)
 		self.assertEqual(log.user, frappe.session.user)
 		details = json.loads(log.details)
-		self.assertEqual(details["eligibility"], "customer_group")
+		self.assertEqual(details["eligibility"], "email_verified")
 
 	def test_promo_vs_fnf_outcome_logged_both_ways(self):
 		# Rows tagged as a line promotion (no real Pricing Rule needed for totals).
@@ -334,32 +343,31 @@ class TestFriendsAndFamilyLog(FrappeTestCase):
 			order_by="creation asc, name asc",
 		)
 
-	def test_customer_flag_and_group_changes_logged(self):
+	def test_customer_email_eligibility_changes_logged(self):
+		from posnext_promotions.promotions.friends_and_family_eligibility import has_verification_fields
+		from posnext_promotions.promotions.friends_and_family_testing import TEST_EMAIL_DOMAIN, give_verified_email
+
+		if not has_verification_fields():
+			self.skipTest("POSNext email verification fields are not installed")
+
+		give_verified_email(PLAIN, TEST_EMAIL_DOMAIN)
 		customer = frappe.get_doc("Customer", PLAIN)
-		customer.set(FLAG_FIELD, 1)
-		customer.save()
-		customer.reload()
-		customer.set(FLAG_FIELD, 0)
-		customer.save()
-		customer.reload()
-		customer.customer_group = FF_GROUP
+		customer.email_id = f"changed.plain@{TEST_EMAIL_DOMAIN}"
 		customer.save()
 		logs = self._customer_logs(PLAIN)
 		self.assertEqual(
 			[(log.log_type, log.reason) for log in logs],
-			[
-				(LOG_ELIGIBILITY_APPLIED, "customer_flag"),
-				(LOG_ELIGIBILITY_REMOVED, "customer_flag"),
-				(LOG_ELIGIBILITY_APPLIED, "customer_group"),
-			],
+			# reason on remove is the previous qualifying reason
+			[(LOG_ELIGIBILITY_REMOVED, "email_verified")],
 		)
 		self.assertEqual(logs[0].customer, PLAIN)
-		self.assertEqual(json.loads(logs[2].details)["changes"]["customer_group"], [OTHER_GROUP, FF_GROUP])
 
 	def test_customer_change_without_membership_change_not_logged(self):
-		self._configure(eligibility_basis="Customer Group")
 		customer = frappe.get_doc("Customer", PLAIN)
-		customer.set(FLAG_FIELD, 1)  # flag ignored under group-only basis
+		customer.set(FLAG_FIELD, 1)  # legacy flag does not affect eligibility
+		customer.save()
+		customer.reload()
+		customer.customer_group = FF_GROUP  # group does not affect eligibility
 		customer.save()
 		self.assertEqual(self._customer_logs(PLAIN), [])
 
