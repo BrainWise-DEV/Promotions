@@ -48,8 +48,12 @@ Free items / GWP
 ----------------
 Gift and free-unit mechanics (``is_free_item`` rows, GWP and same-item free
 units stamped on a paid line) are *product* discounts, not competing price
-discounts. They are never compared and never removed by F&F: F&F skips lines
-that already carry a free-unit discount, and gift rows stay in the cart.
+discounts. They are never money-compared by this engine. Whether they may
+coexist with an applied F&F discount is decided in
+:mod:`posnext_promotions.promotions.friends_and_family_gifts` (Settings
+**Allow Free Gift with F&F** for Free Item / GWP / Cart Total Gift / Brand
+Gift; Buy X Get Y is always excluded). When a gift is allowed to remain, F&F
+skips that line; when it is suppressed, F&F can reclaim the paid line.
 
 This module is pure (no DB writes); callers own mutation.
 """

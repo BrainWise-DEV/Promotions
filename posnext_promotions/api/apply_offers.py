@@ -36,6 +36,10 @@ from posnext_promotions.promotions.friends_and_family_apply import (
 	summarize_line_payloads,
 )
 from posnext_promotions.promotions.friends_and_family_caps import FIELD_FNF_REPLACED
+from posnext_promotions.promotions.friends_and_family_gifts import (
+	allow_free_gift_with_ff,
+	suppress_incompatible_gifts,
+)
 from posnext_promotions.promotions.schedule import (
 	filter_rules_by_schedule,
 	get_inactive_rules,
@@ -1891,6 +1895,26 @@ def apply_offers(invoice_data, selected_offers=None):
 			warehouse=profile.warehouse,
 			pos_profile=invoice.get("pos_profile"),
 		)
+
+		# Miraaya F&F gift rules: when F&F is applied, BXGY is always blocked;
+		# Free Item / GWP / Cart Total Gift / Brand Gift honour Allow Free Gift with F&F.
+		fnf_applied = cint(ff_result.get("applied_count")) > 0
+		gift_suppressed = suppress_incompatible_gifts(
+			fnf_applied=fnf_applied,
+			allow_free_gift=allow_free_gift_with_ff(),
+			prepared_items=prepared_items,
+			free_items_map=free_items_map,
+			rule_map=rule_map,
+			applied_rules=applied_rules,
+		)
+		if gift_suppressed and fnf_applied:
+			# Gift stamps may have overwritten F&F on paid lines; reclaim F&F.
+			ff_result = apply_friends_and_family_to_items(
+				prepared_items,
+				customer=customer,
+				posting_date=invoice.get("posting_date") or nowdate(),
+				pos_profile=invoice.get("pos_profile"),
+			)
 
 		# Free-unit / GWP passes run after F&F and may have re-stamped a line with a
 		# gift discount; F&F does not compete with gift mechanics, so report it.

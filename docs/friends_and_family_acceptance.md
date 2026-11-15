@@ -416,3 +416,30 @@ Rules (server = `friends_and_family_eligibility.get_customer_eligibility`):
 | D5 | Verified, then email changed to `y@miraaya.com` | No F&F until verified again |
 | D6 | `FF Demo Public` (non-member) with any email, POS switch off | Normal price, no F&F message, no verify panel |
 | D7 | Add `mail.miraaya.com` as a 2nd row; Staff `x@mail.miraaya.com` verified | F&F applied |
+
+## Allow Free Gift with F&F (2026-11-15, Miraaya)
+
+Friends and Family Settings → **Allow Free Gift with F&F** (`allow_free_gift_with_ff`, Check, default **0**).
+
+Global for these gift kinds (not per Promotional Scheme):
+
+| Kind | How we detect it |
+|---|---|
+| Free Item | Product discount, different SKU (`same_item=0`), apply on Item Code / Item Group; Gift Pool schemes |
+| GWP | `promotion_type = GWP` |
+| Cart Total Gift | Product discount on `apply_on = Transaction` |
+| Brand Gift | Product discount on `apply_on = Brand` |
+
+**Buy X Get Y (BXGY)** is *not* Free Item: product discount with `same_item=1`. BXGY never combines with F&F, checkbox or not.
+
+| Setting | F&F on cart? | Result |
+|---|---|---|
+| ☐ unchecked (default) | yes | F&F only — Free Item / GWP / Cart Total / Brand gifts suppressed; BXGY suppressed |
+| ☑ checked | yes | Free Item / GWP / Cart Total / Brand may award with F&F; BXGY still suppressed |
+| any | no | Gifts apply as usual (including BXGY) |
+
+Mixed F&F / non-F&F carts use the same cart-level rule: once F&F is applied, incompatible gifts are not awarded.
+
+QA: `/app/friends-and-family-settings` → leave **Allow Free Gift with F&F** off → F&F customer meets a GWP / free-item / cart-total / brand gift → F&F applies, no free gift. Tick the box → same cart gets F&F **and** the gift. BXGY (buy 2 get 1 same item) never stacks with F&F.
+
+Automated: `bench --site <dev-site> run-tests --app posnext_promotions --module posnext_promotions.posnext_promotions.doctype.friends_and_family_settings.test_friends_and_family_gifts`

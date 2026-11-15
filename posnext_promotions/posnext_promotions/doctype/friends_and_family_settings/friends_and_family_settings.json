@@ -10,6 +10,7 @@
   "enabled",
   "column_break_general",
   "discount_percentage",
+  "allow_free_gift_with_ff",
   "dates_section",
   "start_date",
   "column_break_dates",
@@ -62,6 +63,13 @@
    "label": "Discount Percentage",
    "non_negative": 1,
    "reqd": 1
+  },
+  {
+   "default": "0",
+   "description": "Global for Free Item, GWP, Cart Total Gift, and Brand Gift (including Gift Pool). When unchecked and Friends & Family is applied, those free gifts are not awarded. Buy X Get Y is never combined with F&F, regardless of this setting.",
+   "fieldname": "allow_free_gift_with_ff",
+   "fieldtype": "Check",
+   "label": "Allow Free Gift with F&F"
   },
   {
    "fieldname": "dates_section",
@@ -237,7 +245,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-10-20 16:30:00.000000",
+ "modified": "2026-11-15 13:30:00.000000",
  "modified_by": "Administrator",
  "module": "POSNext Promotions",
  "name": "Friends and Family Settings",
