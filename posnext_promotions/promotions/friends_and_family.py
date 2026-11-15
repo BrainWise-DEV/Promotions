@@ -59,6 +59,9 @@ class FriendsAndFamilyProgram:
 	# PN-129 caps (money). 0 = no cap.
 	max_discount_per_order: float = 0.0
 	max_discount_per_customer_month: float = 0.0
+	# When False, Free Item / GWP / Cart Total Gift / Brand Gift cannot stack with F&F.
+	# Buy X Get Y is always excluded from combining with F&F.
+	allow_free_gift_with_ff: bool = False
 
 	@property
 	def has_caps(self) -> bool:
@@ -126,6 +129,7 @@ class FriendsAndFamilyProgram:
 			"end_date": self.end_date,
 			"max_discount_per_order": self.max_discount_per_order,
 			"max_discount_per_customer_month": self.max_discount_per_customer_month,
+			"allow_free_gift_with_ff": self.allow_free_gift_with_ff,
 		}
 
 
@@ -226,4 +230,5 @@ def get_active_program(on_date=None) -> FriendsAndFamilyProgram | None:
 		end_date=cstr(settings.end_date) if settings.get("end_date") else None,
 		max_discount_per_order=max(0.0, flt(settings.get("max_discount_per_order"))),
 		max_discount_per_customer_month=max(0.0, flt(settings.get("max_discount_per_customer_month"))),
+		allow_free_gift_with_ff=bool(cint(settings.get("allow_free_gift_with_ff"))),
 	)

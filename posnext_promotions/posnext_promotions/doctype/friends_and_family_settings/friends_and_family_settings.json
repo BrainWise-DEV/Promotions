@@ -10,6 +10,7 @@
   "enabled",
   "column_break_general",
   "discount_percentage",
+  "allow_free_gift_with_ff",
   "dates_section",
   "start_date",
   "column_break_dates",
@@ -64,6 +65,13 @@
    "reqd": 1
   },
   {
+   "default": "0",
+   "description": "Global for Free Item, GWP, Cart Total Gift, and Brand Gift (including Gift Pool). When unchecked and Friends & Family is applied, those free gifts are not awarded. Buy X Get Y is never combined with F&F, regardless of this setting.",
+   "fieldname": "allow_free_gift_with_ff",
+   "fieldtype": "Check",
+   "label": "Allow Free Gift with F&F"
+  },
+  {
    "fieldname": "dates_section",
    "fieldtype": "Section Break",
    "label": "Program Dates"
@@ -109,28 +117,32 @@
    "description": "Maximum cumulative Friends & Family discount one customer can receive in a calendar month (submitted invoices, net of returns). 0 = no cap."
   },
   {
-   "description": "Who gets Friends & Family. \"Customer Flag\" is the Friends & Family Member checkbox on the Customer form.",
+   "description": "Legacy. Eligibility is approved email domain + verified email only; these fields are hidden and ignored.",
    "fieldname": "eligibility_section",
    "fieldtype": "Section Break",
+   "hidden": 1,
    "label": "Customer Eligibility"
   },
   {
    "default": "Customer Group or Flag",
    "fieldname": "eligibility_basis",
    "fieldtype": "Select",
+   "hidden": 1,
    "label": "Eligible When",
    "options": "Customer Group or Flag\nCustomer Group\nCustomer Flag",
-   "reqd": 1
+   "reqd": 0
   },
   {
    "fieldname": "column_break_eligibility",
-   "fieldtype": "Column Break"
+   "fieldtype": "Column Break",
+   "hidden": 1
   },
   {
    "depends_on": "eval:doc.eligibility_basis!=\"Customer Flag\"",
-   "description": "Customers in these groups, including their child groups, are eligible.",
+   "description": "Legacy. Ignored — eligibility uses Approved Domains only.",
    "fieldname": "eligible_customer_groups",
    "fieldtype": "Table",
+   "hidden": 1,
    "label": "Eligible Customer Groups",
    "options": "Friends and Family Customer Group"
   },
@@ -138,7 +150,7 @@
    "fieldname": "approved_domains_section",
    "fieldtype": "Section Break",
    "label": "Approved Domains",
-   "description": "Required while the program is enabled. A customer who matches the eligibility rule above gets Friends & Family only with an OTP-verified email on one of these domains. Exact match only: sub-domains are NOT included automatically and must be added as separate rows (e.g. add both miraaya.com and mail.miraaya.com). With no enabled domain nobody gets Friends & Family."
+   "description": "Required while the program is enabled. A customer gets Friends & Family only with an OTP-verified email on one of these domains. Exact match only: sub-domains are NOT included automatically and must be added as separate rows (e.g. add both miraaya.com and mail.miraaya.com). With no enabled domain nobody gets Friends & Family."
   },
   {
    "fieldname": "approved_domains",
@@ -233,7 +245,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-10-20 16:30:00.000000",
+ "modified": "2026-11-15 13:30:00.000000",
  "modified_by": "Administrator",
  "module": "POSNext Promotions",
  "name": "Friends and Family Settings",

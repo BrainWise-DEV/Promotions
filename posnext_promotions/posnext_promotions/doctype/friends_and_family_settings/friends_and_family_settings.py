@@ -82,26 +82,22 @@ class FriendsandFamilySettings(Document):
 			seen.add(value)
 
 	def _validate_eligibility(self):
-		if self.eligibility_basis not in eligibility.BASES:
+		"""Group/Flag eligibility is retired — Approved Domains are the only gate.
+
+		Keep stored values coherent without enforcing Group/Flag rules.
+		"""
+		if self.eligibility_basis and self.eligibility_basis not in eligibility.BASES:
 			self.eligibility_basis = eligibility.BASIS_GROUP_OR_FLAG
 
-		if self.eligibility_basis == eligibility.BASIS_FLAG:
-			self.eligible_customer_groups = []
-		else:
-			seen = set()
-			for row in list(self.eligible_customer_groups or []):
-				if row.customer_group in seen:
-					frappe.throw(
-						_("Customer Group {0} is listed more than once").format(frappe.bold(row.customer_group))
-					)
-				seen.add(row.customer_group)
-
-		if (
-			cint(self.enabled)
-			and self.eligibility_basis == eligibility.BASIS_GROUP
-			and not self.eligible_customer_groups
-		):
-			frappe.throw(_("Add at least one Eligible Customer Group when eligibility is by Customer Group"))
+		seen = set()
+		for row in list(self.eligible_customer_groups or []):
+			if not row.customer_group:
+				continue
+			if row.customer_group in seen:
+				frappe.throw(
+					_("Customer Group {0} is listed more than once").format(frappe.bold(row.customer_group))
+				)
+			seen.add(row.customer_group)
 
 
 	def _validate_caps(self):
@@ -145,7 +141,7 @@ class FriendsandFamilySettings(Document):
 		):
 			frappe.throw(
 				_(
-					"Add at least one enabled Approved Domain: Friends & Family members must have a "
+					"Add at least one enabled Approved Domain: Friends & Family requires a "
 					"verified email on an approved company domain"
 				),
 				title=_("Approved Domain Required"),

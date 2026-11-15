@@ -13,7 +13,7 @@
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
-from frappe.utils import flt, nowdate
+from frappe.utils import cint, flt, nowdate
 
 from posnext_promotions.promotions.friends_and_family_testing import approved_domain_rows, give_verified_email
 from posnext_promotions.api.friends_and_family import (
@@ -173,7 +173,8 @@ class TestFriendsAndFamilySchemeAndProfile(FrappeTestCase):
 		scheme_field = frappe.get_meta("Promotional Scheme").get_field("apply_with_ff")
 		self.assertIsNotNone(scheme_field)
 		self.assertEqual(scheme_field.fieldtype, "Check")
-		self.assertEqual(str(scheme_field.default or "0"), "0")
+		self.assertEqual(str(scheme_field.default or "0"), "1")
+		self.assertTrue(cint(scheme_field.hidden))
 		profile_field = frappe.get_meta("POS Profile").get_field("allow_friends_family")
 		self.assertIsNotNone(profile_field)
 		self.assertEqual(profile_field.fieldtype, "Check")

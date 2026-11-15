@@ -138,13 +138,26 @@ def build_demo_data(prefix: str = DEFAULT_PREFIX, company: str | None = None, pr
 					"customer_name": name,
 					"customer_group": group,
 					"customer_type": "Individual",
-					# explicit: the field defaults to 1 for new customers
 					FLAG_FIELD: flag,
 				}
 			).insert(ignore_permissions=True)
-		# Direct write: the flag guard (manager-only) is about cashiers, not this seed.
 		frappe.db.set_value("Customer", name, {"customer_group": group, FLAG_FIELD: flag, "disabled": 0})
-		give_verified_email(name, DEMO_EMAIL_DOMAIN)
+		# Eligibility is email-domain only: staff/flagged get verified demo domain;
+		# public gets a non-approved email so they stay ineligible for acceptance tests.
+		if key == "public":
+			from posnext_promotions.promotions.friends_and_family_eligibility import (
+				VERIFIED_EMAIL_FIELD,
+				VERIFIED_FLAG_FIELD,
+				has_verification_fields,
+			)
+
+			values = {"email_id": "public@gmail.com"}
+			if has_verification_fields():
+				values[VERIFIED_FLAG_FIELD] = 0
+				values[VERIFIED_EMAIL_FIELD] = None
+			frappe.db.set_value("Customer", name, values)
+		else:
+			give_verified_email(name, DEMO_EMAIL_DOMAIN)
 		customers[key] = name
 
 	brands = {key: _ensure("Brand", f"{prefix} Brand {key.upper()}", {"brand": f"{prefix} Brand {key.upper()}"}) for key in ("a", "x")}
@@ -192,7 +205,7 @@ def build_demo_data(prefix: str = DEFAULT_PREFIX, company: str | None = None, pr
 			"start_date": None,
 			"end_date": None,
 			"eligibility_basis": "Customer Group or Flag",
-			"eligible_customer_groups": [{"customer_group": staff_group}],
+			"eligible_customer_groups": [],
 			"applicable_brands": [],
 			"applicable_item_groups": [],
 			"applicable_items": [],
