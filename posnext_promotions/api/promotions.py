@@ -364,6 +364,9 @@ def create_promotion(data):
 		)
 		if data.get("promotion_type") and hasattr(scheme, "promotion_type"):
 			scheme.promotion_type = data.get("promotion_type")
+		# Always compete with F&F via best-discount (UI field is hidden, default 1).
+		if hasattr(scheme, "apply_with_ff"):
+			scheme.apply_with_ff = 1
 
 		# Set applicable for
 		if data.get("applicable_for"):
@@ -497,6 +500,9 @@ def update_promotion(scheme_name, data):
 			scheme.disable = cint(data["disable"])
 		if "promotion_type" in data and hasattr(scheme, "promotion_type"):
 			scheme.promotion_type = data.get("promotion_type") or ""
+		# Always compete with F&F via best-discount (UI field is hidden, default 1).
+		if hasattr(scheme, "apply_with_ff"):
+			scheme.apply_with_ff = 1
 
 		if "gift_pool_items" in data and hasattr(scheme, "gift_pool_items"):
 			scheme.set("gift_pool_items", [])

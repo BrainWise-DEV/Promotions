@@ -32,7 +32,30 @@ def before_install():
 
 def after_migrate():
 	"""Runs after sync_customizations, so the custom/*.json fields exist by now."""
+	_ensure_friends_and_family_customer_flag()
+	_ensure_friends_and_family_invoice_fields()
+	_ensure_friends_and_family_message_events()
 	_backfill_coupon_promotion_conflict()
+
+
+def _ensure_friends_and_family_message_events():
+	"""Structural: standard F&F message event definitions the engine fires (no message text)."""
+	from posnext_promotions.promotions.friends_and_family_messages import ensure_standard_events
+
+	ensure_standard_events()
+
+
+def _ensure_friends_and_family_invoice_fields():
+	"""PN-129: per-line F&F source + amount on Sales / POS Invoice Item (monthly cap ledger)."""
+	from posnext_promotions.promotions.friends_and_family_caps import ensure_invoice_item_fields
+
+	ensure_invoice_item_fields()
+
+
+def _ensure_friends_and_family_customer_flag():
+	from posnext_promotions.promotions.friends_and_family_eligibility import ensure_customer_flag_field
+
+	ensure_customer_flag_field()
 
 
 def _backfill_coupon_promotion_conflict():
@@ -50,3 +73,4 @@ def _backfill_coupon_promotion_conflict():
 			mode,
 			update_modified=False,
 		)
+

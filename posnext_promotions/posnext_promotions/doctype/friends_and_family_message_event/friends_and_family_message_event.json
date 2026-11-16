@@ -1,0 +1,119 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "autoname": "field:event_code",
+ "creation": "2026-10-13 14:00:00.000000",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": [
+  "event_name",
+  "event_code",
+  "column_break_1",
+  "enabled",
+  "is_standard",
+  "section_details",
+  "description",
+  "placeholders"
+ ],
+ "fields": [
+  {
+   "fieldname": "event_name",
+   "fieldtype": "Data",
+   "label": "Event Name",
+   "reqd": 1,
+   "in_list_view": 1,
+   "description": "Clear human label (Arabic / English)."
+  },
+  {
+   "fieldname": "event_code",
+   "fieldtype": "Data",
+   "label": "Event Code",
+   "reqd": 1,
+   "unique": 1,
+   "set_only_once": 1,
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "description": "snake_case identifier used by code, e.g. ff_activated. Cannot be changed after save."
+  },
+  {
+   "fieldname": "column_break_1",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "1",
+   "fieldname": "enabled",
+   "fieldtype": "Check",
+   "label": "Enabled",
+   "in_list_view": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "is_standard",
+   "fieldtype": "Check",
+   "label": "Is Standard",
+   "read_only": 1,
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "description": "Standard events are fired by the Friends & Family engine and are maintained on migrate."
+  },
+  {
+   "fieldname": "section_details",
+   "fieldtype": "Section Break",
+   "label": "Details"
+  },
+  {
+   "fieldname": "description",
+   "fieldtype": "Small Text",
+   "label": "When It Fires"
+  },
+  {
+   "fieldname": "placeholders",
+   "fieldtype": "Small Text",
+   "label": "Available Placeholders",
+   "description": "e.g. {percent}, {brand}"
+  }
+ ],
+ "links": [
+  {
+   "link_doctype": "Friends and Family Message",
+   "link_fieldname": "event"
+  }
+ ],
+ "modified": "2026-10-13 14:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "POSNext Promotions",
+ "name": "Friends and Family Message Event",
+ "naming_rule": "By fieldname",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "read": 1,
+   "write": 1,
+   "role": "System Manager",
+   "export": 1,
+   "print": 1,
+   "share": 1,
+   "report": 1
+  },
+  {
+   "create": 1,
+   "read": 1,
+   "write": 1,
+   "role": "Sales Manager",
+   "report": 1
+  },
+  {
+   "read": 1,
+   "role": "Sales User"
+  }
+ ],
+ "search_fields": "event_name",
+ "show_title_field_in_link": 1,
+ "title_field": "event_name",
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}
