@@ -66,7 +66,7 @@
   },
   {
    "default": "0",
-   "description": "Global for Free Item, GWP, Cart Total Gift, and Brand Gift (including Gift Pool). When unchecked and Friends & Family is applied, those free gifts are not awarded. Buy X Get Y is never combined with F&F, regardless of this setting.",
+   "description": "Global for Free Item, GWP, Gift Pool, Cart Total Gift and Brand Gift. Unchecked (default): a gift whose trigger item received Friends & Family is not given, and a cart-total gift is removed when F&F applies. Checked: the gift and F&F both apply. Buy X Get Y and Item Level Discount (Routine) items never receive F&F.",
    "fieldname": "allow_free_gift_with_ff",
    "fieldtype": "Check",
    "label": "Allow Free Gift with F&F"
@@ -245,7 +245,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-11-15 13:30:00.000000",
+ "modified": "2026-11-16 14:00:00.000000",
  "modified_by": "Administrator",
  "module": "POSNext Promotions",
  "name": "Friends and Family Settings",

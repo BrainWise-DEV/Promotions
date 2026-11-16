@@ -430,16 +430,28 @@ Global for these gift kinds (not per Promotional Scheme):
 | Cart Total Gift | Product discount on `apply_on = Transaction` |
 | Brand Gift | Product discount on `apply_on = Brand` |
 
-**Buy X Get Y (BXGY)** is *not* Free Item: product discount with `same_item=1`. BXGY never combines with F&F, checkbox or not.
+**Buy X Get Y (BXGY)** is *not* Free Item: product discount with `same_item=1`.
 
-| Setting | F&F on cart? | Result |
-|---|---|---|
-| ☐ unchecked (default) | yes | F&F only — Free Item / GWP / Cart Total / Brand gifts suppressed; BXGY suppressed |
-| ☑ checked | yes | Free Item / GWP / Cart Total / Brand may award with F&F; BXGY still suppressed |
-| any | no | Gifts apply as usual (including BXGY) |
+### BXGY and Routine lines get no F&F (updated 2026-11-16)
 
-Mixed F&F / non-F&F carts use the same cart-level rule: once F&F is applied, incompatible gifts are not awarded.
+Client rule (Malak, 9 Nov): Buy X Get Y and **Routine** (Promotional Scheme of type
+*Item Level Discount*, not Accumulative, not coupon) are **not eligible** for F&F.
+A line covered by such a scheme keeps its promotion and never receives F&F
+(`reason = scheme_not_eligible`); every other cart line still gets F&F.
+BXGY lines are flagged *before* F&F runs (scope match + `min_qty`), so the old
+"B1G1 switches to F&F at qty 4" no longer happens. Note: with a non-recursive
+BXGY capped by `max_qty`, ERPNext gives no free unit above `max_qty`; make the
+scheme recursive if the client expects 2 free at qty 4.
 
-QA: `/app/friends-and-family-settings` → leave **Allow Free Gift with F&F** off → F&F customer meets a GWP / free-item / cart-total / brand gift → F&F applies, no free gift. Tick the box → same cart gets F&F **and** the gift. BXGY (buy 2 get 1 same item) never stacks with F&F.
+### Free gifts vs F&F
 
-Automated: `bench --site <dev-site> run-tests --app posnext_promotions --module posnext_promotions.posnext_promotions.doctype.friends_and_family_settings.test_friends_and_family_gifts`
+| Setting | Result |
+|---|---|
+| ☐ unchecked (default) | A Free Item / GWP / Gift Pool / Brand gift whose **trigger line received F&F** is not awarded (GWP line discount not stamped on an F&F line). A Cart Total gift is removed when F&F applied anywhere on the cart. |
+| ☑ checked | Gift and F&F both apply. Cart Total gift threshold is checked on the subtotal **after** F&F. |
+| any, trigger line without F&F | Gift applies as usual. |
+| any | BXGY keeps its free units (its lines have no F&F). |
+
+QA: `/app/friends-and-family-settings` → leave **Allow Free Gift with F&F** off → F&F customer buys the gift trigger item → F&F applies, no gift. Tick the box → F&F **and** the gift. B1G1 item at qty 1..6 → never F&F on that line; other items still F&F.
+
+Automated: `bench --site <dev-site> run-tests --app posnext_promotions --module posnext_promotions.posnext_promotions.doctype.friends_and_family_settings.test_friends_and_family_gifts` and `...test_friends_and_family_scheme_rules`
