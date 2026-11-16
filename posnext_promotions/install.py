@@ -31,9 +31,11 @@ def before_install():
 
 
 def after_migrate():
+	"""Runs after sync_customizations, so the custom/*.json fields exist by now."""
 	_ensure_friends_and_family_customer_flag()
 	_ensure_friends_and_family_invoice_fields()
 	_ensure_friends_and_family_message_events()
+	_backfill_coupon_promotion_conflict()
 
 
 def _ensure_friends_and_family_message_events():
@@ -54,3 +56,21 @@ def _ensure_friends_and_family_customer_flag():
 	from posnext_promotions.promotions.friends_and_family_eligibility import ensure_customer_flag_field
 
 	ensure_customer_flag_field()
+
+
+def _backfill_coupon_promotion_conflict():
+	"""Give coupons saved before `promotion_conflict` existed their old behaviour:
+	checked exclude_already_discounted_items skips, unchecked stacks (from #13). Idempotent."""
+	if not frappe.db.exists("DocType", "POS Coupon"):
+		return
+	if not frappe.get_meta("POS Coupon").has_field("promotion_conflict"):
+		return
+	for excluded, mode in ((1, "Skip the line"), (0, "Add on top")):
+		frappe.db.set_value(
+			"POS Coupon",
+			{"promotion_conflict": ["is", "not set"], "exclude_already_discounted_items": excluded},
+			"promotion_conflict",
+			mode,
+			update_modified=False,
+		)
+

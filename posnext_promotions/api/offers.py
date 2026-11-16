@@ -1099,6 +1099,7 @@ def _validate_coupon(
 			"total_discount": 0,
 			"best_discount": apply_result.get("best_discount"),
 			"customer_message": apply_result.get("customer_message"),
+			"kept_promotion_items": apply_result.get("kept_promotion_items") or [],
 		}
 	response.update(
 		{
@@ -1106,6 +1107,7 @@ def _validate_coupon(
 			"eligible_item_codes": apply_result.get("eligible_item_codes") or [],
 			"total_discount": apply_result.get("total_discount") or 0,
 			"eligible_subtotal": apply_result.get("eligible_subtotal") or 0,
+			"kept_promotion_items": apply_result.get("kept_promotion_items") or [],
 			"message": apply_result.get("message"),
 			"message_en": apply_result.get("message_en"),
 			"message_ar": apply_result.get("message_ar"),
@@ -1113,6 +1115,7 @@ def _validate_coupon(
 			"customer_message": apply_result.get("customer_message"),
 		}
 	)
+
 
 	return response
 
