@@ -67,6 +67,7 @@ from posnext_promotions.promotions.friends_and_family_caps import (
 	ceil_cents,
 	get_cap_context,
 )
+from posnext_promotions.promotions.friends_and_family_gifts import line_blocked_by_scheme
 from posnext_promotions.promotions.friends_and_family_eligibility import (
 	REASON_PROFILE_NOT_ALLOWED,
 	get_customer_eligibility,
@@ -91,6 +92,8 @@ REASON_PROGRAM_INACTIVE = "program_inactive"
 REASON_STRIPPED = "stripped"
 REASON_ORDER_DISCOUNT_BETTER = "order_discount_better"
 REASON_CAP_REACHED = "cap_reached"
+# Line belongs to a Buy X Get Y / Routine (Item Level Discount) scheme — not eligible.
+REASON_SCHEME_NOT_ELIGIBLE = "scheme_not_eligible"
 
 
 def _coverage_message(program, items, applied_count: int, eligibility_message: str) -> str:
@@ -566,6 +569,11 @@ def _evaluate_line(
 
 	if not _is_discountable(item):
 		return _result(False, 0, REASON_NOT_DISCOUNTABLE, rate=flt(item.get("rate") or 0))
+
+	if line_blocked_by_scheme(item):
+		# Miraaya: Buy X Get Y and Routine (Item Level Discount) lines get no F&F;
+		# they keep their promotion. Other lines are unaffected.
+		return _result(False, 0, REASON_SCHEME_NOT_ELIGIBLE, rate=flt(item.get("rate") or price_list_rate))
 
 	competitor = _competing_candidate(item, program, amount_basis)
 

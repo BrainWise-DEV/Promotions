@@ -38,6 +38,8 @@ from posnext_promotions.promotions.friends_and_family_apply import (
 from posnext_promotions.promotions.friends_and_family_caps import FIELD_FNF_REPLACED
 from posnext_promotions.promotions.friends_and_family_gifts import (
 	allow_free_gift_with_ff,
+	fnf_stamped_indices,
+	mark_fnf_ineligible_lines,
 	suppress_incompatible_gifts,
 )
 from posnext_promotions.promotions.schedule import (
@@ -1826,6 +1828,10 @@ def apply_offers(invoice_data, selected_offers=None):
 		# whatever promotion / manual discount the line carries, compared in money,
 		# tie → F&F, never stacked. Percentage always from Settings.
 		# Snapshot the lines first: scenario "no F&F" for the order-level check.
+		# Miraaya: Buy X Get Y / Routine (Item Level Discount) lines are not
+		# eligible for F&F. Flag them *before* F&F runs — BXGY free units are only
+		# valued further down, so the paid line would otherwise look undiscounted.
+		mark_fnf_ineligible_lines(prepared_items, rule_map)
 		pre_fnf_items = [frappe._dict(dict(item)) for item in prepared_items]
 		ff_result = apply_friends_and_family_to_items(
 			prepared_items,
@@ -1873,6 +1879,9 @@ def apply_offers(invoice_data, selected_offers=None):
 				txn_result = txn_without_fnf
 				_mark_fnf_lost_to_order(ff_result)
 
+		# Paid lines that hold F&F before the gift passes (Allow Free Gift with F&F).
+		fnf_line_indices = fnf_stamped_indices(prepared_items)
+
 		# Per-item results win on collisions because they already carry full
 		# discount metadata from the per-item engine result.
 		for key, free_item_doc in txn_result.get("free_items", {}).items():
@@ -1896,19 +1905,20 @@ def apply_offers(invoice_data, selected_offers=None):
 			pos_profile=invoice.get("pos_profile"),
 		)
 
-		# Miraaya F&F gift rules: when F&F is applied, BXGY is always blocked;
-		# Free Item / GWP / Cart Total Gift / Brand Gift honour Allow Free Gift with F&F.
-		fnf_applied = cint(ff_result.get("applied_count")) > 0
+		# Miraaya F&F gift rules (Allow Free Gift with F&F, default off): a Free
+		# Item / GWP / Gift Pool / Brand gift whose trigger line got F&F, or a
+		# cart-total gift on a cart with F&F, is dropped when the setting is off.
+		# BXGY is never dropped here — its lines carry no F&F.
 		gift_suppressed = suppress_incompatible_gifts(
-			fnf_applied=fnf_applied,
+			fnf_indices=fnf_line_indices,
 			allow_free_gift=allow_free_gift_with_ff(),
 			prepared_items=prepared_items,
 			free_items_map=free_items_map,
 			rule_map=rule_map,
 			applied_rules=applied_rules,
 		)
-		if gift_suppressed and fnf_applied:
-			# Gift stamps may have overwritten F&F on paid lines; reclaim F&F.
+		if gift_suppressed:
+			# A GWP stamp may have overwritten F&F on a paid line; reclaim F&F.
 			ff_result = apply_friends_and_family_to_items(
 				prepared_items,
 				customer=customer,
