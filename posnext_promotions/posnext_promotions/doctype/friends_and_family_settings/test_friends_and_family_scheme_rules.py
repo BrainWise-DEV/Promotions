@@ -85,6 +85,11 @@ class TestFriendsAndFamilySchemeRules(FrappeTestCase):
 	def _item(resp, item_code):
 		return next(i for i in resp["items"] if i.get("item_code") == item_code and not i.get("is_free_item"))
 
+	@staticmethod
+	def _free_qty(resp, item_code):
+		"""Same-item Product gifts are a free row on top of paid qty, not free_qty on the paid line."""
+		return sum(flt(f.get("qty")) for f in (resp.get("free_items") or []) if f.get("item_code") == item_code)
+
 	def _bxgy(self, title, **extra):
 		fields = dict(
 			apply_on="Item Code",
@@ -112,13 +117,12 @@ class TestFriendsAndFamilySchemeRules(FrappeTestCase):
 		self.assertEqual(ff.get("reason"), REASON_SCHEME_NOT_ELIGIBLE, f"qty {qty}")
 
 	def test_recursive_b1g1_never_switches_to_fnf_qty_1_to_6(self):
-		# Buy 1 Get 1, recursive: every 2nd unit free.
-		rule = self._bxgy("_PNXT_FF_BXGY_REC", min_qty=1, is_recursive=1, recurse_for=1, apply_recursion_over=0)
+		# Buy 1 Get 1, recursive: every 2 paid units earn 1 free row (paid // recurse_for).
+		rule = self._bxgy("_PNXT_FF_BXGY_REC", min_qty=2, is_recursive=1, recurse_for=2, apply_recursion_over=0)
 		for qty in range(1, 7):
 			resp = self._apply([(ITEM_A, qty), (ITEM_B, 1)], [rule])
-			self._assert_bxgy_keeps_line(resp, qty, min_qty=1)
-			line = self._item(resp, ITEM_A)
-			self.assertEqual(flt(line.get("free_qty")), qty // 2, f"qty {qty}: BXGY free units")
+			self._assert_bxgy_keeps_line(resp, qty, min_qty=2)
+			self.assertEqual(self._free_qty(resp, ITEM_A), qty // 2, f"qty {qty}: BXGY free units")
 			# Other cart lines still get F&F.
 			self.assertEqual(self._item(resp, ITEM_B).get("discount_source"), FNF, f"qty {qty}")
 
@@ -129,7 +133,7 @@ class TestFriendsAndFamilySchemeRules(FrappeTestCase):
 			# Client report: qty 4 (above max_qty) used to flip the line to F&F.
 			self._assert_bxgy_keeps_line(resp, qty)
 			if 2 <= qty <= 3:
-				self.assertEqual(flt(self._item(resp, ITEM_A).get("free_qty")), 1, f"qty {qty}")
+				self.assertEqual(self._free_qty(resp, ITEM_A), 1, f"qty {qty}")
 			self.assertEqual(self._item(resp, ITEM_B).get("discount_source"), FNF, f"qty {qty}")
 
 	def _routine(self, title, pct):
