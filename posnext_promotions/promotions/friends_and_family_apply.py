@@ -1390,8 +1390,9 @@ def _line_tolerance(item, unit: float) -> float:
 def _carried_fnf(item, value: float, uncapped: float, capped: float, tolerance: float) -> float:
 	"""F&F the paid row carries, valued from its persisted prices (ERPNext order, as the ledger).
 
-	A row with an F&F marker carries its whole discount as F&F. The POS sends no
-	marker, so an unmarked row counts as F&F only when it has no Pricing Rule or
+	A row with an F&F marker carries its whole discount as F&F. The POS marks F&F
+	lines with ``posnext_discount_source``; a row without a marker (an older client, or
+	a row the POS left unmarked) counts as F&F only when it has no Pricing Rule or
 	coupon tag and its discount is what the program gives it (full or capped).
 	Any other unmarked discount is a competitor the unpaid path would keep too.
 	"""
@@ -1587,8 +1588,9 @@ def _freeze_paid_invoice(doc, items) -> None:
 def _paid_gift_disagreements(items, fnf_ids: set) -> list:
 	"""Gifts the gift policy forbids next to this paid invoice's F&F: reported, never removed.
 
-	The policy runs on copies, keyed on the rows that carry F&F (the POS sends no
-	F&F markers, so the default "stamped now" rows would miss them). Each free row it
+	The policy runs on copies, keyed on the rows that carry F&F (the POS marks them with
+	``posnext_discount_source``, and free rows keep their rule names; rows from older clients
+	carry no marker, so the default "stamped now" rows would miss them). Each free row it
 	would drop, and each F&F row whose gift stamp it would clear, is one disagreement.
 	"""
 	if not fnf_ids:

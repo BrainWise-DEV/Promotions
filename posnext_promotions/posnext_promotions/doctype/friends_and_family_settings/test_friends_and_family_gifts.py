@@ -323,3 +323,35 @@ class TestFriendsAndFamilyGiftSettings(FrappeTestCase):
 		program = get_active_program()
 		self.assertFalse(program.allow_free_gift_with_ff)
 		self.assertFalse(gifts.allow_free_gift_with_ff())
+
+
+class TestRuleScopeMatches(FrappeTestCase):
+	"""`_rule_scope_matches` reads the Pricing Rule and matches the line by its apply_on scope."""
+
+	def _matches(self, item, rule):
+		with patch.object(frappe, "get_cached_doc", return_value=frappe._dict(rule)):
+			return gifts._rule_scope_matches(frappe._dict(item), "_Test Scope Rule")
+
+	def test_item_code_scope(self):
+		rule = {"apply_on": "Item Code", "items": [frappe._dict(item_code="_A")]}
+		self.assertTrue(self._matches({"item_code": "_A"}, rule))
+		self.assertFalse(self._matches({"item_code": "_B"}, rule))
+
+	def test_brand_scope(self):
+		rule = {"apply_on": "Brand", "brands": [frappe._dict(brand="_Brand A")]}
+		self.assertTrue(self._matches({"item_code": "_X", "brand": "_Brand A"}, rule))
+		self.assertFalse(self._matches({"item_code": "_X", "brand": "_Brand B"}, rule))
+		self.assertFalse(self._matches({"item_code": "_X"}, rule))
+
+	def test_item_group_scope_includes_descendants(self):
+		rule = {"apply_on": "Item Group", "item_groups": [frappe._dict(item_group="_Parent")]}
+		with patch(
+			"posnext_promotions.api.gwp.get_child_item_groups", return_value=["_Parent", "_Child"]
+		):
+			self.assertTrue(self._matches({"item_code": "_X", "item_group": "_Child"}, rule))
+			self.assertTrue(self._matches({"item_code": "_X", "item_group": "_Parent"}, rule))
+			self.assertFalse(self._matches({"item_code": "_X", "item_group": "_Other"}, rule))
+
+	def test_missing_rule_does_not_match(self):
+		with patch.object(frappe, "get_cached_doc", side_effect=frappe.DoesNotExistError):
+			self.assertFalse(gifts._rule_scope_matches(frappe._dict(item_code="_A"), "_Gone"))

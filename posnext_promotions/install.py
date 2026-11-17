@@ -31,7 +31,13 @@ def before_install():
 
 
 def after_install():
-	"""Structural keys the post_model_sync patches would otherwise add on the first migrate."""
+	"""F&F structure a fresh install needs (same helpers as after_migrate, which repeats them).
+
+	``_backfill_coupon_promotion_conflict`` stays migrate-only: it repairs data a fresh install cannot have.
+	"""
+	_ensure_friends_and_family_customer_flag()
+	_ensure_friends_and_family_invoice_fields()
+	_ensure_friends_and_family_message_events()
 	_ensure_ff_usage_unique_key()
 
 
