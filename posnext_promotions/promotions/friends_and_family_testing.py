@@ -11,6 +11,7 @@ customers a verified email on it.
 from __future__ import annotations
 
 import re
+from contextlib import contextmanager
 
 import frappe
 from frappe.utils import now_datetime
@@ -41,3 +42,26 @@ def give_verified_email(customer: str, domain: str = TEST_EMAIL_DOMAIN, email: s
 			values["custom_email_verified_on"] = now_datetime()
 	frappe.db.set_value("Customer", customer, values, update_modified=False)
 	return email
+
+
+FF_SETTINGS = "Friends and Family Settings"
+
+
+@contextmanager
+def ff_settings_guard():
+	"""Snapshot the F&F Settings Single (fields + child rows) and restore it on exit."""
+	snapshot = frappe.get_doc(FF_SETTINGS).as_dict(convert_dates_to_str=False)
+	try:
+		yield
+	finally:
+		doc = frappe.get_doc(FF_SETTINGS)
+		for df in doc.meta.fields:
+			if df.fieldtype in ("Table", "Table MultiSelect"):
+				doc.set(df.fieldname, [])
+				for row in snapshot.get(df.fieldname) or []:
+					doc.append(df.fieldname, {k: v for k, v in row.items() if k not in ("name", "idx", "parent", "parentfield", "parenttype", "creation", "modified")})
+			elif df.fieldtype not in frappe.model.no_value_fields:
+				doc.set(df.fieldname, snapshot.get(df.fieldname))
+		doc.flags.ignore_permissions = True
+		doc.flags.ignore_validate = True
+		doc.save(ignore_permissions=True)
