@@ -61,6 +61,10 @@ FIELD_DISCOUNT_SOURCE = "posnext_discount_source"
 # PN-133: the discount F&F replaced on the line (JSON), so a later save can
 # re-run the comparison — and give the promotion back if F&F no longer wins.
 FIELD_FNF_REPLACED = "posnext_fnf_replaced_discount"
+# The F&F line snapshot: the program's percentage and the program name (blank in Phase 1).
+# Together with the source tag these mark a line as F&F; no percentage heuristic.
+FIELD_FNF_PERCENTAGE = "posnext_fnf_percentage"
+FIELD_FNF_PROGRAM = "posnext_fnf_program"
 INVOICE_ITEM_DOCTYPES = ("Sales Invoice Item", "POS Invoice Item")
 INVOICE_DOCTYPES = ("Sales Invoice", "POS Invoice")
 
@@ -102,6 +106,29 @@ ITEM_FIELD_SPECS = [
 		"print_hide": 1,
 		"report_hide": 1,
 		"description": "Promotion / coupon / manual discount that Friends & Family replaced (JSON).",
+	},
+	{
+		"fieldname": FIELD_FNF_PERCENTAGE,
+		"module": "POSNext Promotions",
+		"label": "Friends & Family %",
+		"fieldtype": "Percent",
+		"insert_after": FIELD_FNF_REPLACED,
+		"read_only": 1,
+		"no_copy": 0,
+		"print_hide": 1,
+		"description": "Friends & Family program percentage when this line was stamped "
+		"(copied from the original line on returns).",
+	},
+	{
+		"fieldname": FIELD_FNF_PROGRAM,
+		"module": "POSNext Promotions",
+		"label": "Friends & Family Program",
+		"fieldtype": "Data",
+		"insert_after": FIELD_FNF_PERCENTAGE,
+		"read_only": 1,
+		"no_copy": 0,
+		"print_hide": 1,
+		"description": "Friends & Family program that discounted this line.",
 	},
 ]
 

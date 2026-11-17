@@ -27,7 +27,9 @@ Amounts come from the persisted row after ERPNext recalculated it:
 ``(price_list_rate - rate) x qty`` on lines tagged F&F. Nothing is taken from
 a client-sent discount field.
 
-Returns credit the period of their original invoice. Consolidated Sales
+Returns credit the period of their original invoice, and only from the
+original row (:func:`return_credits`): its recorded F&F amount, pro rata to
+the quantity returned. Nothing on the return row itself is trusted. Consolidated Sales
 Invoices are skipped (their POS Invoices were recorded), and so are Sales
 Invoices that are not POS (``is_pos = 0``).
 """
@@ -42,7 +44,7 @@ import frappe
 from frappe import _
 from frappe.query_builder.functions import Coalesce, IfNull, Sum
 from frappe.utils import cint, cstr, flt, fmt_money, getdate, now_datetime
-from pypika.terms import ExistsCriterion, Values
+from pypika.terms import ExistsCriterion, ValueWrapper, Values
 
 from posnext_promotions.promotions import best_discount as bd
 from posnext_promotions.promotions import ff_config
@@ -51,6 +53,9 @@ from posnext_promotions.promotions.friends_and_family_caps import (
 	CAP_MONTHLY,
 	CAP_ORDER,
 	FIELD_DISCOUNT_SOURCE,
+	FIELD_FNF_AMOUNT,
+	FIELD_FNF_PERCENTAGE,
+	FIELD_FNF_PROGRAM,
 	INVOICE_DOCTYPES,
 )
 
@@ -64,6 +69,15 @@ TOTAL_UNIQUE_KEY = "ff_usage_total_key"
 TOTAL_UNIQUE_KEY_FIELDS = ("customer", "company", "period_key")
 FNF_SOURCE = "friends_and_family"
 REASON_BREACH = "cap_breach_at_submit"
+# Return row -> original row link, per invoice doctype.
+RETURN_LINK_FIELDS = {"Sales Invoice": "sales_invoice_item", "POS Invoice": "pos_invoice_item"}
+# Why a return row got no credit although it may have had F&F.
+RETURN_NO_LINK = "return_without_original_row"
+RETURN_ORIGINAL_MISSING = "return_original_row_missing"
+RETURN_ORIGINAL_QTY_ZERO = "return_original_qty_zero"
+RETURN_ORIGINAL_IS_RETURN = "return_original_is_return"
+RETURN_ORIGINAL_CONSOLIDATED = "return_original_consolidated"
+ORIGINAL_ROW_INDEX = "original_row_index"
 
 def _ledger():
 	return frappe.qb.DocType(LEDGER_DOCTYPE)
@@ -77,8 +91,8 @@ def _totals():
 
 
 def ensure_ledger_unique_key() -> None:
-	"""Add the ledger's ``ff_usage_line`` unique key, (customer, period_key) and period_key indexes, and the
-	counter's (customer, period_key) unique key, when missing. Idempotent.
+	"""Add the ledger's ``ff_usage_line`` unique key, (customer, period_key), period_key and
+	``original_row_index`` indexes, and the counter's unique key, when missing. Idempotent.
 
 	Checks this site's schema with ``SHOW INDEX``. ``frappe.db.add_unique`` checks
 	``information_schema`` by table name only, so another site's database on the
@@ -95,6 +109,7 @@ def ensure_ledger_unique_key() -> None:
 		if not frappe.db.has_index(table, PERIOD_ONLY_INDEX):
 			# The rebuild's locking SUM per period locks only that period's rows.
 			frappe.db.sql_ddl(f"alter table `{table}` add index `{PERIOD_ONLY_INDEX}` (`period_key`)")
+		_ensure_original_row_index(table)
 	if frappe.db.table_exists(TOTAL_DOCTYPE, cached=False):
 		table = f"tab{TOTAL_DOCTYPE}"
 		# SHOW INDEX lists a key's columns in order; Column_name is the 5th field.
@@ -106,6 +121,22 @@ def ensure_ledger_unique_key() -> None:
 		if not cols:
 			fields = ", ".join(f"`{f}`" for f in TOTAL_UNIQUE_KEY_FIELDS)
 			frappe.db.sql_ddl(f"alter table `{table}` add unique index `{TOTAL_UNIQUE_KEY}` ({fields})")
+
+
+def _ensure_original_row_index(table: str) -> None:
+	"""``original_row`` (``search_index``) under the name the return path forces: ``original_row_index``.
+
+	Frappe names a ``search_index`` index ``original_row`` when CREATE TABLE makes it
+	(fresh install) and ``original_row_index`` when ALTER adds the column later. The
+	CREATE name is renamed, so one index exists under one name on every site, and
+	Frappe's own sync (which checks indexes by column) neither adds nor drops one.
+	"""
+	if not frappe.db.has_column(LEDGER_DOCTYPE, "original_row") or frappe.db.has_index(table, ORIGINAL_ROW_INDEX):
+		return
+	if frappe.db.has_index(table, "original_row"):
+		frappe.db.sql_ddl(f"alter table `{table}` rename index `original_row` to `{ORIGINAL_ROW_INDEX}`")
+	else:
+		frappe.db.sql_ddl(f"alter table `{table}` add index `{ORIGINAL_ROW_INDEX}` (`original_row`)")
 
 
 # ---- periods ----------------------------------------------------------------
@@ -156,6 +187,13 @@ def _upsert_total(name: str, customer: str, company: str, period_key: str, base_
 	query.run()
 
 
+def _busy(customer):
+	frappe.throw(
+		_("Friends & Family usage is busy for customer {0}, please retry.").format(customer),
+		title=_("Please retry"),
+	)
+
+
 def lock_usage(customer: str, company: str, period_key: str) -> float:
 	"""Lock the customer's counter for ``company`` and ``period_key``; return its value (company currency).
 
@@ -175,10 +213,7 @@ def lock_usage(customer: str, company: str, period_key: str) -> float:
 		_upsert_total(name, customer, company, period_key, 0.0, overwrite=False)
 		value = frappe.qb.from_(T).select(T.base_amount).where(T.name == name).for_update().run()[0][0]
 	except frappe.QueryTimeoutError:
-		frappe.throw(
-			_("Friends & Family usage is busy for customer {0}, please retry.").format(customer),
-			title=_("Please retry"),
-		)
+		_busy(customer)
 	return flt(value)
 
 
@@ -267,6 +302,150 @@ def line_fnf_amount(row) -> float:
 	return (price_list_rate - rate) * flt(row.get("qty"))
 
 
+# ---- returns ----------------------------------------------------------------
+
+
+def _item_precision(doctype: str, currency: str | None) -> int:
+	from frappe.model.meta import get_field_precision
+
+	field = frappe.get_meta(f"{doctype} Item").get_field(FIELD_FNF_AMOUNT)
+	return get_field_precision(field, currency=currency) if field else bd.MONEY_PRECISION
+
+
+def _original_rows(doc, links: set) -> dict:
+	"""Original rows by name: on ``return_against``, submitted, same customer.
+
+	``is_return`` / ``is_consolidated`` are returned for the caller to reject: a
+	credit note's rows, and a consolidated Sales Invoice's rows (they copy the F&F
+	fields of POS Invoices that were recorded already), are never an original.
+	"""
+	doctype = cstr(doc.get("doctype"))
+	if not links or not doc.get("return_against"):
+		return {}
+	Item = frappe.qb.DocType(f"{doctype} Item")
+	Inv = frappe.qb.DocType(doctype)
+	# POS Invoice has no is_consolidated column.
+	consolidated = Inv.is_consolidated if doctype == "Sales Invoice" else ValueWrapper(0)
+	rows = (
+		frappe.qb.from_(Item)
+		.join(Inv)
+		.on(Inv.name == Item.parent)
+		.select(
+			IfNull(Inv.is_return, 0).as_("is_return"),
+			IfNull(consolidated, 0).as_("is_consolidated"),
+			Item.name,
+			Item.item_code,
+			Item.qty,
+			Item[FIELD_DISCOUNT_SOURCE].as_("source"),
+			Item[FIELD_FNF_AMOUNT].as_("fnf_amount"),
+			Item[FIELD_FNF_PERCENTAGE].as_("fnf_percentage"),
+			Item[FIELD_FNF_PROGRAM].as_("fnf_program"),
+		)
+		.where(
+			Item.name.isin(sorted(links))
+			& (Item.parent == doc.get("return_against"))
+			& (Item.parenttype == doctype)
+			& (Inv.docstatus == 1)
+			& (Inv.customer == doc.get("customer"))
+		)
+	).run(as_dict=True)
+	return {row.name: row for row in rows}
+
+
+def _prior_credits(doc, originals: set, for_update: bool = False) -> dict:
+	"""``{original row: [qty returned, credit given]}`` by other returns, from the ledger (Ruling 38).
+
+	Return ledger rows carry ``original_row`` and ``qty`` and are written only under
+	the original period's counter lock (:func:`_on_submit_return`), so a locking
+	read taken after that lock sees every committed return of the row.
+	``for_update`` makes it that locking read; it is bound to ``original_row_index``
+	(forced: on a small table the optimiser may otherwise scan, and a locking scan
+	would lock every ledger row).
+	"""
+	if not originals:
+		return {}
+	L = _ledger()
+	query = (
+		frappe.qb.from_(L)
+		.select(L.original_row, L.qty, L.amount)
+		.where(
+			L.original_row.isin(sorted(originals))
+			& (L.invoice_doctype == doc.get("doctype"))
+			& (L.is_cancelled == 0)
+		)
+	)
+	if doc.get("name"):
+		query = query.where(L.invoice != doc.get("name"))
+	if for_update:
+		query = query.force_index(ORIGINAL_ROW_INDEX).for_update()
+	prior: dict = {}
+	for row in query.run(as_dict=True):
+		done = prior.setdefault(row.original_row, [0.0, 0.0])
+		done[0] += abs(flt(row.qty))
+		done[1] -= flt(row.amount)
+	return {link: [qty, max(0.0, credit)] for link, (qty, credit) in prior.items()}
+
+
+def return_credits(doc, for_update: bool = False) -> list[frappe._dict]:
+	"""F&F usage each return row gives back, derived from its ORIGINAL row only.
+
+	Per row: ``credit`` (<= 0), ``original`` (the original row when it carried
+	F&F, else ``None``) and ``warning`` (why no original row could be used).
+	Credit = the original row's recorded F&F amount x cumulative returned qty /
+	original qty, minus what earlier returns of that row already credited, so
+	partial returns add up to the original amount exactly and never beyond it.
+	A missing link, an original row that is not on ``return_against`` (or not
+	submitted, other customer or item), an original that is itself a return or a
+	consolidated invoice, or an original qty of 0 credits nothing.
+
+	Earlier returns are read from the ledger (:func:`_prior_credits`).
+	``for_update``: with a locking read (submit only, after :func:`lock_usage` on
+	the original period's counter and this return's own rows are inserted).
+	"""
+	doctype = cstr(doc.get("doctype"))
+	link_field = RETURN_LINK_FIELDS.get(doctype)
+	rows = doc.get("items") or []
+	links = {cstr(r.get(link_field)) for r in rows if link_field and r.get(link_field)}
+	originals = _original_rows(doc, links)
+	prior = _prior_credits(doc, set(originals), for_update=for_update)
+	precision = _item_precision(doctype, doc.get("currency"))
+	results = []
+	for row in rows:
+		result = frappe._dict(row=row, credit=0.0, original=None, warning=None)
+		results.append(result)
+		link = cstr(row.get(link_field)) if link_field else ""
+		original = originals.get(link)
+		if not link:
+			result.warning = RETURN_NO_LINK
+			continue
+		if original is None or cstr(original.item_code) != cstr(row.get("item_code")):
+			result.warning = RETURN_ORIGINAL_MISSING
+			continue
+		# Before the qty check: a return's rows have negative qty.
+		if cint(original.is_return):
+			result.warning = RETURN_ORIGINAL_IS_RETURN
+			continue
+		if cint(original.is_consolidated):
+			result.warning = RETURN_ORIGINAL_CONSOLIDATED
+			continue
+		original_qty = flt(original.qty)
+		if original_qty <= 0:
+			result.warning = RETURN_ORIGINAL_QTY_ZERO
+			continue
+		original_amount = flt(original.fnf_amount, precision)
+		if cstr(original.source) != FNF_SOURCE or original_amount <= 0:
+			continue
+		done = prior.setdefault(link, [0.0, 0.0])
+		returned = min(original_qty, done[0] + abs(flt(row.get("qty"))))
+		target = min(original_amount, flt(original_amount * returned / original_qty, precision))
+		credit = max(0.0, flt(target - done[1], precision))
+		done[0] += abs(flt(row.get("qty")))
+		done[1] += credit
+		result.credit = -credit
+		result.original = original
+	return results
+
+
 def _ledger_posting_date(doc):
 	"""Posting date that picks the period: a return uses its original invoice's."""
 	if cint(doc.get("is_return")) and doc.get("return_against"):
@@ -286,8 +465,11 @@ def _company_currency(company) -> str | None:
 	return frappe.get_cached_value("Company", company, "default_currency") if company else None
 
 
-def ledger_rows(doc) -> list[dict]:
-	"""Ledger values for each F&F line of ``doc`` (empty when the invoice is not tracked)."""
+def ledger_rows(doc, credits: list | None = None) -> list[dict]:
+	"""Ledger values for each F&F line of ``doc`` (empty when the invoice is not tracked).
+
+	``credits``: :func:`return_credits` already computed for a return (under its lock).
+	"""
 	if not is_tracked(doc) or not doc.get("customer"):
 		return []
 	company = doc.get("company")
@@ -297,10 +479,20 @@ def ledger_rows(doc) -> list[dict]:
 	amount_precision = _precision("amount", currency)
 	base_precision = _precision("base_amount", company_currency)
 	period = period_key(_ledger_posting_date(doc))
+	if cint(doc.get("is_return")):
+		# Never from the return row's prices: a crafted price_list_rate would credit anything.
+		# Every row with an F&F original is recorded, even at 0: its qty counts
+		# towards the cumulative returned qty of later returns of that row.
+		amounts = [
+			(r.row, r.credit, r.original.name if r.original else None)
+			for r in (credits if credits is not None else return_credits(doc))
+		]
+	else:
+		amounts = [(row, line_fnf_amount(row), None) for row in doc.get("items") or []]
 	rows = []
-	for row in doc.get("items") or []:
-		amount = flt(line_fnf_amount(row), amount_precision)
-		if not amount or not row.get("name"):
+	for row, line_amount, original_row in amounts:
+		amount = flt(line_amount, amount_precision)
+		if not (amount or original_row) or not row.get("name"):
 			continue
 		rows.append(
 			{
@@ -310,6 +502,8 @@ def ledger_rows(doc) -> list[dict]:
 				"invoice_doctype": doc.get("doctype"),
 				"invoice": doc.get("name"),
 				"invoice_item": row.get("name"),
+				"original_row": original_row,
+				"qty": flt(row.get("qty")),
 				"posting_date": getdate(doc.get("posting_date")),
 				"period_key": period,
 				"currency": currency,
@@ -437,14 +631,91 @@ def _log_breach(doc, breach: dict) -> None:
 # ---- hooks ------------------------------------------------------------------
 
 
+def _persist_return_stamps(doc, credits) -> None:
+	"""The credit decided under the lock is the row's stamp (later returns sum these stamps)."""
+	item_doctype = f"{doc.get('doctype')} Item"
+	for result in credits:
+		row = result.row
+		if flt(row.get(FIELD_FNF_AMOUNT)) == flt(result.credit):
+			continue
+		if isinstance(row, dict):
+			row[FIELD_FNF_AMOUNT] = flt(result.credit)
+		else:
+			row.set(FIELD_FNF_AMOUNT, flt(result.credit))
+		if row.get("name"):
+			frappe.db.set_value(item_doctype, row.get("name"), FIELD_FNF_AMOUNT, flt(result.credit), update_modified=False)
+
+
+def _on_submit_return(doc) -> None:
+	"""Record a return's credit; returns of one original row run one after the other (Rulings 36, 38).
+
+	Validate stamped each row from a snapshot read, which may miss a return of the
+	same original row committed since. Here, in this order:
+
+	1. lock the original period's counter (every return of the row needs it:
+	   same customer, company, period), so those returns serialise;
+	2. insert this return's ledger rows with amount 0 (they carry
+	   ``original_row`` and ``qty``);
+	3. re-read earlier returns of those rows from the ledger with a locking read
+	   (index-bound) and recompute the credit;
+	4. update this return's own rows by their unique key and add the total to
+	   the counter.
+
+	Inserting before the locking read matters: the read takes gap locks on
+	``original_row_index``; were the insert after it, two returns of different
+	originals in one gap would each wait on the other's gap lock (deadlock).
+	Return headers are never locked (Ruling 38).
+	"""
+	if not is_tracked(doc) or not doc.get("customer"):
+		return
+	plain = return_credits(doc)
+	# A snapshot read can only over-state the credit; no F&F original means nothing to record.
+	if not any(r.original is not None for r in plain):
+		return
+	customer, company = doc.get("customer"), doc.get("company")
+	period = period_key(_ledger_posting_date(doc))
+	lock_usage(customer, company, period)
+	try:
+		inserted = [values for values in ledger_rows(doc, credits=plain) if insert_row({**values, "amount": 0, "base_amount": 0})]
+		if not inserted:
+			return  # already recorded (the hook ran before for this invoice)
+		credits = return_credits(doc, for_update=True)
+	except frappe.QueryTimeoutError:
+		_busy(customer)
+	_persist_return_stamps(doc, credits)
+	final = {values["invoice_item"]: values for values in ledger_rows(doc, credits=credits)}
+	L = _ledger()
+	delta = 0.0
+	for values in inserted:
+		row = final.get(values["invoice_item"])
+		if not row or not row["amount"]:
+			continue
+		(
+			frappe.qb.update(L)
+			.set(L.amount, row["amount"])
+			.set(L.base_amount, row["base_amount"])
+			.where(
+				(L.invoice_doctype == values["invoice_doctype"])
+				& (L.invoice == values["invoice"])
+				& (L.invoice_item == values["invoice_item"])
+			)
+		).run()
+		delta += flt(row["base_amount"])
+	if delta:
+		_add_to_total(customer, company, period, delta)
+
+
 def on_submit(doc, method=None):
 	"""Sales Invoice / POS Invoice ``on_submit``: lock the counter, check the caps, record usage."""
+	if cint(doc.get("is_return")):
+		_on_submit_return(doc)
+		return
 	rows = ledger_rows(doc)
 	if not rows:
 		return
 	customer, company, period = rows[0]["customer"], rows[0]["company"], rows[0]["period_key"]
 	used = lock_usage(customer, company, period) - _recorded_for_invoice(doc.get("doctype"), doc.get("name"))
-	breach = None if cint(doc.get("is_return")) else _check_caps(doc, rows, max(0.0, used))  # clamp on read only
+	breach = _check_caps(doc, rows, max(0.0, used))  # clamp on read only
 	block = const.CAP_BREACH_POLICIES[1]
 	if breach and ff_config.resolve().on_cap_breach_at_submit.value == block:
 		frappe.throw(breach["message"], title=_("Friends & Family cap exceeded"))
@@ -557,6 +828,39 @@ def rebuild_totals(period_key: str) -> None:
 		).run()
 
 
+def backfill_return_links() -> int:
+	"""Fill ``original_row`` / ``qty`` on return ledger rows recorded before those fields (Ruling 38).
+
+	Later returns of the same original row read their predecessors from these
+	fields. Idempotent: only rows with no ``original_row`` yet. Returns the count.
+	"""
+	L = _ledger()
+	rows = (
+		frappe.qb.from_(L)
+		.select(L.name, L.invoice_doctype, L.invoice_item)
+		.where((L.is_return == 1) & (IfNull(L.original_row, "") == ""))
+	).run(as_dict=True)
+	count = 0
+	for row in rows:
+		link_field = RETURN_LINK_FIELDS.get(row.invoice_doctype)
+		if not link_field:
+			continue
+		Item = frappe.qb.DocType(f"{row.invoice_doctype} Item")
+		item = (
+			frappe.qb.from_(Item).select(Item[link_field].as_("link"), Item.qty).where(Item.name == row.invoice_item)
+		).run(as_dict=True)
+		if not item:
+			continue
+		(
+			frappe.qb.update(L)
+			.set(L.original_row, item[0].link or None)
+			.set(L.qty, flt(item[0].qty))
+			.where(L.name == row.name)
+		).run()
+		count += 1
+	return count
+
+
 def backfill(period_key: str, batch_size: int = 500, dry_run: bool = False) -> dict:
 	"""Record submitted F&F invoices of ``period_key`` that have no ledger rows yet, then
 	rebuild that period's counters from the ledger.
@@ -564,7 +868,10 @@ def backfill(period_key: str, batch_size: int = 500, dry_run: bool = False) -> d
 	Pages by invoice name and commits after each batch. Idempotent: the unique
 	key (ensured first) skips lines already recorded, and counters are
 	recomputed, not added to. ``dry_run`` writes nothing and returns what it
-	would write. Returns ``{"invoices": n, "rows": m}``.
+	would write. Returns ``{"invoices": n, "rows": m}``: counts only. They are
+	exact for returns too (a return row with an F&F original is written even at
+	0); the credit amounts are not previewed, since a dry run cannot see earlier
+	returns' credits it has not written.
 	"""
 	if not dry_run:
 		ensure_ledger_unique_key()

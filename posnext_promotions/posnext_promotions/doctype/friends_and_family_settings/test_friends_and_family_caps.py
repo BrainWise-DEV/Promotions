@@ -444,10 +444,18 @@ class TestFriendsAndFamilyCaps(FrappeTestCase):
 		self.assertEqual(payload["caps"]["cap_hit"], CAP_MONTHLY)
 
 	def test_return_invoice_stamps_negative_usage(self):
-		fnf_row = self._line(qty=-2, discount_percentage=30, **{FIELD_DISCOUNT_SOURCE: DISCOUNT_SOURCE_FRIENDS_AND_FAMILY})
+		# The credit comes from the linked original row (2 units, F&F 60), not the return row.
+		original = self._ledger([60])
+		frappe.db.sql("update `tabPOS Invoice Item` set qty = 2 where name = %s", f"{original}-1")
+		fnf_row = self._line(
+			qty=-2,
+			discount_percentage=30,
+			pos_invoice_item=f"{original}-1",
+			**{FIELD_DISCOUNT_SOURCE: DISCOUNT_SOURCE_FRIENDS_AND_FAMILY},
+		)
 		fnf_row.rate = 70
 		other_row = self._line(item_code=ITEM_2, qty=-1, **{FIELD_FNF_AMOUNT: 12})
-		doc = self._invoice([fnf_row, other_row], is_return=1, return_against="X")
+		doc = self._invoice([fnf_row, other_row], is_return=1, return_against=original)
 		self.assertIsNone(apply_friends_and_family_on_invoice(doc))
 		self.assertEqual(flt(fnf_row[FIELD_FNF_AMOUNT]), -60)
 		self.assertEqual(flt(fnf_row.rate), 70)  # pricing untouched on returns

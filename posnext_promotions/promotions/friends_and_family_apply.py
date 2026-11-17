@@ -60,6 +60,8 @@ from posnext_promotions.promotions.friends_and_family import (
 from posnext_promotions.promotions.friends_and_family_caps import (
 	FIELD_DISCOUNT_SOURCE,
 	FIELD_FNF_AMOUNT,
+	FIELD_FNF_PERCENTAGE,
+	FIELD_FNF_PROGRAM,
 	FIELD_FNF_REPLACED,
 	CapContext,
 	allocate,
@@ -68,7 +70,7 @@ from posnext_promotions.promotions.friends_and_family_caps import (
 	ceil_cents,
 	get_cap_context,
 )
-from posnext_promotions.promotions import ff_compatibility, ff_config, ff_snapshot
+from posnext_promotions.promotions import ff_compatibility, ff_config, ff_ledger, ff_snapshot
 from posnext_promotions.promotions import friends_and_family_gifts as gifts
 from posnext_promotions.promotions.friends_and_family_gifts import line_blocked_by_scheme
 from posnext_promotions.promotions.friends_and_family_eligibility import (
@@ -301,6 +303,10 @@ def _clear_fnf_audit_fields(item) -> None:
 		_set_item_attr(item, FIELD_DISCOUNT_SOURCE, None)
 	if flt(item.get(FIELD_FNF_AMOUNT)):
 		_set_item_attr(item, FIELD_FNF_AMOUNT, 0)
+	if flt(item.get(FIELD_FNF_PERCENTAGE)):
+		_set_item_attr(item, FIELD_FNF_PERCENTAGE, 0)
+	if item.get(FIELD_FNF_PROGRAM):
+		_set_item_attr(item, FIELD_FNF_PROGRAM, None)
 
 
 # Line fields that describe the discount F&F replaced (restored on the next run).
@@ -431,6 +437,7 @@ def _stamp_friends_and_family(
 	expects; on cart payloads it is the line total, as ``apply_offers`` uses.
 	``line_amount`` (PN-129) stamps a cap-reduced saving instead of the full %.
 	"""
+	program_percentage = percentage
 	qty = _line_qty(item)
 	price_list_rate = _line_price_list_rate(item)
 	if line_amount is not None:
@@ -453,6 +460,10 @@ def _stamp_friends_and_family(
 	# Persisted audit trail (PN-129): drives the monthly cap and reporting.
 	_set_item_attr(item, FIELD_DISCOUNT_SOURCE, DISCOUNT_SOURCE_FRIENDS_AND_FAMILY)
 	_set_item_attr(item, FIELD_FNF_AMOUNT, bd.money(discount_amount))
+	# Line snapshot: the program's rate (the line's own, possibly capped, % is
+	# discount_percentage). Program names arrive in Phase 3; blank until then.
+	_set_item_attr(item, FIELD_FNF_PERCENTAGE, flt(program_percentage))
+	_set_item_attr(item, FIELD_FNF_PROGRAM, None)
 	return discount_amount, rate
 
 
@@ -518,17 +529,12 @@ def _drop_competing_tags(item, competing_source: str | None) -> list[str]:
 def _looks_like_fnf_stamp(item, program, amount_basis: str) -> bool:
 	"""Treat the line's current discount as our own earlier F&F stamp.
 
-	Cart payloads carry ``discount_source``. Saved invoice rows do not persist
-	it, so on the invoice path a percentage equal to the Settings rate with no
-	Pricing Rule / coupon behind it is our stamp (re-stamping is idempotent).
+	Only an explicit marker counts: the source tag (``discount_source`` on cart
+	payloads, ``posnext_discount_source`` on saved rows) or the stored F&F
+	percentage. A manual or legacy discount that merely equals the program's
+	percentage is a competitor, not our stamp.
 	"""
-	if _is_fnf_stamped(item):
-		return True
-	if amount_basis != bd.AMOUNT_BASIS_UNIT:
-		return False
-	if bd.has_pricing_rules(item) or bd.line_coupon_code(item):
-		return False
-	return abs(flt(item.get("discount_percentage")) - flt(program.discount_percentage)) < 0.0001
+	return _is_fnf_stamped(item) or flt(item.get(FIELD_FNF_PERCENTAGE)) > 0
 
 
 def _competing_candidate(item, program, amount_basis: str) -> bd.Candidate | None:
@@ -951,6 +957,8 @@ _LINE_SNAPSHOT_FIELDS = (
 	"is_already_discounted",
 	FIELD_DISCOUNT_SOURCE,
 	FIELD_FNF_AMOUNT,
+	FIELD_FNF_PERCENTAGE,
+	FIELD_FNF_PROGRAM,
 	FIELD_FNF_REPLACED,
 )
 
@@ -1140,21 +1148,80 @@ def _invoice_state(doc, items) -> tuple:
 	)
 
 
-def _stamp_return_usage(items) -> None:
-	"""Credit-note rows give F&F allowance back: store the negative saving for the returned qty.
+RETURN_WARNINGS_FLAG = "ff_return_warnings"
 
-	The row copies ``posnext_discount_source`` / rate / price list rate from
-	the original line, so the per-unit saving is ``price_list_rate - rate``.
+
+def _claims_fnf(row) -> bool:
+	"""The client sent F&F markers on this row (not trusted, only used to decide on a warning)."""
+	return (
+		cstr(row.get(FIELD_DISCOUNT_SOURCE)) == DISCOUNT_SOURCE_FRIENDS_AND_FAMILY
+		or bool(flt(row.get(FIELD_FNF_AMOUNT)))
+		or flt(row.get(FIELD_FNF_PERCENTAGE)) > 0
+	)
+
+
+def _fnf_items_on(doc) -> set:
+	"""Item codes that carried F&F on the invoice this return is against."""
+	against = doc.get("return_against")
+	doctype = cstr(doc.get("doctype"))
+	if not against or doctype not in ff_ledger.RETURN_LINK_FIELDS:
+		return set()
+	Item = frappe.qb.DocType(f"{doctype} Item")
+	return set(
+		(
+			frappe.qb.from_(Item)
+			.select(Item.item_code)
+			.where(
+				(Item.parent == against)
+				& (Item.parenttype == doctype)
+				& (Item[FIELD_DISCOUNT_SOURCE] == DISCOUNT_SOURCE_FRIENDS_AND_FAMILY)
+			)
+		).run(pluck=True)
+	)
+
+
+def _stamp_return_usage(doc, items) -> None:
+	"""Credit-note rows give F&F allowance back, derived from the ORIGINAL row only.
+
+	The amount comes from :func:`ff_ledger.return_credits` (the original row's
+	recorded F&F amount, pro rata to the returned qty). The F&F markers are
+	copied from the original row, so reports see the return; a row whose
+	original carried no F&F gets them cleared, whatever the client sent.
+	Rows that may have had F&F but have no usable original row are kept on
+	``doc.flags`` for a log warning at submit (drafts are never logged).
 	"""
-	for row in items:
-		if cstr(row.get(FIELD_DISCOUNT_SOURCE)) != DISCOUNT_SOURCE_FRIENDS_AND_FAMILY:
-			if flt(row.get(FIELD_FNF_AMOUNT)):
-				_set_item_attr(row, FIELD_FNF_AMOUNT, 0)
-			continue
-		price_list_rate = flt(row.get("price_list_rate"))
-		rate = flt(row.get("rate"))
-		per_unit = price_list_rate - rate if price_list_rate > rate else flt(row.get("discount_amount"))
-		_set_item_attr(row, FIELD_FNF_AMOUNT, -bd.money(abs(flt(row.get("qty"))) * max(0.0, per_unit)))
+	warnings = []
+	fnf_items = None
+	for result in ff_ledger.return_credits(doc):
+		row, original = result.row, result.original
+		claims = _claims_fnf(row)
+		if original is not None:
+			_set_item_attr(row, FIELD_DISCOUNT_SOURCE, DISCOUNT_SOURCE_FRIENDS_AND_FAMILY)
+			_set_item_attr(row, FIELD_FNF_PERCENTAGE, flt(original.fnf_percentage))
+			_set_item_attr(row, FIELD_FNF_PROGRAM, original.fnf_program or None)
+		else:
+			if cstr(row.get(FIELD_DISCOUNT_SOURCE)) == DISCOUNT_SOURCE_FRIENDS_AND_FAMILY:
+				_set_item_attr(row, FIELD_DISCOUNT_SOURCE, None)
+			if flt(row.get(FIELD_FNF_PERCENTAGE)):
+				_set_item_attr(row, FIELD_FNF_PERCENTAGE, 0)
+			if row.get(FIELD_FNF_PROGRAM):
+				_set_item_attr(row, FIELD_FNF_PROGRAM, None)
+		_set_item_attr(row, FIELD_FNF_AMOUNT, flt(result.credit))
+		if result.warning:
+			if fnf_items is None:
+				fnf_items = _fnf_items_on(doc)
+			if claims or cstr(row.get("item_code")) in fnf_items:
+				warnings.append(
+					{
+						"invoice_row": row.get("name"),
+						"item_code": row.get("item_code"),
+						"qty": flt(row.get("qty")),
+						"reason": result.warning,
+					}
+				)
+	flags = getattr(doc, "flags", None)
+	if flags is not None:
+		flags[RETURN_WARNINGS_FLAG] = warnings
 
 
 def _remove_invoice_rows(doc, rows) -> None:
@@ -1217,18 +1284,22 @@ def apply_friends_and_family_on_invoice(doc, method=None):
 	     per-line plan; each F&F row persists ``posnext_discount_source`` and
 	     ``posnext_fnf_discount_amount`` for the monthly usage ledger.
 
-	Returns / credit notes only get their (negative) F&F usage stamped.
+	Returns / credit notes only get their (negative) F&F usage stamped, from
+	the original rows. Consolidated invoices are left untouched.
 
 	Skips during install / migrate / patch.
 	"""
 	if frappe.flags.in_install or frappe.flags.in_migrate or frappe.flags.in_patch:
+		return
+	# Consolidated invoices merge POS Invoices that were already decided and recorded.
+	if cint(doc.get("is_consolidated")):
 		return
 	items = doc.get("items")
 	if not items:
 		return
 
 	if cint(doc.get("is_return")):
-		_stamp_return_usage(items)
+		_stamp_return_usage(doc, items)
 		return
 
 	# Only POS / point-of-sale invoices for now — the program is a POS benefit.

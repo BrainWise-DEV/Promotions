@@ -29,7 +29,9 @@ What is logged, and when
   Drafts are never logged (they churn on every save); only what was really
   sold. Ineligible customers with nothing stripped produce no rows.
 * **Returns** (``is_return`` submit) — ``Discount Returned`` per F&F row with
-  the negative amount and ``return_against``.
+  the negative amount, ``return_against`` and the original invoice's POS
+  Profile; a zero-amount ``Discount Returned`` warning per row that may have
+  had F&F but has no usable original row (so nothing was credited).
 * **Cancel** — the invoice's earlier rows are flagged ``is_cancelled`` and a
   ``Discount Reversed`` row (negated amount) is added per F&F row, so the log
   stays append-only and totals per customer still reconcile.
@@ -53,7 +55,12 @@ from frappe import _
 from frappe.utils import cint, cstr, flt, now_datetime, nowdate
 
 from posnext_promotions.promotions import best_discount as bd
-from posnext_promotions.promotions.friends_and_family_caps import FIELD_DISCOUNT_SOURCE, FIELD_FNF_AMOUNT
+from posnext_promotions.promotions import ff_ledger
+from posnext_promotions.promotions.friends_and_family_caps import (
+	FIELD_DISCOUNT_SOURCE,
+	FIELD_FNF_AMOUNT,
+	FIELD_FNF_PERCENTAGE,
+)
 
 LOG_DOCTYPE = "Friends and Family Log"
 
@@ -206,6 +213,63 @@ def _line_entry(doc, row, line: dict, payload: dict) -> tuple[str, dict] | None:
 	return log_type, values
 
 
+def _return_warning_message(reason: str, against: str | None) -> str:
+	if reason == ff_ledger.RETURN_ORIGINAL_MISSING:
+		return _("Return row's original row was not found on {0}: no Friends & Family usage credited.").format(against)
+	if reason == ff_ledger.RETURN_ORIGINAL_QTY_ZERO:
+		return _("Return row's original row on {0} has no quantity: no Friends & Family usage credited.").format(against)
+	if reason == ff_ledger.RETURN_ORIGINAL_IS_RETURN:
+		return _("Return row links a row of {0}, which is itself a return: no Friends & Family usage credited.").format(
+			against
+		)
+	if reason == ff_ledger.RETURN_ORIGINAL_CONSOLIDATED:
+		return _(
+			"Return row links a row of {0}, a consolidated invoice whose POS Invoices were recorded already: "
+			"no Friends & Family usage credited."
+		).format(against)
+	return _("Return row has no link to its original invoice row: no Friends & Family usage credited.")
+
+
+def _log_return(doc, items) -> None:
+	"""``Discount Returned`` per F&F return row, plus a zero-amount warning per row that got no credit.
+
+	Rows carry the ORIGINAL invoice's POS Profile: the credit belongs to that sale.
+	"""
+	against = doc.get("return_against")
+	context = _invoice_context(doc)
+	if against and doc.get("doctype"):
+		context["pos_profile"] = frappe.db.get_value(doc.get("doctype"), against, "pos_profile") or context["pos_profile"]
+	for row in items:
+		if not _is_fnf_row(row):
+			continue
+		write_log(
+			LOG_RETURNED,
+			**context,
+			**_row_context(row),
+			discount_source=FNF,
+			discount_amount=_row_fnf_amount(row),
+			discount_percentage=flt(row.get(FIELD_FNF_PERCENTAGE)),
+			return_against=against,
+			reason="return",
+			message=_("Friends & Family discount returned against {0}").format(against),
+		)
+	flags = getattr(doc, "flags", None)
+	by_name = {row.get("name"): row for row in items}
+	for warning in (flags.get("ff_return_warnings") if flags is not None else None) or []:
+		row = by_name.get(warning.get("invoice_row")) or frappe._dict(warning)
+		write_log(
+			LOG_RETURNED,
+			**context,
+			**_row_context(row),
+			discount_source=FNF,
+			discount_amount=0.0,
+			return_against=against,
+			reason=warning.get("reason"),
+			message=_return_warning_message(warning.get("reason"), against),
+			details=warning,
+		)
+
+
 @_safe
 def log_invoice_submit(doc, method=None):
 	"""Sales Invoice / POS Invoice ``on_submit``."""
@@ -213,19 +277,7 @@ def log_invoice_submit(doc, method=None):
 		return
 	items = doc.get("items") or []
 	if cint(doc.get("is_return")):
-		for row in items:
-			if not _is_fnf_row(row):
-				continue
-			write_log(
-				LOG_RETURNED,
-				**_invoice_context(doc),
-				**_row_context(row),
-				discount_source=FNF,
-				discount_amount=_row_fnf_amount(row),
-				return_against=doc.get("return_against"),
-				reason="return",
-				message=_("Friends & Family discount returned against {0}").format(doc.get("return_against")),
-			)
+		_log_return(doc, items)
 		return
 
 	flags = getattr(doc, "flags", None)

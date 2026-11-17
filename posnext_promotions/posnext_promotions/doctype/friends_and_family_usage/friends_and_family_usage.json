@@ -15,9 +15,11 @@
   "invoice_doctype",
   "invoice",
   "invoice_item",
+  "original_row",
   "posting_date",
   "section_break_amount",
   "currency",
+  "qty",
   "amount",
   "column_break_amount",
   "base_amount",
@@ -88,6 +90,14 @@
    "read_only": 1
   },
   {
+   "fieldname": "original_row",
+   "fieldtype": "Data",
+   "label": "Original Invoice Item",
+   "search_index": 1,
+   "read_only": 1,
+   "description": "Returns only: the original invoice row this return row gives F&F back for."
+  },
+  {
    "fieldname": "posting_date",
    "fieldtype": "Date",
    "label": "Posting Date",
@@ -104,6 +114,13 @@
    "label": "Currency",
    "options": "Currency",
    "read_only": 1
+  },
+  {
+   "fieldname": "qty",
+   "fieldtype": "Float",
+   "label": "Qty",
+   "read_only": 1,
+   "description": "Quantity on the invoice row (negative on returns)."
   },
   {
    "fieldname": "amount",

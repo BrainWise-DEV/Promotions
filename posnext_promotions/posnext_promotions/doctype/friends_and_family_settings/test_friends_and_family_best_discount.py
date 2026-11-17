@@ -35,7 +35,11 @@ from posnext_promotions.promotions.friends_and_family_apply import (
 	apply_friends_and_family_to_items,
 	compute_friends_and_family_discounts,
 )
-from posnext_promotions.promotions.friends_and_family_caps import FIELD_FNF_REPLACED
+from posnext_promotions.promotions.friends_and_family_caps import (
+	FIELD_DISCOUNT_SOURCE,
+	FIELD_FNF_PERCENTAGE,
+	FIELD_FNF_REPLACED,
+)
 from posnext_promotions.promotions.friends_and_family_eligibility import (
 	FLAG_FIELD,
 	ensure_customer_flag_field,
@@ -421,8 +425,9 @@ class TestFriendsAndFamilyBestDiscount(FrappeTestCase):
 		self.assertEqual(payload["best_discount"]["order"]["winner"], bd.SOURCE_ORDER_MANUAL)
 
 	def test_invoice_saved_fnf_rows_stripped_when_header_stronger(self):
-		# Saved rows do not persist discount_source: 30% with no rule/coupon is our stamp.
-		rows = [self._line(discount_percentage=30), self._line(item_code=ITEM_2, discount_percentage=30)]
+		# Saved F&F rows carry their markers (source + F&F %); no percentage heuristic.
+		marks = {FIELD_DISCOUNT_SOURCE: "friends_and_family", FIELD_FNF_PERCENTAGE: 30}
+		rows = [self._line(discount_percentage=30, **marks), self._line(item_code=ITEM_2, discount_percentage=30, **marks)]
 		for row in rows:
 			row.rate = 70
 		doc = self._invoice(rows, discount_amount=90)

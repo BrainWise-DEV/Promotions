@@ -266,7 +266,12 @@ class TestFFLedger(FrappeTestCase):
 		self.assertEqual(self._total(), 30)
 		original = self._bare_invoice(rows=[(100, 70, 1)])
 		name = self._name()
-		ret = self._invoice([self._row(f"{name}-1", qty=-1, fnf_rate=70)], name=name, is_return=1, return_against=original)
+		ret = self._invoice(
+			[self._row(f"{name}-1", qty=-1, fnf_rate=70, pos_invoice_item=f"{original}-1")],
+			name=name,
+			is_return=1,
+			return_against=original,
+		)
 		ff_ledger.on_submit(ret)
 		self.assertEqual(self._total(), 0)
 		ff_ledger.on_cancel(ret)
@@ -283,9 +288,13 @@ class TestFFLedger(FrappeTestCase):
 
 	def test_usage_never_below_zero_and_counter_equals_ledger(self):
 		# A return of an invoice the ledger never recorded must not create allowance.
+		original = self._bare_invoice(rows=[(100, 70, 1)])  # raw insert: no ledger rows
 		name = self._name()
 		ret = self._invoice(
-			[self._row(f"{name}-1", qty=-1, fnf_rate=70)], name=name, is_return=1, return_against="_T-FFL-unknown"
+			[self._row(f"{name}-1", qty=-1, fnf_rate=70, pos_invoice_item=f"{original}-1")],
+			name=name,
+			is_return=1,
+			return_against=original,
 		)
 		ff_ledger.on_submit(ret)
 		self.assertEqual(flt(self._rows(name)[0].amount), -30)
@@ -374,7 +383,7 @@ class TestFFLedger(FrappeTestCase):
 		original = self._bare_invoice(posting_date="2026-11-20", rows=[(100, 70, 1)])
 		name = self._name()
 		ret = self._invoice(
-			[self._row(f"{name}-1", qty=-1, fnf_rate=70)],
+			[self._row(f"{name}-1", qty=-1, fnf_rate=70, pos_invoice_item=f"{original}-1")],
 			name=name,
 			is_return=1,
 			return_against=original,
@@ -629,7 +638,7 @@ class TestFFLedgerSchema(FrappeTestCase):
 class TestFFLedgerLock(FrappeTestCase):
 	"""Two DB connections, as two tills submitting at the same time."""
 
-	PERIODS = ("2031-02", "2031-03", "2031-05", "2031-06", "2031-07")
+	PERIODS = ("2031-02", "2031-03", "2031-05", "2031-06", "2031-07", "2031-08")  # 2031-08: Ruling 36
 
 	@classmethod
 	def setUpClass(cls):
@@ -643,6 +652,8 @@ class TestFFLedgerLock(FrappeTestCase):
 				frappe.db.rollback()
 		with self.primary_connection():
 			frappe.db.delete(ff_ledger.LEDGER_DOCTYPE, {"invoice": ["like", f"{PREFIX}LOCK-%"]})
+			for table in ("POS Invoice Item", "POS Invoice"):
+				frappe.db.delete(table, {"name": ["like", f"{PREFIX}LOCK-%"]})
 			frappe.db.delete(ff_ledger.TOTAL_DOCTYPE, {"period_key": ["in", self.PERIODS]})
 			frappe.db.commit()
 
@@ -784,3 +795,257 @@ class TestFFLedgerLock(FrappeTestCase):
 			frappe.db.commit()
 		with self.primary_connection():
 			self.assertEqual(ff_ledger.get_usage(LOCK_CUSTOMER, _company(), period), 50)
+
+	# ---- Ruling 36: concurrent returns of one original row ------------------
+
+	def _raw_invoice(self, name, rows, **values):
+		"""Raw submitted POS Invoice (header + rows). Row = dict of item columns."""
+		header = {
+			"name": name,
+			"customer": LOCK_CUSTOMER,
+			"company": _company(),
+			"currency": frappe.get_cached_value("Company", _company(), "default_currency"),
+			"conversion_rate": 1,
+			"posting_date": "2031-08-10",
+			"docstatus": 1,
+			"is_pos": 1,
+			**values,
+		}
+		frappe.db.sql(
+			f"insert into `tabPOS Invoice` ({', '.join(f'`{c}`' for c in header)}) values ({', '.join(['%s'] * len(header))})",
+			tuple(header.values()),
+		)
+		for idx, row in enumerate(rows, 1):
+			values = {
+				"name": f"{name}-{idx}",
+				"parent": name,
+				"parenttype": "POS Invoice",
+				"parentfield": "items",
+				"idx": idx,
+				"item_code": ITEM,
+				"docstatus": 1,
+				**row,
+			}
+			frappe.db.sql(
+				f"insert into `tabPOS Invoice Item` ({', '.join(f'`{c}`' for c in values)}) "
+				f"values ({', '.join(['%s'] * len(values))})",
+				tuple(values.values()),
+			)
+
+	def _return_doc(self, name, original):
+		row = frappe._dict(name=f"{name}-1", item_code=ITEM, qty=-1, rate=70, pos_invoice_item=f"{original}-1")
+		return frappe._dict(
+			doctype="POS Invoice",
+			name=name,
+			customer=LOCK_CUSTOMER,
+			company=_company(),
+			currency=frappe.get_cached_value("Company", _company(), "default_currency"),
+			conversion_rate=1,
+			posting_date="2031-08-12",
+			is_pos=1,
+			is_return=1,
+			return_against=original,
+			items=[row],
+		)
+
+	def _submit_return(self, doc, stamp):
+		"""Persist the return as submitted with its validate-time stamp, then run the submit hook."""
+		self._insert_return(doc, stamp)
+		ff_ledger.on_submit(doc)
+
+	def _insert_return(self, doc, stamp):
+		"""What Frappe writes before the on_submit hooks run: header and rows, docstatus 1."""
+		row = doc["items"][0]
+		row[FIELD_FNF_AMOUNT] = stamp
+		row[FIELD_DISCOUNT_SOURCE] = FNF
+		self._raw_invoice(
+			doc.name,
+			[
+				{
+					"qty": row.qty,
+					"rate": row.rate,
+					"pos_invoice_item": row.pos_invoice_item,
+					FIELD_DISCOUNT_SOURCE: FNF,
+					FIELD_FNF_AMOUNT: stamp,
+				}
+			],
+			is_return=1,
+			return_against=doc.return_against,
+			posting_date=doc.posting_date,
+		)
+
+	def test_concurrent_returns_of_one_row_never_over_credit(self):
+		period = self.PERIODS[5]
+		self.addCleanup(self._cleanup)
+		self._short_lock_waits()
+		original = f"{PREFIX}LOCK-ORIG"
+		with self.primary_connection():
+			self._raw_invoice(
+				original,
+				[{"qty": 1, "price_list_rate": 100, "rate": 70, FIELD_DISCOUNT_SOURCE: FNF, FIELD_FNF_AMOUNT: 30}],
+			)
+			frappe.db.commit()
+		ret_a = self._return_doc(f"{PREFIX}LOCK-RA", original)
+		ret_b = self._return_doc(f"{PREFIX}LOCK-RB", original)
+		with self.secondary_connection():
+			# B validates first: its snapshot has no other return, so it stamps the full 30.
+			b_stamp = ff_ledger.return_credits(ret_b)[0].credit
+			self.assertEqual(b_stamp, -30)
+		with self.primary_connection():
+			a_stamp = ff_ledger.return_credits(ret_a)[0].credit
+			self._submit_return(ret_a, a_stamp)
+			frappe.db.commit()
+		with self.secondary_connection():
+			# B's snapshot still misses A's return...
+			self.assertEqual(ff_ledger.return_credits(ret_b)[0].credit, -30)
+			# ...its submit re-reads under the lock and credits only what is left (0).
+			self._submit_return(ret_b, b_stamp)
+			self.assertEqual(flt(ret_b["items"][0][FIELD_FNF_AMOUNT]), 0)
+			frappe.db.commit()
+		with self.primary_connection():
+			credited = flt(
+				frappe.db.sql(
+					"select sum(amount) from `tabFriends and Family Usage` where invoice in (%s, %s) and is_cancelled = 0",
+					(ret_a.name, ret_b.name),
+				)[0][0]
+			)
+			self.assertEqual(credited, -30)  # never more than the original's 30
+			self.assertEqual(flt(frappe.db.get_value("POS Invoice Item", f"{ret_b.name}-1", FIELD_FNF_AMOUNT)), 0)
+			self.assertEqual(
+				flt(frappe.db.get_value(ff_ledger.TOTAL_DOCTYPE, ff_ledger.total_name(LOCK_CUSTOMER, _company(), period), "base_amount")),
+				-30,
+			)
+
+	def _original(self, name, qty, fnf, customer=LOCK_CUSTOMER):
+		with self.primary_connection():
+			self._raw_invoice(
+				name,
+				[{"qty": qty, "price_list_rate": 100, "rate": 70, FIELD_DISCOUNT_SOURCE: FNF, FIELD_FNF_AMOUNT: fnf}],
+				customer=customer,
+			)
+			frappe.db.commit()
+
+	def _credited(self, *invoices):
+		return flt(
+			frappe.db.sql(
+				f"""select sum(amount) from `tabFriends and Family Usage`
+				where invoice in ({', '.join(['%s'] * len(invoices))}) and is_cancelled = 0""",
+				invoices,
+			)[0][0]
+		)
+
+	def test_concurrent_return_rejected_by_the_counter_lock(self):
+		self.addCleanup(self._cleanup)
+		self._short_lock_waits()
+		original = f"{PREFIX}LOCK-ORIG2"
+		self._original(original, qty=2, fnf=60)
+		ret_a = self._return_doc(f"{PREFIX}LOCK-RC", original)
+		ret_b = self._return_doc(f"{PREFIX}LOCK-RD", original)
+		with self.primary_connection():
+			self._submit_return(ret_a, -30)  # A holds the counter lock, not committed yet
+		with self.secondary_connection():
+			self._insert_return(ret_b, -60)  # B's own header and rows: nothing waits here
+			# B's submit hook needs the same counter: rejected with a retry message, never a stale credit.
+			with self.assertRaises(frappe.ValidationError) as busy:
+				ff_ledger.on_submit(ret_b)
+			self.assertIn("busy", str(busy.exception))
+			frappe.db.rollback()
+		with self.primary_connection():
+			frappe.db.commit()
+		with self.secondary_connection():
+			# The cashier retries: B now sees A's credit and gets only the remaining 30.
+			self._submit_return(ret_b, -60)  # stale validate: "the whole 60 is left"
+			self.assertEqual(flt(ret_b["items"][0][FIELD_FNF_AMOUNT]), -30)
+			frappe.db.commit()
+		with self.primary_connection():
+			self.assertEqual(self._credited(ret_a.name, ret_b.name), -60)
+
+	def test_overlapping_returns_of_one_invoice_complete_in_sequence(self):
+		"""Frappe writes both return headers before their hooks run. Neither hook locks headers, so
+		A completes while B's header is uncommitted, then B completes: no wait, no deadlock."""
+		self.addCleanup(self._cleanup)
+		self._short_lock_waits()
+		original = f"{PREFIX}LOCK-ORIG3"
+		self._original(original, qty=2, fnf=60)
+		ret_a = self._return_doc(f"{PREFIX}LOCK-RE", original)
+		ret_b = self._return_doc(f"{PREFIX}LOCK-RF", original)
+		ret_b["items"][0].qty = -2  # B returns both units
+		with self.primary_connection():
+			self._insert_return(ret_a, -30)
+		with self.secondary_connection():
+			self._insert_return(ret_b, -60)
+		with self.primary_connection():
+			ff_ledger.on_submit(ret_a)
+			frappe.db.commit()
+		with self.secondary_connection():
+			ff_ledger.on_submit(ret_b)
+			frappe.db.commit()
+		with self.primary_connection():
+			self.assertEqual(flt(frappe.db.get_value("POS Invoice Item", f"{ret_b.name}-1", FIELD_FNF_AMOUNT)), -30)
+			self.assertEqual(self._credited(ret_a.name, ret_b.name), -60)  # never beyond the original 60
+
+	def test_returns_of_two_customers_in_one_index_gap_never_wait(self):
+		"""Ledger steps of two returns interleaved, with original rows adjacent in ``original_row_index``.
+
+		Each return inserts its own rows before its locking read, so neither insert lands in a gap
+		the other has locked: with a 1 s lock-wait limit any wait raises, a deadlock raises 1213.
+		"""
+		self.addCleanup(self._cleanup)
+		self._short_lock_waits()
+		orig_a, orig_b = f"{PREFIX}LOCK-GAP-A", f"{PREFIX}LOCK-GAP-B"
+		self._original(orig_a, qty=1, fnf=30)
+		self._original(orig_b, qty=1, fnf=30, customer=LOCK_CUSTOMER_2)
+		ret_a = self._return_doc(f"{PREFIX}LOCK-RG", orig_a)
+		ret_b = self._return_doc(f"{PREFIX}LOCK-RH", orig_b)
+		ret_b.customer = LOCK_CUSTOMER_2
+		period = ff_ledger.period_key("2031-08-10")
+		steps = {}
+		for conn, doc in ((self.primary_connection, ret_a), (self.secondary_connection, ret_b)):
+			with conn():
+				self._insert_return(doc, -30)
+				ff_ledger.lock_usage(doc.customer, _company(), period)
+				rows = ff_ledger.ledger_rows(doc, credits=ff_ledger.return_credits(doc))
+				self.assertTrue(all(ff_ledger.insert_row({**v, "amount": 0, "base_amount": 0}) for v in rows))
+		for conn, doc in ((self.primary_connection, ret_a), (self.secondary_connection, ret_b)):
+			with conn():
+				steps[doc.name] = ff_ledger.return_credits(doc, for_update=True)[0].credit
+		self.assertEqual(steps, {ret_a.name: -30, ret_b.name: -30})
+		for conn in (self.primary_connection, self.secondary_connection):
+			with conn():
+				frappe.db.rollback()
+
+	def _original_row_keys(self):
+		table = f"tab{ff_ledger.LEDGER_DOCTYPE}"
+		return {r[2] for r in frappe.db.sql(f"show index from `{table}` where Column_name = 'original_row'")}
+
+	def test_original_row_index_has_the_forced_name_on_fresh_and_altered_tables(self):
+		"""CREATE TABLE names the search_index index after the column; ALTER names it ``<column>_index``.
+		The return path forces ``original_row_index``, so it must exist under that name either way."""
+		from frappe.database.mariadb.schema import MariaDBTable
+
+		# What a fresh install's CREATE TABLE makes for this DocType:
+		self.assertIn("index `original_row`(`original_row`)", MariaDBTable(ff_ledger.LEDGER_DOCTYPE).get_index_definitions())
+		self.addCleanup(self._cleanup)
+		table = f"tab{ff_ledger.LEDGER_DOCTYPE}"
+		try:
+			# Fresh-table state: the index is named `original_row`.
+			frappe.db.sql_ddl(f"alter table `{table}` drop index `{ff_ledger.ORIGINAL_ROW_INDEX}`")
+			frappe.db.sql_ddl(f"alter table `{table}` add index `original_row` (`original_row`)")
+			ff_ledger.ensure_ledger_unique_key()
+			self.assertEqual(self._original_row_keys(), {ff_ledger.ORIGINAL_ROW_INDEX})  # renamed, no duplicate
+			# No index at all: created under the forced name.
+			frappe.db.sql_ddl(f"alter table `{table}` drop index `{ff_ledger.ORIGINAL_ROW_INDEX}`")
+			ff_ledger.ensure_ledger_unique_key()
+			self.assertEqual(self._original_row_keys(), {ff_ledger.ORIGINAL_ROW_INDEX})
+			ff_ledger.ensure_ledger_unique_key()  # idempotent
+			self.assertEqual(self._original_row_keys(), {ff_ledger.ORIGINAL_ROW_INDEX})
+		finally:
+			ff_ledger.ensure_ledger_unique_key()
+		# A return submit runs its forced-index locking read.
+		original = f"{PREFIX}LOCK-ORIG4"
+		self._original(original, qty=1, fnf=30)
+		with self.primary_connection():
+			ret = self._return_doc(f"{PREFIX}LOCK-RI", original)
+			self._submit_return(ret, -30)
+			self.assertEqual(self._credited(ret.name), -30)
+			frappe.db.rollback()
