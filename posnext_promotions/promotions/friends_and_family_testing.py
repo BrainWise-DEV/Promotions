@@ -80,3 +80,47 @@ def _restore_ff_settings(snapshot: dict) -> None:
 	doc.flags.ignore_permissions = True
 	doc.flags.ignore_validate = True
 	doc.save(ignore_permissions=True)
+
+
+INERT_RULE_ITEM = "_Test FF Inert Rule Item"
+
+
+def _inert_rule_item() -> str:
+	if not frappe.db.exists("Item", INERT_RULE_ITEM):
+		frappe.get_doc(
+			{
+				"doctype": "Item",
+				"item_code": INERT_RULE_ITEM,
+				"item_name": INERT_RULE_ITEM,
+				"item_group": frappe.db.get_value("Item Group", {"is_group": 0}) or "Products",
+				"stock_uom": "Nos",
+				"is_stock_item": 0,
+			}
+		).insert(ignore_permissions=True)
+	return INERT_RULE_ITEM
+
+
+def ensure_named_pricing_rule(name: str, **values) -> str:
+	"""An enabled, undated selling Pricing Rule called ``name`` (``values`` overwrite its fields).
+
+	Signed F&F snapshots are only restored while their rules still apply, so tests
+	that tag lines with a rule name need the rule. It is inert: it applies only to
+	an item no test sells, and it is a Price rule, so no F&F blocking rule picks it up.
+	"""
+	if not frappe.db.exists("Pricing Rule", name):
+		frappe.get_doc(
+			{
+				"doctype": "Pricing Rule",
+				"title": name,
+				"apply_on": "Item Code",
+				"items": [{"item_code": _inert_rule_item()}],
+				"selling": 1,
+				"buying": 0,
+				"price_or_product_discount": "Price",
+				"rate_or_discount": "Discount Percentage",
+				"discount_percentage": 1,
+			}
+		).insert(ignore_permissions=True, set_name=name)
+	frappe.db.set_value("Pricing Rule", name, {"disable": 0, "valid_from": None, "valid_upto": None, **values})
+	frappe.clear_document_cache("Pricing Rule", name)
+	return name

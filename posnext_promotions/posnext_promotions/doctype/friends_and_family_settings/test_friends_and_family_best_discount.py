@@ -10,6 +10,7 @@ from frappe.utils import flt
 from posnext_promotions.promotions.friends_and_family_testing import (
 	TEST_EMAIL_DOMAIN,
 	approved_domain_rows,
+	ensure_named_pricing_rule,
 	give_verified_email,
 )
 from posnext_promotions.api.apply_offers import (
@@ -79,6 +80,8 @@ class TestFriendsAndFamilyBestDiscount(FrappeTestCase):
 			# ineligible customer gets a verified email on a domain that is not approved.
 			give_verified_email(name, domain=TEST_EMAIL_DOMAIN if name == ELIGIBLE else NOT_APPROVED_DOMAIN)
 
+		# Real rule: a replaced-discount snapshot is restored only while its rules are valid.
+		ensure_named_pricing_rule(PROMO_RULE)
 		item_group = frappe.db.get_value("Item Group", {"is_group": 0}) or "Products"
 		for code in (ITEM, ITEM_2, EXCLUDED_ITEM):
 			if not frappe.db.exists("Item", code):

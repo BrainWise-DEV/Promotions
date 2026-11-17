@@ -15,7 +15,11 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import cint, flt, nowdate
 
-from posnext_promotions.promotions.friends_and_family_testing import approved_domain_rows, give_verified_email
+from posnext_promotions.promotions.friends_and_family_testing import (
+	approved_domain_rows,
+	ensure_named_pricing_rule,
+	give_verified_email,
+)
 from posnext_promotions.api.friends_and_family import (
 	apply_friends_and_family_discount,
 	check_friends_and_family_eligibility,
@@ -44,6 +48,7 @@ FF_GROUP = "_Test FF Scheme Customer Group"
 ELIGIBLE = "_Test FF Scheme Eligible Customer"
 ITEM = "_Test FF Scheme Item"
 SCHEME = "_Test FF Scheme Apply With FF"
+RULE_WITHOUT_SCHEME = "_Test FF Rule Without Scheme"
 
 
 def _first_company():
@@ -73,6 +78,8 @@ class TestFriendsAndFamilySchemeAndProfile(FrappeTestCase):
 			).insert()
 		frappe.db.set_value("Customer", ELIGIBLE, {FLAG_FIELD: 0, "disabled": 0})
 		give_verified_email(ELIGIBLE)
+		# Real rule: a replaced-discount snapshot is restored only while its rules are valid.
+		ensure_named_pricing_rule(RULE_WITHOUT_SCHEME)
 		item_group = frappe.db.get_value("Item Group", {"is_group": 0}) or "Products"
 		if not frappe.db.exists("Item", ITEM):
 			frappe.get_doc(
@@ -232,7 +239,7 @@ class TestFriendsAndFamilySchemeAndProfile(FrappeTestCase):
 		self.assertEqual(line.discount_source, DISCOUNT_SOURCE_FRIENDS_AND_FAMILY)
 
 	def test_pricing_rule_without_scheme_still_competes(self):
-		line = self._line("_Test FF Rule Without Scheme", 40)
+		line = self._line(RULE_WITHOUT_SCHEME, 40)
 		apply_friends_and_family_to_items([line], customer=ELIGIBLE, posting_date=DATE)
 		self.assertEqual(flt(line.discount_percentage), 40)
 
@@ -256,7 +263,7 @@ class TestFriendsAndFamilySchemeAndProfile(FrappeTestCase):
 
 	def test_profile_allowed_applies_normally(self):
 		name = self._profile(1)
-		line = self._line("_Test FF Rule Without Scheme", 0)
+		line = self._line(RULE_WITHOUT_SCHEME, 0)
 		line.pricing_rules = None
 		line.discount_source = None
 		payload = apply_friends_and_family_discount(
@@ -302,8 +309,11 @@ class TestFriendsAndFamilySchemeAndProfile(FrappeTestCase):
 
 	def test_profile_disabled_strips_stale_stamp_and_restores_promo(self):
 		name = self._profile(1)
-		line = self._line("_Test FF Rule Without Scheme", 10)
-		apply_friends_and_family_to_items([line], customer=ELIGIBLE, posting_date=DATE)
+		# The restore gate checks the rule's company against the profile's (Ruling 24).
+		ensure_named_pricing_rule(RULE_WITHOUT_SCHEME, company=frappe.db.get_value("POS Profile", name, "company"))
+		line = self._line(RULE_WITHOUT_SCHEME, 10)
+		# Same profile as the later run: the snapshot is signed for it (Ruling 25).
+		apply_friends_and_family_to_items([line], customer=ELIGIBLE, posting_date=DATE, pos_profile=name)
 		self.assertEqual(line.discount_source, DISCOUNT_SOURCE_FRIENDS_AND_FAMILY)
 
 		frappe.db.set_value("POS Profile", name, "allow_friends_family", 0)

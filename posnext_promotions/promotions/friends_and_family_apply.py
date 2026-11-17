@@ -40,7 +40,6 @@ amounts, suppressed sources, English + Arabic message) for the POS UI.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, replace
 
 import frappe
@@ -56,6 +55,7 @@ from posnext_promotions.promotions.friends_and_family import (
 	COVER_OK,
 	COVER_OUT_OF_SCOPE,
 	SCHEME_APPLY_WITH_FF_FIELD,
+	SETTINGS_DOCTYPE,
 )
 from posnext_promotions.promotions.friends_and_family_caps import (
 	FIELD_DISCOUNT_SOURCE,
@@ -67,7 +67,7 @@ from posnext_promotions.promotions.friends_and_family_caps import (
 	ceil_cents,
 	get_cap_context,
 )
-from posnext_promotions.promotions import ff_compatibility, ff_config
+from posnext_promotions.promotions import ff_compatibility, ff_config, ff_snapshot
 from posnext_promotions.promotions import friends_and_family_gifts as gifts
 from posnext_promotions.promotions.friends_and_family_gifts import line_blocked_by_scheme
 from posnext_promotions.promotions.friends_and_family_eligibility import (
@@ -316,17 +316,35 @@ _REPLACED_FIELDS = (
 )
 
 
-def _replaced_snapshot(item) -> str:
-	return json.dumps({key: item.get(key) for key in _REPLACED_FIELDS}, default=str)
+SNAPSHOT_HOURS_FIELD = "replaced_discount_snapshot_hours"
 
 
-def _restore_replaced_discount(item) -> bool:
+def _snapshot_ttl_seconds() -> int:
+	hours = cint(frappe.get_cached_doc(SETTINGS_DOCTYPE).get(SNAPSHOT_HOURS_FIELD))
+	if hours < 1:
+		# Settings not saved since the field was added (Settings.validate stores >= 1).
+		hours = cint(frappe.get_meta(SETTINGS_DOCTYPE).get_field(SNAPSHOT_HOURS_FIELD).default)
+	return hours * 3600
+
+
+def _replaced_snapshot(item, ctx) -> str | None:
+	data = {key: item.get(key) for key in _REPLACED_FIELDS}
+	return ff_snapshot.sign(item, data, ttl_seconds=_snapshot_ttl_seconds(), doc=ctx)
+
+
+def _restore_replaced_discount(item, doc) -> bool:
 	"""Put back the discount an earlier F&F stamp replaced (PN-133).
 
 	Saved invoices are validated more than once (save, then submit). Without
 	this, the second run sees an F&F line with no competitor — the promotion it
 	beat is gone — so the comparison (and its audit log) is lost, and a cap
 	that later reduces F&F could not hand the line back to its promotion.
+
+	The snapshot sits in a client-writable field, so only a server-signed one
+	for this line's values is used, and only while every Pricing Rule in it is
+	still applies to ``doc`` (the invoice, or :func:`restore_context` for a cart):
+	enabled, valid on its posting date, same company / profile / customer
+	(Ruling 24). Otherwise it is dropped and the line is priced from today's rules.
 	"""
 	raw = item.get(FIELD_FNF_REPLACED)
 	if not raw:
@@ -334,9 +352,9 @@ def _restore_replaced_discount(item) -> bool:
 	_set_item_attr(item, FIELD_FNF_REPLACED, None)
 	if not _is_fnf_stamped(item):
 		return False
-	try:
-		data = json.loads(raw) if isinstance(raw, str) else dict(raw)
-	except (TypeError, ValueError):
+	data = ff_snapshot.verify(item, raw, doc=doc)
+	# Signature first: a forged snapshot never reaches the rule lookups.
+	if data is None or not ff_snapshot.rules_apply_to(data, doc):
 		return False
 	_clear_fnf_audit_fields(item)
 	for key in _REPLACED_FIELDS:
@@ -345,12 +363,17 @@ def _restore_replaced_discount(item) -> bool:
 	return True
 
 
-def _restored_copy(item):
+def restore_context(customer, posting_date, pos_profile=None) -> frappe._dict:
+	"""Doc-like view of a cart for :func:`_restore_replaced_discount`."""
+	return frappe._dict(customer=customer, posting_date=posting_date, pos_profile=pos_profile)
+
+
+def _restored_copy(item, doc):
 	"""Non-mutating view of ``item`` with its replaced discount put back."""
 	if not item.get(FIELD_FNF_REPLACED):
 		return item
 	copy = frappe._dict(item.as_dict() if callable(getattr(item, "as_dict", None)) else dict(item))
-	_restore_replaced_discount(copy)
+	_restore_replaced_discount(copy, doc)
 	return copy
 
 
@@ -756,7 +779,8 @@ def compute_friends_and_family_discounts(
 	per applying line) always comes from Settings — never from the request.
 	"""
 	posting_date = posting_date or nowdate()
-	items = enrich_items_with_catalog([_restored_copy(i) for i in items or []])
+	signed_for = restore_context(customer, posting_date, pos_profile)
+	items = enrich_items_with_catalog([_restored_copy(i, signed_for) for i in items or []])
 	eligibility = get_customer_eligibility(customer, posting_date, pos_profile)
 	program = eligibility.program if eligibility.eligible else None
 	payload = _base_payload(eligibility, program)
@@ -813,7 +837,8 @@ def apply_friends_and_family_to_items(
 	"""
 	posting_date = posting_date or nowdate()
 	items = enrich_items_with_catalog(list(items or []))
-	restored = {idx for idx, item in enumerate(items) if _restore_replaced_discount(item)}
+	signed_for = restore_context(customer, posting_date, pos_profile)
+	restored = {idx for idx, item in enumerate(items) if _restore_replaced_discount(item, signed_for)}
 	eligibility = get_customer_eligibility(customer, posting_date, pos_profile)
 	program = eligibility.program if eligibility.eligible else None
 	payload = _base_payload(eligibility, program)
@@ -847,7 +872,7 @@ def apply_friends_and_family_to_items(
 		for item, result in zip(items, planned, strict=False):
 			if result.applies:
 				replaced = (
-					_replaced_snapshot(item)
+					_replaced_snapshot(item, signed_for)
 					if result.competing_source not in (None, bd.SOURCE_NONE) and flt(result.competing_amount) > 0
 					else None
 				)
@@ -1187,7 +1212,7 @@ def apply_friends_and_family_on_invoice(doc, method=None):
 	before = _invoice_state(doc, items)
 	# Re-open earlier decisions: lines get back the discount F&F replaced.
 	for item in items:
-		_restore_replaced_discount(item)
+		_restore_replaced_discount(item, doc)
 	# Buy X Get Y / Routine lines get no F&F (same rule as the cart).
 	ff_compatibility.block_ineligible_lines(items, doc=doc)
 	snapshots = [_snapshot_line(i) for i in items]

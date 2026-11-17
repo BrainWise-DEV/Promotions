@@ -38,6 +38,7 @@ from posnext_promotions.promotions import best_discount as bd
 from posnext_promotions.promotions.friends_and_family_apply import (
 	_is_fnf_stamped,
 	_restore_replaced_discount,
+	restore_context,
 	compute_friends_and_family_discounts,
 	enrich_items_with_catalog,
 )
@@ -46,10 +47,10 @@ from posnext_promotions.promotions.friends_and_family_eligibility import get_cus
 REASON_BETTER_DISCOUNT_EXISTS = "better_discount_exists"
 
 
-def _neutral_copy(item):
+def _neutral_copy(item, ctx):
 	"""Line as the coupon engine should see it: an F&F stamp is not a blocker."""
 	line = frappe._dict(dict(item))
-	if _restore_replaced_discount(line):
+	if _restore_replaced_discount(line, ctx):
 		return line
 	if _is_fnf_stamped(line):
 		line.discount_source = None
@@ -68,9 +69,10 @@ def _capped_fnf_candidates(items, customer, posting_date, pos_profile=None) -> d
 
 	The coupon then competes with that (possibly cap-reduced) F&F saving.
 	"""
+	ctx = restore_context(customer, posting_date, pos_profile)
 	plan = compute_friends_and_family_discounts(
 		customer=customer,
-		items=[_neutral_copy(i) for i in items],
+		items=[_neutral_copy(i, ctx) for i in items],
 		posting_date=posting_date,
 		pos_profile=pos_profile,
 	)
@@ -125,7 +127,8 @@ def resolve_coupon_best_discount(coupon, items, customer=None, posting_date=None
 	eligibility = get_customer_eligibility(customer, posting_date, pos_profile)
 	program = eligibility.program if eligibility.eligible else None
 
-	result = apply_coupon_to_items(coupon, [_neutral_copy(i) for i in items])
+	ctx = restore_context(customer, posting_date, pos_profile)
+	result = apply_coupon_to_items(coupon, [_neutral_copy(i, ctx) for i in items])
 	if not result.get("valid"):
 		result["best_discount"] = bd.summarize([])
 		return result

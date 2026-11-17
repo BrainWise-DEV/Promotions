@@ -26,6 +26,7 @@ from frappe.utils import cint, cstr, flt, getdate, nowdate
 # Module import (not ``from … import``): tests patch ``gifts._rule_scope_matches``.
 from posnext_promotions.promotions import ff_config
 from posnext_promotions.promotions import ff_constants as const
+from posnext_promotions.promotions import schedule
 from posnext_promotions.promotions import friends_and_family_gifts as gifts
 from posnext_promotions.promotions.ff_classifier import classify_promotion
 from posnext_promotions.promotions.friends_and_family_caps import FIELD_DISCOUNT_SOURCE
@@ -150,7 +151,10 @@ def _profile_values(pos_profile) -> dict:
 	if not pos_profile or not frappe.db.exists("POS Profile", pos_profile):
 		return {}
 	return frappe.get_cached_value(
-		"POS Profile", pos_profile, ["ignore_pricing_rule", "warehouse", "selling_price_list", "customer"], as_dict=True
+		"POS Profile",
+		pos_profile,
+		["ignore_pricing_rule", "warehouse", "selling_price_list", "customer", "company"],
+		as_dict=True,
 	) or {}
 
 
@@ -203,6 +207,74 @@ def _matches(fieldname: str, wanted: str, have: str) -> bool:
 	return have in get_descendants_of(frappe.unscrub(fieldname), wanted, ignore_permissions=True)
 
 
+def rule_valid_on(rule, posting_date) -> bool:
+	"""``posting_date`` is inside the rule's ``valid_from`` … ``valid_upto`` (either may be blank)."""
+	posting_date = getdate(posting_date)
+	return (not rule.get("valid_from") or getdate(rule.get("valid_from")) <= posting_date) and (
+		not rule.get("valid_upto") or getdate(rule.get("valid_upto")) >= posting_date
+	)
+
+
+def rule_fields() -> list[str]:
+	"""Pricing Rule fields :func:`rule_applies_to_doc` reads."""
+	fields = [
+		"name",
+		"disable",
+		"selling",
+		"coupon_code_based",
+		"company",
+		"valid_from",
+		"valid_upto",
+		"applicable_for",
+		"customer",
+		"customer_group",
+		"territory",
+		"for_price_list",
+		"warehouse",
+	]
+	if frappe.get_meta("Pricing Rule").has_field("one_time_per_customer"):
+		fields.append("one_time_per_customer")
+	if schedule.schedule_fields_available():
+		fields += [schedule.FROM_TIME_FIELD, schedule.TO_TIME_FIELD]
+	return fields
+
+
+def _doc_coupon_is_for(rule, doc) -> bool:
+	"""The doc's header ``coupon_code`` resolves to ``rule`` (ERPNext's Coupon Code → pricing_rule lookup)."""
+	code = cstr(doc.get("coupon_code"))
+	return bool(code) and frappe.db.get_value("Coupon Code", code, "pricing_rule") == rule.get("name")
+
+
+def rule_applies_to_doc(rule, doc, profile: dict | None = None) -> bool:
+	"""``rule`` (a row with :func:`rule_fields`) applies to ``doc`` at its posting date.
+
+	Enabled and selling; a coupon-based rule only while the doc's ``coupon_code``
+	is that rule's coupon (Ruling 26); the doc's POS profile does not ignore
+	pricing rules; same company (the doc's, else its profile's); valid on
+	``posting_date`` and live at the doc's posting moment (Active From / To Time,
+	:mod:`schedule`); and :func:`_rule_applies_to_doc` (profile warehouse / price
+	list, customer / group / territory tree, one-time redemption).
+	"""
+	if profile is None:
+		profile = _profile_values(doc.get("pos_profile"))
+	if cint(rule.get("disable")) or not cint(rule.get("selling")):
+		return False
+	if cint(rule.get("coupon_code_based")) and not _doc_coupon_is_for(rule, doc):
+		return False
+	if cint(profile.get("ignore_pricing_rule")):
+		return False
+	company = cstr(doc.get("company") or profile.get("company"))
+	if rule.get("company") and company and cstr(rule.get("company")) != company:
+		return False
+	if not rule_valid_on(rule, doc.get("posting_date") or nowdate()):
+		return False
+	# Date-only rules are settled by the posting date above; a rule whose ends carry
+	# a time is judged at the doc's posting moment (now for a live cart).
+	if schedule.has_time_bound(rule) and not schedule.is_active_at(rule, schedule.resolve_moment(doc)):
+		return False
+	return _rule_applies_to_doc(rule, doc, profile)
+
+
 def blocking_rule_map(doc) -> dict:
 	"""The one rule source for BXGY / Routine blocking, shared by cart and invoice (Ruling 19).
 
@@ -217,10 +289,7 @@ def blocking_rule_map(doc) -> dict:
 	profile = _profile_values(doc.get("pos_profile"))
 	if cint(profile.get("ignore_pricing_rule")):
 		return {}
-	posting_date = getdate(doc.get("posting_date") or nowdate())
-	fields = ["name", "valid_from", "valid_upto", "applicable_for", "customer", "customer_group", "territory", "for_price_list", "warehouse"]
-	if frappe.get_meta("Pricing Rule").has_field("one_time_per_customer"):
-		fields.append("one_time_per_customer")
+	fields = rule_fields()
 	base = {"disable": 0, "selling": 1, "company": doc.get("company"), "coupon_code_based": 0}
 	# NOTE (cost): up to three Pricing Rule queries per cart apply / invoice validate.
 	# ponytail: cache per company + day — Phase 1 Task 6f.
@@ -243,20 +312,9 @@ def blocking_rule_map(doc) -> dict:
 			},
 			fields=fields,
 		)
-	names = list(
-		dict.fromkeys(
-			row.name
-			for row in rows
-			if (not row.valid_from or getdate(row.valid_from) <= posting_date)
-			and (not row.valid_upto or getdate(row.valid_upto) >= posting_date)
-			and _rule_applies_to_doc(row, doc, profile)
-			and gifts.scheme_blocking_kind(row.name)
-		)
+	names = dict.fromkeys(
+		row.name for row in rows if rule_applies_to_doc(row, doc, profile) and gifts.scheme_blocking_kind(row.name)
 	)
-	if names:
-		from posnext_promotions.promotions.schedule import filter_rules_by_schedule, resolve_moment
-
-		names = list(filter_rules_by_schedule(dict.fromkeys(names), when=resolve_moment(doc)))
 	return {name: gifts._rule_values(name) for name in names}
 
 

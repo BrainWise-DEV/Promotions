@@ -20,6 +20,7 @@ class FriendsandFamilySettings(Document):
 		self._validate_eligibility()
 		self._validate_caps()
 		self._validate_approved_domains()
+		self._validate_snapshot_hours()
 
 	def on_update(self):
 		# get_cached_doc is cleared by Document.save; document for callers that
@@ -38,6 +39,13 @@ class FriendsandFamilySettings(Document):
 			frappe.throw(_("Discount Percentage must be between 0 and 100"))
 		if cint(self.enabled) and percentage <= 0:
 			frappe.throw(_("Discount Percentage must be greater than 0 while the program is enabled"))
+
+	def _validate_snapshot_hours(self):
+		# An Int field reads blank as 0, so below 1 means unset: store the DocType
+		# default and the saved value is always >= 1.
+		field = "replaced_discount_snapshot_hours"
+		if cint(self.get(field)) < 1:
+			self.set(field, cint(self.meta.get_field(field).default))
 
 	def _validate_dates(self):
 		if self.start_date and self.end_date and getdate(self.start_date) > getdate(self.end_date):

@@ -39,7 +39,8 @@
   "excluded_brands",
   "global_rules_section",
   "on_cap_breach_at_submit",
-  "unclassified_promotion_policy"
+  "unclassified_promotion_policy",
+  "replaced_discount_snapshot_hours"
  ],
  "fields": [
   {
@@ -265,11 +266,19 @@
    "fieldtype": "Select",
    "label": "Unclassified Promotion Policy",
    "options": "Compete\nBlock F&F on line"
+  },
+  {
+   "default": "24",
+   "description": "How long a line keeps the discount F&F replaced (for re-checking on save / submit). After this the line is re-priced from the current rules. Blank or 0 is saved as 24.",
+   "fieldname": "replaced_discount_snapshot_hours",
+   "fieldtype": "Int",
+   "label": "Replaced Discount Kept (Hours)",
+   "non_negative": 1
   }
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-11-16 16:00:00.000000",
+ "modified": "2026-11-17 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "POSNext Promotions",
  "name": "Friends and Family Settings",
