@@ -267,6 +267,30 @@ def is_customer_ff_member(customer: str | None, pos_profile: str | None = None) 
 	return bool(get_customer_eligibility(customer, pos_profile=pos_profile).ff_member)
 
 
+def _log_verification_change(customer: str, verified: bool, email_domain: str | None, via: str | None) -> None:
+	"""F&F Log row for an email-verification change. Domain and flags only, never the address."""
+	from posnext_promotions.promotions.friends_and_family_log import (
+		LOG_ELIGIBILITY_APPLIED,
+		LOG_ELIGIBILITY_REMOVED,
+		write_log,
+	)
+
+	write_log(
+		LOG_ELIGIBILITY_APPLIED if verified else LOG_ELIGIBILITY_REMOVED,
+		customer=customer,
+		reference_doctype="Customer",
+		reference_name=customer,
+		reason=REASON_EMAIL_VERIFIED if verified else REASON_EMAIL_NOT_VERIFIED,
+		message=_("Customer {0} email verification changed ({1})").format(customer, via or "-"),
+		details={"email_domain": email_domain, "verified": bool(verified), "via": via},
+	)
+
+
+def benefit_provider() -> dict:
+	"""``pos_next_customer_benefit_providers`` hook: lets POS Next ask who is an F&F member."""
+	return {"is_member": is_customer_ff_member, "on_verification_change": _log_verification_change}
+
+
 def is_customer_eligible(customer: str | None, on_date=None, pos_profile: str | None = None) -> bool:
 	return get_customer_eligibility(customer, on_date, pos_profile).eligible
 

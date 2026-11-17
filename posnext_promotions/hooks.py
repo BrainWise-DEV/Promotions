@@ -135,3 +135,8 @@ doc_events = {
 before_install = "posnext_promotions.install.before_install"
 after_install = "posnext_promotions.install.after_install"
 after_migrate = "posnext_promotions.install.after_migrate"
+
+# POS Next asks these providers who is a Friends & Family member.
+pos_next_customer_benefit_providers = [
+	"posnext_promotions.promotions.friends_and_family_eligibility.benefit_provider"
+]
