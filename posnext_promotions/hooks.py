@@ -77,10 +77,12 @@ doc_events = {
 		],
 		"on_submit": [
 			"posnext_promotions.api.one_time_usage.record_one_time_offer_usage",
+			"posnext_promotions.promotions.ff_ledger.on_submit",
 			"posnext_promotions.promotions.friends_and_family_log.log_invoice_submit",
 		],
 		"on_cancel": [
 			"posnext_promotions.api.one_time_usage.release_one_time_offer_usage",
+			"posnext_promotions.promotions.ff_ledger.on_cancel",
 			"posnext_promotions.promotions.friends_and_family_log.log_invoice_cancel",
 		],
 	},
@@ -92,8 +94,14 @@ doc_events = {
 			"posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts",
 			"posnext_promotions.promotions.friends_and_family_apply.apply_friends_and_family_on_invoice",
 		],
-		"on_submit": "posnext_promotions.promotions.friends_and_family_log.log_invoice_submit",
-		"on_cancel": "posnext_promotions.promotions.friends_and_family_log.log_invoice_cancel",
+		"on_submit": [
+			"posnext_promotions.promotions.ff_ledger.on_submit",
+			"posnext_promotions.promotions.friends_and_family_log.log_invoice_submit",
+		],
+		"on_cancel": [
+			"posnext_promotions.promotions.ff_ledger.on_cancel",
+			"posnext_promotions.promotions.friends_and_family_log.log_invoice_cancel",
+		],
 	},
 	"Customer": {
 		"validate": "posnext_promotions.promotions.friends_and_family_eligibility.guard_flag_changes",
@@ -105,4 +113,5 @@ doc_events = {
 # are installed. Keep the task module for sites that call it explicitly.
 
 before_install = "posnext_promotions.install.before_install"
+after_install = "posnext_promotions.install.after_install"
 after_migrate = "posnext_promotions.install.after_migrate"

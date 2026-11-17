@@ -17,20 +17,21 @@ Monthly usage
 Every invoice line that receives F&F stores the money it saved in the custom
 field ``posnext_fnf_discount_amount`` (line total) and
 ``posnext_discount_source = "friends_and_family"`` on Sales Invoice Item and
-POS Invoice Item. Usage for a month is the sum of that amount over the
-customer's **submitted** (``docstatus = 1``) Sales and POS Invoices posted in
-that month. Cancelled invoices (``docstatus = 2``) and drafts never count.
-Consolidated Sales Invoices (``is_consolidated = 1``) are skipped so a POS
-Invoice merged into one is not counted twice.
+POS Invoice Item. On submit, ``ff_ledger`` writes one **Friends and Family
+Usage** row per such line (company currency); usage for a month is the sum of
+those rows that are not cancelled. Drafts never count, cancelled invoices stop
+counting, consolidated Sales Invoices are skipped.
+
+Caps are company-currency amounts, counted per company (companies may keep
+different currencies). An invoice in another currency gets an allowance of
+``remaining / conversion_rate`` in its own currency.
 
 Returns / credit notes: a return line copies the F&F source of the original
 line; on validate we store the **negative** F&F saving for the returned qty.
 The return is credited to the month of the **original** invoice
-(``return_against``) — returning a September purchase in October does not
+(``return_against``): returning a September purchase in October does not
 create extra October allowance; returning an October purchase in October
 gives the allowance back.
-
-Invoices saved before PN-129 carry no stored amount and do not count.
 
 Allocation
 ----------
@@ -51,7 +52,7 @@ from dataclasses import dataclass
 
 import frappe
 from frappe import _
-from frappe.utils import cstr, flt, getdate, nowdate
+from frappe.utils import flt, getdate, nowdate
 
 from posnext_promotions.promotions import best_discount as bd
 
@@ -128,55 +129,67 @@ def month_bounds(on_date=None) -> tuple:
 	return d.replace(day=1), d.replace(day=last)
 
 
-def _has_usage_columns(doctype: str) -> bool:
-	return frappe.db.table_exists(doctype) and frappe.db.has_column(f"{doctype} Item", FIELD_FNF_AMOUNT)
+def get_monthly_usage(
+	customer: str | None, on_date=None, exclude: str | None = None, company: str | None = None
+) -> float:
+	"""F&F ``company`` already granted ``customer`` in the month of ``on_date`` (net of returns).
+
+	Reads the usage counter (that company's currency). Caps are per company:
+	``company`` is required whenever there is a customer. No lock: validate may
+	see a stale value; submit re-checks under the counter lock.
+	"""
+	from posnext_promotions.promotions import ff_ledger
+
+	return ff_ledger.get_usage(
+		customer, company, ff_ledger.period_key(on_date or nowdate()), exclude_invoice=exclude
+	)
 
 
-def get_monthly_usage(customer: str | None, on_date=None, exclude: str | None = None) -> float:
-	"""F&F already granted to ``customer`` in the calendar month of ``on_date`` (net of returns)."""
-	customer = cstr(customer).strip()
-	if not customer:
-		return 0.0
-	start, end = month_bounds(on_date)
-	total = 0.0
-	for doctype in INVOICE_DOCTYPES:
-		if not _has_usage_columns(doctype):
-			continue
-		consolidated = (
-			"and ifnull(p.is_consolidated, 0) = 0" if frappe.db.has_column(doctype, "is_consolidated") else ""
+def cart_cap_basis(pos_profile: str | None, posting_date=None) -> tuple[str, float]:
+	"""``(company, conversion_rate)`` caps use for a cart sold through ``pos_profile``."""
+	rate = cap_conversion_rate(pos_profile, posting_date)  # raises without a valid profile
+	return frappe.get_cached_value("POS Profile", pos_profile, "company"), rate
+
+
+def cap_conversion_rate(pos_profile: str | None, posting_date=None) -> float:
+	"""Company-currency units per cart-currency unit for a POS Profile's cart (like ``doc.conversion_rate``).
+
+	1 when the profile currency equals the company's. Otherwise ERPNext's
+	exchange rate on ``posting_date``. A missing profile or rate is an error,
+	never 1 (ERPNext could not build that invoice either). Called only when caps
+	are set.
+	"""
+	if not pos_profile:
+		frappe.throw(_("A POS Profile is needed to check Friends & Family caps in company currency."))
+	values = frappe.get_cached_value("POS Profile", pos_profile, ["company", "currency"], as_dict=True)
+	if not values:
+		frappe.throw(_("POS Profile {0} not found.").format(pos_profile))
+	company_currency = (
+		frappe.get_cached_value("Company", values.company, "default_currency") if values.company else None
+	)
+	# POS Profile.company / currency and Company.default_currency are mandatory in
+	# ERPNext; a blank one cannot hold a foreign-currency cart.
+	if not values.currency or not company_currency or values.currency == company_currency:
+		return 1.0
+	from erpnext.setup.utils import get_exchange_rate
+
+	rate = flt(get_exchange_rate(values.currency, company_currency, posting_date or nowdate()))
+	if rate <= 0:
+		frappe.throw(
+			_("No exchange rate from {0} to {1} on {2}: Friends & Family caps cannot be checked.").format(
+				values.currency, company_currency, posting_date or nowdate()
+			)
 		)
-		exclude_sql = "and p.name != %(exclude)s" if exclude else ""
-		params = {"customer": customer, "start": start, "end": end, "exclude": exclude}
-		sales = frappe.db.sql(
-			f"""
-			select coalesce(sum(i.`{FIELD_FNF_AMOUNT}`), 0)
-			from `tab{doctype} Item` i
-			join `tab{doctype}` p on p.name = i.parent
-			where p.docstatus = 1 and p.customer = %(customer)s and ifnull(p.is_return, 0) = 0
-				and p.posting_date between %(start)s and %(end)s {consolidated} {exclude_sql}
-			""",
-			params,
-		)[0][0]
-		returns = frappe.db.sql(
-			f"""
-			select coalesce(sum(i.`{FIELD_FNF_AMOUNT}`), 0)
-			from `tab{doctype} Item` i
-			join `tab{doctype}` p on p.name = i.parent
-			join `tab{doctype}` o on o.name = p.return_against
-			where p.docstatus = 1 and p.customer = %(customer)s and ifnull(p.is_return, 0) = 1
-				and o.posting_date between %(start)s and %(end)s {consolidated} {exclude_sql}
-			""",
-			params,
-		)[0][0]
-		total += flt(sales) + flt(returns)
-	return max(0.0, total)
+	return rate
 
 
 @dataclass
 class CapContext:
+	# Caps and usage are company currency; ``allowance`` is invoice currency.
 	per_order_cap: float = 0.0
 	monthly_cap: float = 0.0
 	monthly_used: float = 0.0
+	conversion_rate: float = 1.0
 
 	@property
 	def active(self) -> bool:
@@ -190,9 +203,12 @@ class CapContext:
 
 	@property
 	def allowance(self) -> float | None:
-		"""Max F&F for this order (``None`` = unlimited)."""
+		"""Max F&F for this order in invoice currency (``None`` = unlimited)."""
 		limits = [v for v in (self.per_order_cap or None, self.monthly_remaining) if v is not None]
-		return min(limits) if limits else None
+		if not limits:
+			return None
+		rate = flt(self.conversion_rate) or 1.0
+		return min(limits) if rate == 1.0 else floor_cents(min(limits) / rate)
 
 	@property
 	def binding_cap(self) -> str | None:
@@ -204,14 +220,26 @@ class CapContext:
 		return CAP_MONTHLY if remaining is not None else None
 
 
-def get_cap_context(program, customer, posting_date=None, exclude: str | None = None) -> CapContext:
+def get_cap_context(
+	program,
+	customer,
+	posting_date=None,
+	exclude: str | None = None,
+	conversion_rate: float = 1.0,
+	company: str | None = None,
+) -> CapContext:
+	"""Caps for one order sold by ``company``. ``conversion_rate`` converts invoice currency
+	to company currency; the monthly cap counts only that company's usage."""
 	if program is None:
 		return CapContext()
 	monthly_cap = flt(getattr(program, "max_discount_per_customer_month", 0))
 	return CapContext(
 		per_order_cap=flt(getattr(program, "max_discount_per_order", 0)),
 		monthly_cap=monthly_cap,
-		monthly_used=get_monthly_usage(customer, posting_date, exclude=exclude) if monthly_cap > 0 else 0.0,
+		monthly_used=(
+			get_monthly_usage(customer, posting_date, exclude=exclude, company=company) if monthly_cap > 0 else 0.0
+		),
+		conversion_rate=flt(conversion_rate) or 1.0,
 	)
 
 
@@ -257,7 +285,9 @@ def build_cap_payload(ctx: CapContext, uncapped_total: float, applied_total: flo
 		"capped": bool(capped),
 		"cap_hit": None,
 		"monthly_remaining_after": (
-			max(0.0, bd.money(remaining - applied_total)) if remaining is not None else None
+			max(0.0, bd.money(remaining - flt(applied_total) * (flt(ctx.conversion_rate) or 1.0)))
+			if remaining is not None
+			else None
 		),
 		"message": "",
 		"message_en": "",

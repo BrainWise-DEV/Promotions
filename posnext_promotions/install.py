@@ -30,12 +30,28 @@ def before_install():
 		frappe.delete_doc("Module Def", module, force=1, ignore_permissions=True)
 
 
+def after_install():
+	"""Structural keys the post_model_sync patches would otherwise add on the first migrate."""
+	_ensure_ff_usage_unique_key()
+
+
 def after_migrate():
 	"""Runs after sync_customizations, so the custom/*.json fields exist by now."""
 	_ensure_friends_and_family_customer_flag()
 	_ensure_friends_and_family_invoice_fields()
 	_ensure_friends_and_family_message_events()
+	_ensure_ff_usage_unique_key()
 	_backfill_coupon_promotion_conflict()
+
+
+def _ensure_ff_usage_unique_key():
+	"""Structural: one Usage row per invoice line, one Usage Total per customer and period.
+
+	Called from after_install and after_migrate (Ruling 2).
+	"""
+	from posnext_promotions.promotions.ff_ledger import ensure_ledger_unique_key
+
+	ensure_ledger_unique_key()
 
 
 def _ensure_friends_and_family_message_events():

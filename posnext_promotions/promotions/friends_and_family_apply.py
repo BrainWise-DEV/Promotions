@@ -64,6 +64,7 @@ from posnext_promotions.promotions.friends_and_family_caps import (
 	CapContext,
 	allocate,
 	build_cap_payload,
+	cart_cap_basis,
 	ceil_cents,
 	get_cap_context,
 )
@@ -662,12 +663,35 @@ def _evaluate_line(
 	)
 
 
-def _plan_lines(items, program, customer, posting_date, amount_basis, exclude_invoice=None) -> tuple:
-	"""Per-line decisions with PN-129 caps applied. Returns ``(results, cap context, uncapped total)``."""
+def _plan_lines(
+	items,
+	program,
+	customer,
+	posting_date,
+	amount_basis,
+	exclude_invoice=None,
+	conversion_rate: float | None = None,
+	pos_profile: str | None = None,
+	company: str | None = None,
+) -> tuple:
+	"""Per-line decisions with PN-129 caps applied. Returns ``(results, cap context, uncapped total)``.
+
+	Caps are company currency and per company; ``conversion_rate`` turns them into
+	this order's currency. ``None`` (cart) = the POS Profile's company and rate,
+	looked up only when caps are set.
+	"""
+	if conversion_rate is None:
+		if program.has_caps:
+			profile_company, conversion_rate = cart_cap_basis(pos_profile, posting_date)
+			company = company or profile_company
+		else:
+			conversion_rate = 1.0
 	results = [
 		_evaluate_line(item, program, idx=idx, amount_basis=amount_basis) for idx, item in enumerate(items)
 	]
-	ctx = get_cap_context(program, customer, posting_date, exclude=exclude_invoice)
+	ctx = get_cap_context(
+		program, customer, posting_date, exclude=exclude_invoice, conversion_rate=conversion_rate, company=company
+	)
 	uncapped_total = sum(r.discount_amount for r in results if r.applies)
 	allowance = ctx.allowance
 	if allowance is None or bd.money(uncapped_total) <= bd.money(allowance):
@@ -772,6 +796,8 @@ def compute_friends_and_family_discounts(
 	amount_basis: str = bd.AMOUNT_BASIS_LINE,
 	exclude_invoice: str | None = None,
 	pos_profile: str | None = None,
+	conversion_rate: float | None = None,
+	company: str | None = None,
 ) -> dict:
 	"""Per-line F&F decision for ``customer`` + cart ``items`` on ``posting_date``.
 
@@ -805,7 +831,7 @@ def compute_friends_and_family_discounts(
 		return payload
 
 	results, ctx, uncapped_total = _plan_lines(
-		items, program, customer, posting_date, amount_basis, exclude_invoice
+		items, program, customer, posting_date, amount_basis, exclude_invoice, conversion_rate, pos_profile, company
 	)
 	caps = build_cap_payload(ctx, uncapped_total, _applied_total(results))
 	applied = sum(1 for r in results if r.applies)
@@ -824,6 +850,8 @@ def apply_friends_and_family_to_items(
 	amount_basis: str = bd.AMOUNT_BASIS_LINE,
 	exclude_invoice: str | None = None,
 	pos_profile: str | None = None,
+	conversion_rate: float | None = None,
+	company: str | None = None,
 ) -> dict:
 	"""Mutate ``items``: stamp F&F where it wins, strip stale F&F stamps otherwise.
 
@@ -866,7 +894,7 @@ def apply_friends_and_family_to_items(
 		caps = build_cap_payload(CapContext(), 0, 0)
 	else:
 		planned, ctx, uncapped_total = _plan_lines(
-			items, program, customer, posting_date, amount_basis, exclude_invoice
+			items, program, customer, posting_date, amount_basis, exclude_invoice, conversion_rate, pos_profile, company
 		)
 		results = []
 		for item, result in zip(items, planned, strict=False):
@@ -1220,6 +1248,8 @@ def apply_friends_and_family_on_invoice(doc, method=None):
 
 	# Scenario-B line values: what each line saves without F&F.
 	pos_profile = doc.get("pos_profile")
+	# Caps are company currency (ledger base_amount); this invoice may be in another.
+	conversion_rate = flt(doc.get("conversion_rate")) or 1.0
 	program = get_customer_eligibility(doc.get("customer"), posting_date, pos_profile)
 	program = program.program if program.eligible else None
 	b_line_values = []
@@ -1236,6 +1266,8 @@ def apply_friends_and_family_on_invoice(doc, method=None):
 		amount_basis=bd.AMOUNT_BASIS_UNIT,
 		exclude_invoice=doc.get("name") or None,
 		pos_profile=pos_profile,
+		conversion_rate=conversion_rate,
+		company=doc.get("company"),
 	)
 	order_decision = _resolve_order_level(doc, items, snapshots, b_line_values, ff_payload, fnf_like)
 	# Gift policy after the order-level decision, as on the cart: a gift goes only when
@@ -1250,6 +1282,8 @@ def apply_friends_and_family_on_invoice(doc, method=None):
 			amount_basis=bd.AMOUNT_BASIS_UNIT,
 			exclude_invoice=doc.get("name") or None,
 			pos_profile=pos_profile,
+			conversion_rate=conversion_rate,
+			company=doc.get("company"),
 		)
 	items = doc.get("items")
 	if order_decision:

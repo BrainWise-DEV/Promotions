@@ -3,12 +3,15 @@
 
 """PN-129 — Friends & Family discount caps (per order + monthly per customer)."""
 
+from unittest.mock import patch
+
 import frappe
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import flt
 
 from posnext_promotions.promotions.friends_and_family_testing import approved_domain_rows, give_verified_email
 from posnext_promotions.promotions import best_discount as bd
+from posnext_promotions.promotions import ff_ledger
 from posnext_promotions.promotions.best_discount_coupon import resolve_coupon_best_discount
 from posnext_promotions.promotions.friends_and_family import get_active_program
 from posnext_promotions.promotions.friends_and_family_apply import (
@@ -84,6 +87,14 @@ class TestFriendsAndFamilyCaps(FrappeTestCase):
 
 	def setUp(self):
 		frappe.db.savepoint("pn129_case")
+		# Cart calls here pass no POS Profile; caps then need the profile's company and
+		# rate (Rulings 29, 32). These fixtures sell for the default company at rate 1.
+		rate = patch(
+			"posnext_promotions.promotions.friends_and_family_apply.cart_cap_basis",
+			return_value=(self._company(), 1.0),
+		)
+		rate.start()
+		self.addCleanup(rate.stop)
 		self._configure()
 		self._seq = 0
 
@@ -147,7 +158,13 @@ class TestFriendsAndFamilyCaps(FrappeTestCase):
 		is_consolidated=0,
 		name=None,
 	):
-		"""Insert a bare invoice + rows carrying F&F usage (no GL / stock side effects)."""
+		"""Insert a bare invoice + rows carrying F&F usage (no GL / stock side effects).
+
+		Usage now lives in the Friends and Family Usage ledger, so the rows that a
+		submit would record are written there too, with the same rules: drafts and
+		consolidated invoices get none, cancelled invoices get cancelled rows,
+		returns count in their original invoice's month.
+		"""
 		self._seq += 1
 		name = name or f"{LEDGER_PREFIX}{doctype[:3]}-{self._seq}"
 		values = {
@@ -170,7 +187,29 @@ class TestFriendsAndFamilyCaps(FrappeTestCase):
 				values (%s, %s, %s, 'items', %s, %s, %s, %s, %s)""",
 				(f"{name}-{idx}", name, doctype, idx, ITEM, docstatus, DISCOUNT_SOURCE_FRIENDS_AND_FAMILY, amount),
 			)
+			if docstatus in (1, 2) and not is_consolidated:
+				period_date = posting_date
+				if is_return and return_against:
+					period_date = frappe.db.get_value(doctype, return_against, "posting_date") or posting_date
+				ff_ledger.record_rows(
+					[{
+						"customer": customer,
+						"company": self._company(),
+						"invoice_doctype": doctype,
+						"invoice": name,
+						"invoice_item": f"{name}-{idx}",
+						"posting_date": posting_date,
+						"period_key": ff_ledger.period_key(period_date),
+						"amount": amount,
+						"base_amount": amount,
+						"is_return": is_return,
+						"is_cancelled": int(docstatus == 2),
+					}]
+				)
 		return name
+
+	def _company(self):
+		return frappe.db.get_single_value("Global Defaults", "default_company") or frappe.db.get_value("Company", {})
 
 	# ---- settings ---------------------------------------------------------
 
@@ -289,9 +328,9 @@ class TestFriendsAndFamilyCaps(FrappeTestCase):
 		self._ledger([100], posting_date="2026-09-30")  # other month
 		self._ledger([100], customer=OTHER_CUSTOMER)
 		self._ledger([100], doctype="Sales Invoice", is_consolidated=1)  # merged POS invoices
-		self.assertEqual(get_monthly_usage(CUSTOMER, DATE), 30)
-		self.assertEqual(get_monthly_usage(CUSTOMER, "2026-09-15"), 100)
-		self.assertEqual(get_monthly_usage(None, DATE), 0)
+		self.assertEqual(get_monthly_usage(CUSTOMER, DATE, company=self._company()), 30)
+		self.assertEqual(get_monthly_usage(CUSTOMER, "2026-09-15", company=self._company()), 100)
+		self.assertEqual(get_monthly_usage(None, DATE, company=self._company()), 0)
 
 	def test_returns_reduce_usage_of_original_month(self):
 		october = self._ledger([30, 30])
@@ -299,13 +338,13 @@ class TestFriendsAndFamilyCaps(FrappeTestCase):
 		self._ledger([-30], is_return=1, return_against=october, posting_date="2026-10-06")
 		self._ledger([-40], is_return=1, return_against=september, posting_date="2026-10-06")
 		self._ledger([-30], is_return=1, return_against=october, docstatus=0)  # draft return ignored
-		self.assertEqual(get_monthly_usage(CUSTOMER, DATE), 30)  # 60 - 30; September return not credited here
-		self.assertEqual(get_monthly_usage(CUSTOMER, "2026-09-01"), 0)
+		self.assertEqual(get_monthly_usage(CUSTOMER, DATE, company=self._company()), 30)  # 60 - 30; September return not credited here
+		self.assertEqual(get_monthly_usage(CUSTOMER, "2026-09-01", company=self._company()), 0)
 
 	def test_exclude_current_invoice_from_usage(self):
 		name = self._ledger([50])
-		self.assertEqual(get_monthly_usage(CUSTOMER, DATE), 50)
-		self.assertEqual(get_monthly_usage(CUSTOMER, DATE, exclude=name), 0)
+		self.assertEqual(get_monthly_usage(CUSTOMER, DATE, company=self._company()), 50)
+		self.assertEqual(get_monthly_usage(CUSTOMER, DATE, exclude=name, company=self._company()), 0)
 
 	# ---- capped F&F vs competitors ----------------------------------------
 
@@ -358,6 +397,7 @@ class TestFriendsAndFamilyCaps(FrappeTestCase):
 		return frappe._dict(
 			{
 				"doctype": "POS Invoice",
+				"company": self._company(),
 				"customer": CUSTOMER,
 				"posting_date": DATE,
 				"is_pos": 1,

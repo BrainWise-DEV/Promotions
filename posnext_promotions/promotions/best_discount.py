@@ -146,24 +146,51 @@ def line_gross(item) -> float:
 	return line_price_list_rate(item) * line_qty(item)
 
 
+def _charged_saving(item, qty: float, gross: float, pct: float) -> float | None:
+	"""The saving when ``rate`` is what the line charges, else ``None`` (caller uses % / amount).
+
+	ERPNext's ``calculate_item_values`` re-prices a line from its percentage
+	(or amount) only when it has Pricing Rules or no rate; otherwise ``rate``
+	stands and the percentage is only a label. Cart lines carry the list price
+	in ``rate`` and their discount in the percentage / amount (``apply_offers``
+	folds them into the net rate later), so ``rate`` counts only when it is
+	below the list price and no Pricing Rule re-prices the line.
+	"""
+	price_list_rate = line_price_list_rate(item)
+	if price_list_rate <= 0 or qty <= 0:
+		return None
+	if pct >= 100:
+		return gross
+	if has_pricing_rules(item) and (pct > 0 or flt(item.get("discount_amount")) > 0):
+		return None
+	rate = flt(item.get("rate") or 0)
+	if 0 < rate < price_list_rate:
+		return min(gross, (price_list_rate - rate) * qty)
+	return None
+
+
 def line_discount_value(item, amount_basis: str = AMOUNT_BASIS_LINE) -> float:
-	"""Money the line's current discount saves, whatever its source."""
+	"""Money the line's current discount saves, whatever its source.
+
+	The one valuation for cart and invoice (Ruling 28): both follow ERPNext's
+	pricing precedence, so the same line gets the same value on both paths.
+	``amount_basis`` only says whether ``discount_amount`` is per unit (saved
+	invoice rows) or the line total (cart payloads).
+	"""
 	if item.get("is_free_item"):
 		return 0.0
 	qty = line_qty(item)
 	gross = line_gross(item)
 	pct = flt(item.get("discount_percentage") or 0)
+	charged = _charged_saving(item, qty, gross, pct)
+	if charged is not None:
+		return charged
 	if pct > 0 and gross > 0:
 		return min(gross, gross * pct / 100.0)
 	amount = flt(item.get("discount_amount") or 0)
 	if amount > 0:
 		value = amount * qty if amount_basis == AMOUNT_BASIS_UNIT else amount
 		return min(gross, value) if gross > 0 else value
-	if amount_basis == AMOUNT_BASIS_UNIT:
-		rate = flt(item.get("rate") or 0)
-		pl = line_price_list_rate(item)
-		if pl > 0 and 0 <= rate < pl and qty > 0:
-			return (pl - rate) * qty
 	return 0.0
 
 

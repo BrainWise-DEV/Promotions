@@ -565,11 +565,11 @@ class TestFriendsAndFamilyAcceptance(FrappeTestCase):
 		self.assertEqual(flt(self._row(third, "phone").rate), 500)
 		self.assertIn("Monthly Friends & Family limit of 500.00 reached", self._payload(third)["message_en"])
 		self.assertEqual(self._logs(third, item_code=self.items["phone"])[0].log_type, "Cap Hit")
-		self.assertEqual(get_monthly_usage(self.staff, self.today), 500)
+		self.assertEqual(get_monthly_usage(self.staff, self.today, company=self.company), 500)
 
 		ret = self._return(first)
 		self.assertEqual(flt(ret.items[0].get(FIELD_FNF_AMOUNT)), -300)
-		self.assertEqual(get_monthly_usage(self.staff, self.today), 200)
+		self.assertEqual(get_monthly_usage(self.staff, self.today, company=self.company), 200)
 		fourth = self._sell(self.staff, [("laptop", 1)])
 		self.assertEqual(flt(self._row(fourth, "laptop").rate), 700)  # 300 allowance again
 
@@ -630,6 +630,37 @@ class TestFriendsAndFamilyAcceptance(FrappeTestCase):
 			(self.staff, self.today),
 		)[0][0]
 		self.assertEqual(flt(direct), 150)
+
+	def test_14b_real_submit_and_cancel_drive_ledger_and_counter(self):
+		from posnext_promotions.promotions import ff_ledger
+
+		period = ff_ledger.period_key(self.today)
+
+		def counter():
+			return flt(
+				frappe.db.get_value(ff_ledger.TOTAL_DOCTYPE, ff_ledger.total_name(self.staff, self.company, period), "base_amount")
+			)
+
+		def rows(doc):
+			return frappe.get_all(
+				ff_ledger.LEDGER_DOCTYPE,
+				filters={"invoice": doc.name},
+				fields=["invoice_doctype", "invoice_item", "base_amount", "is_cancelled", "company", "period_key"],
+			)
+
+		before = counter()
+		doc = self._sell(self.staff, [("laptop", 1)])  # F&F 300
+		recorded = rows(doc)
+		self.assertEqual(len(recorded), 1)
+		self.assertEqual(recorded[0].invoice_doctype, "Sales Invoice")
+		self.assertEqual(recorded[0].invoice_item, self._row(doc, "laptop").name)
+		self.assertEqual(flt(recorded[0].base_amount), 300)
+		self.assertEqual((recorded[0].company, recorded[0].period_key), (self.company, period))
+		self.assertEqual(counter(), before + 300)
+
+		self._cancel(doc)
+		self.assertTrue(all(row.is_cancelled for row in rows(doc)))
+		self.assertEqual(counter(), before)
 
 	def test_15_settings_and_eligibility_changes_are_logged(self):
 		from posnext_promotions.promotions.friends_and_family_testing import give_verified_email
