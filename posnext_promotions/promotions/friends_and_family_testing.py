@@ -133,3 +133,68 @@ def ensure_named_pricing_rule(name: str, **values) -> str:
 	frappe.db.set_value("Pricing Rule", name, {"disable": 0, "valid_from": None, "valid_upto": None, **values})
 	frappe.clear_document_cache("Pricing Rule", name)
 	return name
+
+
+TEST_POS_PROFILE = "_Test FF POS Profile"
+NO_COMPANY_HINT = "The site has no Company: run ERPNext setup first (`bench execute erpnext.setup.utils.before_tests`)."
+
+
+def _create_walk_in_customer() -> str:
+	"""ERPNext setup creates no Customer, and a POS Profile needs a default one."""
+	# Customers need leaf groups; the Selling Settings defaults are often the root ones.
+	group = frappe.db.get_value("Customer Group", {"is_group": 0})
+	territory = frappe.db.get_value("Territory", {"is_group": 0})
+	if not (group and territory):
+		raise AssertionError("No Customer Group / Territory for the test Customer. " + NO_COMPANY_HINT)
+	return (
+		frappe.get_doc(
+			{
+				"doctype": "Customer",
+				"customer_name": "_Test FF Walk-in",
+				"customer_type": "Individual",
+				"customer_group": group,
+				"territory": territory,
+			}
+		)
+		.insert(ignore_permissions=True)
+		.name
+	)
+
+
+def ensure_test_pos_profile() -> str:
+	"""A POS Profile for tests, created on the site's Company when the site has none.
+
+	Raises (never skips) when the fixture cannot be built, so CI cannot go green without running the tests.
+	"""
+	if frappe.db.exists("POS Profile", TEST_POS_PROFILE):
+		return TEST_POS_PROFILE
+	company = frappe.defaults.get_global_default("company") or frappe.db.get_value("Company", {})
+	if not company:
+		raise AssertionError(NO_COMPANY_HINT)
+	mode = frappe.db.get_value("Mode of Payment Account", {"company": company, "parenttype": "Mode of Payment"}, "parent")
+	if not mode:
+		raise AssertionError(f"No Mode of Payment has an account for {company}. " + NO_COMPANY_HINT)
+	warehouse = frappe.db.get_value("Warehouse", {"company": company, "is_group": 0, "disabled": 0})
+	price_list = frappe.db.get_value("Price List", {"selling": 1, "enabled": 1})
+	missing = [n for n, v in (("Warehouse", warehouse), ("selling Price List", price_list)) if not v]
+	if missing:
+		raise AssertionError(f"No {', '.join(missing)} for the test POS Profile. " + NO_COMPANY_HINT)
+	customer = frappe.db.get_value("Customer", {"disabled": 0}) or _create_walk_in_customer()
+	write_off_account, cost_center = frappe.get_cached_value("Company", company, ["write_off_account", "cost_center"])
+	profile = frappe.get_doc(
+		{
+			"doctype": "POS Profile",
+			"name": TEST_POS_PROFILE,
+			"company": company,
+			"warehouse": warehouse,
+			"selling_price_list": price_list,
+			"currency": frappe.get_cached_value("Company", company, "default_currency"),
+			"customer": customer,
+			"write_off_account": write_off_account,
+			"write_off_cost_center": cost_center,
+			"disabled": 0,
+			"payments": [{"mode_of_payment": mode, "default": 1}],
+		}
+	)
+	profile.insert(ignore_permissions=True)
+	return profile.name

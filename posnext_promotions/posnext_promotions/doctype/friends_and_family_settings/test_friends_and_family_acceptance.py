@@ -26,7 +26,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import add_days, flt, nowdate
 
-from posnext_promotions.promotions.friends_and_family_testing import approved_domain_rows
+from posnext_promotions.promotions.friends_and_family_testing import approved_domain_rows, ensure_test_pos_profile
 from posnext_promotions.api.apply_offers import apply_offers
 from posnext_promotions.api.friends_and_family import apply_friends_and_family_discount
 from posnext_promotions.api.offers import validate_coupon
@@ -52,13 +52,13 @@ LOG = "Friends and Family Log"
 CASHIER = "_test_ff_acc_cashier@example.com"
 
 
-def _pick_pos_profile() -> str | None:
+def _pick_pos_profile() -> str:
 	wanted = os.environ.get("FF_ACCEPTANCE_POS_PROFILE")
 	if wanted and frappe.db.exists("POS Profile", wanted):
 		return wanted
 	if frappe.db.exists("POS Profile", {"name": "profile 1", "disabled": 0}):
 		return "profile 1"
-	return frappe.db.get_value("POS Profile", {"disabled": 0})
+	return frappe.db.get_value("POS Profile", {"disabled": 0}) or ensure_test_pos_profile()
 
 
 def _ensure_price_list(profile) -> str:
@@ -84,8 +84,6 @@ class TestFriendsAndFamilyAcceptance(FrappeTestCase):
 		cls._commit_patch.start()
 		ensure_invoice_item_fields()
 		cls.profile = _pick_pos_profile()
-		if not cls.profile:
-			raise cls.skipTest(cls, "No POS Profile on this site")
 		profile = frappe.get_doc("POS Profile", cls.profile)
 		cls.company = profile.company
 		cls.mode_of_payment = next(

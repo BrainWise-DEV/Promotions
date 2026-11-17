@@ -18,6 +18,7 @@ from frappe.utils import cint, flt, nowdate
 from posnext_promotions.promotions.friends_and_family_testing import (
 	approved_domain_rows,
 	ensure_named_pricing_rule,
+	ensure_test_pos_profile,
 	give_verified_email,
 )
 from posnext_promotions.api.friends_and_family import (
@@ -172,9 +173,7 @@ class TestFriendsAndFamilySchemeAndProfile(FrappeTestCase):
 		)
 
 	def _profile(self, allow):
-		name = frappe.db.get_value("POS Profile", {})
-		if not name:
-			self.skipTest("no POS Profile on the site")
+		name = frappe.db.get_value("POS Profile", {}) or ensure_test_pos_profile()
 		old = frappe.db.get_value("POS Profile", name, "allow_friends_family")
 		_set_allow(name, allow)
 		self.addCleanup(_set_allow, name, old)
