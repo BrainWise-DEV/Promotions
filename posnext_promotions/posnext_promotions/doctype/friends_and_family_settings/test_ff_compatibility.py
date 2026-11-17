@@ -441,6 +441,60 @@ class TestFFCompatibility(FrappeTestCase):
 		self.assertEqual([r.item_code for r in doc.get("items") if cint(r.is_free_item)], [ITEM_C])
 		self.assertEqual(_source(self._paid(doc, ITEM_B)), FNF)
 
+	def test_cleared_gift_stamp_keeps_price_rule(self):
+		# A GWP stamp on an F&F line goes; the Price rule sharing the line stays attached.
+		gwp = self._gift(promotion_type=gifts.PROMOTION_TYPE_GWP)
+		price = self._price_rule(ITEM_B)
+		row = self._row(ITEM_B, 1, f"{gwp},{price}", idx=1)
+		row.update(
+			{"discount_source": gifts.DISCOUNT_SOURCE_GWP, "discount_percentage": 10, "discount_amount": 8, "rate": 72}
+		)
+		applied = {gwp, price}
+		suppressed = ff_compatibility.enforce_gift_policy(
+			[row], {}, ff_config.resolve(), fnf_keys={1}, applied_rules=applied
+		)
+		self.assertEqual(suppressed, [gwp])
+		self.assertEqual(gifts._item_rule_names(row), [price])
+		self.assertEqual(applied, {price})
+		self.assertEqual((flt(row.discount_amount), flt(row.rate)), (0, 80))
+
+	def test_fallback_gift_stamp_detaches_only_the_unknown_rule(self):
+		# The gift kind comes from discount_source only (its rule no longer resolves):
+		# that rule goes, the Price rule stays.
+		price = self._price_rule(ITEM_B)
+		row = self._row(ITEM_B, 1, f"{PREFIX}DELETED-GIFT,{price}", idx=1)
+		row.update(
+			{"discount_source": gifts.DISCOUNT_SOURCE_GWP, "discount_percentage": 10, "discount_amount": 8, "rate": 72}
+		)
+		suppressed = ff_compatibility.enforce_gift_policy([row], {}, ff_config.resolve(), fnf_keys={1})
+		self.assertEqual(suppressed, [f"{PREFIX}DELETED-GIFT"])
+		self.assertEqual(gifts._item_rule_names(row), [price])
+		self.assertEqual(flt(row.discount_amount), 0)
+
+	def test_invoice_line_freed_from_gift_gets_fnf_on_rerun(self):
+		# ITEM_B's only discount is the gift rule's (50 % beats F&F 30 %). ITEM_A gets F&F and
+		# also triggers the gift, so the gift goes: ITEM_B loses the gift discount and the
+		# re-run gives it F&F.
+		gift = self._gift(triggers=[ITEM_A, ITEM_B])
+		row_b = self._row(ITEM_B, 1, gift)
+		row_b.update({"discount_percentage": 50, "discount_amount": 40, "rate": 40})
+		doc = self._invoice([self._row(ITEM_A, 1, gift), row_b, self._row(ITEM_C, 1, gift, free=True)])
+		apply_friends_and_family_on_invoice(doc)
+		self.assertFalse([r for r in doc.get("items") if cint(r.is_free_item)])
+		line_b = self._paid(doc, ITEM_B)
+		self.assertEqual(_source(line_b), FNF)
+		self.assertEqual(flt(line_b.discount_percentage), 30)
+		self.assertNotIn(gift, gifts._item_rule_names(line_b))
+
+	def test_clear_line_gift_stamp_detaches_only_named_rules(self):
+		row = frappe._dict(
+			{"pricing_rules": "GIFT-1,PRICE-1", "price_list_rate": 80, "rate": 72, "discount_amount": 8}
+		)
+		gifts._clear_line_gift_stamp(row, ["GIFT-1"])
+		self.assertEqual(row.pricing_rules, "PRICE-1")
+		gifts._clear_line_gift_stamp(row)
+		self.assertEqual(row.pricing_rules, "")
+
 	def test_removed_gift_keeps_other_rules_on_trigger_row(self):
 		# ITEM_A is excluded from F&F and keeps a 10% Price rule; ITEM_B gets F&F, so
 		# the gift (triggered by both) goes. ITEM_A loses only the gift tag.

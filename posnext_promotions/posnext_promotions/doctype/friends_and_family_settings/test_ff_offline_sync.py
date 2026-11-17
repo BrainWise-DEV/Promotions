@@ -55,6 +55,16 @@ class TestFFOfflineSync(PaidInvoiceFixture, FrappeTestCase):
 		self.assertEqual(self._reasons(doc), [ff_paid.CAP_EXCEEDED])
 		self.assertEqual(self._ledger_amount(doc), 30)
 
+	def test_offline_forbidden_gift_logged_not_removed(self):
+		self._settings(allow_free_gift_with_ff=0)
+		rule, doc = self._gift_invoice(paid=False, offline=True)
+		before = self._prices(doc)
+		self._sync(doc)
+		self.assertEqual(self._prices(doc), before)
+		self.assertEqual(len(doc.get("items")), 2)
+		self.assertIn(ff_paid.GIFT_WITH_FNF, self._reasons(doc))
+		self.assertEqual(self._logs(doc, LOG_PAID_DISAGREEMENT), [])
+
 	def test_offline_cap_breach_never_blocks(self):
 		self._cap_with_remaining(5, on_cap_breach_at_submit="Block submit")
 		doc = self._invoice([self._row(qty=2, pct=30, marked=True)], paid=False, offline=True)

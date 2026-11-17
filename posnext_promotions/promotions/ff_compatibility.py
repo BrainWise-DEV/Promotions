@@ -417,14 +417,19 @@ def _decide_gifts(snapshot: GiftSnapshot, fnf_keys: set, rule_map: dict):
 		item = line.row
 		if not gifts._line_has_gift_stamp(item):
 			continue
-		rule_names = gifts._item_rule_names(item)
-		kinds = {gifts.classify_gift_rule(rule_map.get(n) or n) for n in rule_names}
+		kind_of = {n: gifts.classify_gift_rule(rule_map.get(n) or n) for n in gifts._item_rule_names(item)}
+		kinds = set(kind_of.values())
 		kinds.discard(None)
+		gift_rules = [n for n, kind in kind_of.items() if kind in gifts.CONFIGURABLE_GIFT_KINDS]
 		if not kinds and cstr(item.get("discount_source")) in gifts._GIFT_LINE_SOURCES:
+			# The stamp says "gift" but no rule on the line classifies as one: the gift's
+			# rule is one that no longer resolves (deleted). Known rules (a Price rule) stay.
 			kinds = {gifts.GIFT_KIND_FREE_ITEM}
+			gift_rules = [n for n in kind_of if gifts._rule_values(rule_map.get(n) or n) is None]
 		if kinds & gifts.CONFIGURABLE_GIFT_KINDS and gifts.GIFT_KIND_BXGY not in kinds:
-			suppressed.update(rule_names)
-			gifts._clear_line_gift_stamp(item)
+			# Only the gift rules go; a Price rule on the same line stays attached.
+			suppressed.update(gift_rules)
+			gifts._clear_line_gift_stamp(item, gift_rules)
 
 	if suppressed:
 		# Detach the dropped gift rules from their trigger lines so the POS does

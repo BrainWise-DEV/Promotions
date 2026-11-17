@@ -1035,14 +1035,15 @@ def _scenario_b_lines(items, snapshots, fnf_like) -> list:
 
 
 def _pos_coupon_value(
-	coupon_code: str, base_net: float, base_grand: float, lines=None, tax_amount: float = 0
+	coupon_code: str, base_net: float, base_grand: float, lines=None, tax_rate: float = 0
 ) -> tuple[float, float | None] | None:
 	"""``(value, percentage)`` of an order-level POS Coupon (``None`` if unknown).
 
-	With ``lines`` the value comes from the coupon engine, i.e. the same base the
-	POS used in ``calculate_coupon_discount``: already-discounted lines (a
-	promotion that beat F&F) and excluded brands do not count. Without lines it
-	falls back to the coupon % of the whole base.
+	With ``lines`` the value comes from :func:`best_discount_coupon.coupon_value_on`,
+	the rule ``calculate_coupon_discount`` uses: out-of-scope lines and excluded brands
+	do not count, already-discounted lines follow the coupon's ``promotion_conflict``,
+	and a "Grand Total" coupon adds only the exclusive taxes (``tax_rate``). Without
+	lines it falls back to the coupon % of the whole base.
 	"""
 	code = cstr(coupon_code).strip().upper()
 	if not code or not frappe.db.table_exists("POS Coupon"):
@@ -1053,16 +1054,10 @@ def _pos_coupon_value(
 	row = frappe.get_cached_doc("POS Coupon", name)
 	pct = flt(row.discount_percentage) if cstr(row.discount_type) == "Percentage" else None
 	if lines:
-		from posnext_promotions.api.coupon_engine import apply_coupon_discount
+		# Same value rule as validate_coupon / calculate_coupon_discount (cart = invoice).
+		from posnext_promotions.promotions.best_discount_coupon import coupon_value_on
 
-		result = apply_coupon_discount(
-			row,
-			cart_total=base_grand,
-			net_total=base_net,
-			items=[dict(line) for line in lines],
-			tax_amount=tax_amount,
-		)
-		value = flt(result.get("discount")) if result.get("valid") else 0.0
+		value = coupon_value_on(row, lines, tax_rate)
 	else:
 		base = base_grand if cstr(row.apply_on) == "Grand Total" else base_net
 		value = flt(base) * pct / 100.0 if pct is not None else flt(row.discount_amount)
@@ -1073,23 +1068,43 @@ def _pos_coupon_value(
 	return max(0.0, min(value, flt(base))), pct
 
 
-def _order_candidate_without_fnf(doc, items, b_line_values, snapshots=None, fnf_like=None) -> bd.Candidate:
-	"""Header discount the invoice would carry if F&F did not apply (scenario B)."""
+def _scenario_b_bases(doc, items, b_line_values) -> tuple[float, float, float]:
+	"""``(net base, grand base, exclusive tax rate)`` of the invoice without F&F.
+
+	Taxes included in the print rate are already inside the lines: only the
+	exclusive tax rows are added (gap audit A I3).
+	"""
+	from posnext_promotions.api.coupon_engine import exclusive_tax_rate
+
 	gross = sum(bd.line_gross(i) for i in items if not i.get("is_free_item"))
 	base_net = max(0.0, gross - sum(b_line_values))
-	tax_amount = flt(doc.get("total_taxes_and_charges") or 0)
-	base_grand = base_net + tax_amount
+	tax_rate = exclusive_tax_rate(doc.get("taxes") or [])
+	return base_net, base_net * (1.0 + tax_rate), tax_rate
+
+
+def _coupon_without_fnf(doc, items, b_line_values, snapshots=None, fnf_like=None):
+	"""``(value, percentage)`` of the invoice's POS Coupon without F&F; ``None`` if not one."""
+	coupon_code = cstr(doc.get("coupon_code")).strip()
+	if not coupon_code:
+		return None
+	base_net, base_grand, tax_rate = _scenario_b_bases(doc, items, b_line_values)
+	lines = _scenario_b_lines(items, snapshots, fnf_like) if snapshots else None
+	return _pos_coupon_value(coupon_code, base_net, base_grand, lines=lines, tax_rate=tax_rate)
+
+
+def _order_candidate_without_fnf(doc, items, b_line_values, snapshots=None, fnf_like=None) -> bd.Candidate:
+	"""Header discount the invoice would carry if F&F did not apply (scenario B)."""
+	base_net, base_grand, _tax_rate = _scenario_b_bases(doc, items, b_line_values)
 	pct = flt(doc.get("additional_discount_percentage") or 0)
 	coupon_code = cstr(doc.get("coupon_code")).strip()
 	value = _header_discount_value(doc)
 	if coupon_code:
-		lines = _scenario_b_lines(items, snapshots, fnf_like) if snapshots else None
-		coupon = _pos_coupon_value(coupon_code, base_net, base_grand, lines=lines, tax_amount=tax_amount)
+		coupon = _coupon_without_fnf(doc, items, b_line_values, snapshots, fnf_like)
 		coupon_pct = None
 		if coupon is not None:
 			# The coupon engine is authoritative for a POS Coupon: it skips lines
 			# that already carry a promotion, so the coupon never stacks on them.
-			value = coupon[0] if lines else max(value, coupon[0])
+			value = coupon[0] if snapshots else max(value, coupon[0])
 			coupon_pct = coupon[1]
 		return bd.Candidate(
 			source=bd.SOURCE_ORDER_COUPON,
@@ -1103,13 +1118,70 @@ def _order_candidate_without_fnf(doc, items, b_line_values, snapshots=None, fnf_
 	return bd.Candidate(source=bd.SOURCE_ORDER_MANUAL, amount=value, percentage=pct or None)
 
 
+def _is_pos_coupon(code) -> bool:
+	code = cstr(code).strip().upper()
+	return bool(code) and bool(frappe.db.table_exists("POS Coupon")) and bool(
+		frappe.db.exists("POS Coupon", {"coupon_code": code})
+	)
+
+
+def _cap_header_at_coupon(doc, items, snapshots, b_line_values, fnf_like) -> bool:
+	"""An unpaid invoice's header discount never exceeds its POS Coupon's value.
+
+	Runs whether or not F&F applied: the client may send any header amount, the
+	server prices the coupon. Never raises the header. True when the invoice's
+	coupon is a POS Coupon. (Paid invoices never get here: see :func:`_freeze_paid_invoice`.)
+	"""
+	if not _is_pos_coupon(doc.get("coupon_code")):
+		return False
+	header = _header_discount_value(doc)
+	if header <= 0 and not flt(doc.get("additional_discount_percentage")):
+		return True
+	coupon = _coupon_without_fnf(doc, items, b_line_values, snapshots, fnf_like)
+	if coupon is not None and bd.money(header) > bd.money(coupon[0]):
+		value = bd.money(coupon[0])
+		doc.additional_discount_percentage = 0
+		doc.discount_amount = value
+		if doc.get("base_discount_amount"):
+			doc.base_discount_amount = bd.money(value * (flt(doc.get("conversion_rate")) or 1.0))
+	return True
+
+
+def _drop_unused_coupon(doc, items) -> None:
+	"""A POS Coupon that gives nothing (no header discount, no line tagged) is not used."""
+	if _header_discount_value(doc) or flt(doc.get("additional_discount_percentage")):
+		return
+	if any(i.get("posnext_coupon_code") for i in items):
+		return
+	doc.coupon_code = None
+
+
 def _resolve_order_level(doc, items, snapshots, b_line_values, ff_payload, fnf_like=None) -> dict | None:
 	"""F&F lines vs an invoice header discount → keep the scenario that saves more.
 
 	A = F&F (with per-line best-of) and **no** header discount.
 	B = no F&F (lines keep their non-F&F discounts) **plus** the header discount.
-	Tie → A (F&F).
+	Tie → A (F&F). A POS Coupon's header is first capped at the coupon's value,
+	and a POS Coupon left giving nothing is dropped (its usage must not count).
 	"""
+	pos_coupon = _cap_header_at_coupon(doc, items, snapshots, b_line_values, fnf_like)
+	decision = _order_level_decision(doc, items, snapshots, b_line_values, ff_payload, fnf_like)
+	if pos_coupon:
+		_drop_unused_coupon(doc, items)
+	return decision
+
+
+def _grand_total_coupon_factor(doc, items, b_line_values) -> float:
+	"""``1 + exclusive tax rate`` when the header is a "Grand Total" POS Coupon, else 1."""
+	code = cstr(doc.get("coupon_code")).strip().upper()
+	if not _is_pos_coupon(code):
+		return 1.0
+	if cstr(frappe.db.get_value("POS Coupon", {"coupon_code": code}, "apply_on")) != "Grand Total":
+		return 1.0
+	return 1.0 + _scenario_b_bases(doc, items, b_line_values)[2]
+
+
+def _order_level_decision(doc, items, snapshots, b_line_values, ff_payload, fnf_like=None) -> dict | None:
 	if not ff_payload.get("applied_count"):
 		return None
 	header_pct = flt(doc.get("additional_discount_percentage") or 0)
@@ -1117,16 +1189,21 @@ def _resolve_order_level(doc, items, snapshots, b_line_values, ff_payload, fnf_l
 	if not header_pct and not header_amt:
 		return None
 
-	a_total = sum(bd.line_discount_value(i, bd.AMOUNT_BASIS_UNIT) for i in items)
+	# Ruling 56: against a "Grand Total" POS Coupon (valued with its exclusive tax) the line
+	# discounts count with the exclusive tax they also save — one unit on both sides.
+	factor = _grand_total_coupon_factor(doc, items, b_line_values)
+	a_total = sum(bd.line_discount_value(i, bd.AMOUNT_BASIS_UNIT) for i in items) * factor
 	order_b = _order_candidate_without_fnf(doc, items, b_line_values, snapshots, fnf_like)
+	capped = bool((ff_payload.get("caps") or {}).get("capped"))
 	fnf_side = bd.Candidate(
 		source=bd.SOURCE_FRIENDS_AND_FAMILY,
 		amount=a_total,
-		percentage=flt(ff_payload.get("discount_percentage")) or None,
+		# A capped F&F is shown by its money value, not the program %.
+		percentage=None if capped else (flt(ff_payload.get("discount_percentage")) or None),
 	)
 	other_side = bd.Candidate(
 		source=order_b.source,
-		amount=sum(b_line_values) + order_b.amount,
+		amount=sum(b_line_values) * factor + order_b.amount,
 		percentage=order_b.percentage,
 		code=order_b.code,
 	)
@@ -1365,17 +1442,18 @@ def _disagreement(
 	return entry
 
 
-def _paid_header_disagreement(
-	doc, items, carried_total: float, applied_count: int, unit: float
-) -> dict | None:
-	"""Header discount on a paid invoice: never stacked on F&F, never above the coupon's value."""
+def _paid_header_disagreement(doc, items, carried_total: float, unit: float) -> dict | None:
+	"""Header discount on a paid invoice: never stacked on F&F, never above the coupon's value.
+
+	The coupon check runs whether or not F&F applies (as the unpaid cap does).
+	"""
 	header_amt = _header_discount_value(doc)
 	header_pct = flt(doc.get("additional_discount_percentage") or 0)
 	if header_amt <= 0 and header_pct <= 0:
 		return None
 	if carried_total > 0:
 		return _disagreement(ff_paid.HEADER_DISCOUNT, carried=carried_total, header=bd.money(header_amt), stacked=1)
-	if not cstr(doc.get("coupon_code")).strip() or not applied_count:
+	if not cstr(doc.get("coupon_code")).strip():
 		return None
 	snapshots = [_snapshot_line(i) for i in items]
 	b_line_values = [bd.line_discount_value(i, bd.AMOUNT_BASIS_UNIT) for i in items]
@@ -1480,9 +1558,10 @@ def _freeze_paid_invoice(doc, items) -> None:
 			if carried < c_amt - tolerance:
 				found.append(_disagreement(ff_paid.MISSING_FNF, item, carried, u_amt, c_amt))
 
-	header = _paid_header_disagreement(doc, items, carried_total, cint(uncapped.get("applied_count")), unit)
+	header = _paid_header_disagreement(doc, items, carried_total, unit)
 	if header:
 		found.append(header)
+	found.extend(_paid_gift_disagreements(items, {id(line[0]) for line in lines if line[1] > 0}))
 
 	if not offline:
 		for entry in found:
@@ -1503,6 +1582,36 @@ def _freeze_paid_invoice(doc, items) -> None:
 		# Not the entitlement payload: the submit log then records what the rows carry.
 		flags.friends_and_family = None
 		flags[ff_paid.DISAGREEMENTS_FLAG] = {"offline": offline, "entries": found}
+
+
+def _paid_gift_disagreements(items, fnf_ids: set) -> list:
+	"""Gifts the gift policy forbids next to this paid invoice's F&F: reported, never removed.
+
+	The policy runs on copies, keyed on the rows that carry F&F (the POS sends no
+	F&F markers, so the default "stamped now" rows would miss them). Each free row it
+	would drop, and each F&F row whose gift stamp it would clear, is one disagreement.
+	"""
+	if not fnf_ids:
+		return []
+	copies = [_row_copy(i) for i in items]
+	keys = ff_compatibility.row_key_list(copies)
+	fnf_keys = {key for key, item in zip(keys, items, strict=True) if id(item) in fnf_ids}
+	kept = [c for c in copies if cint(c.get("is_free_item"))]
+	suppressed = ff_compatibility.enforce_gift_policy(copies, kept, ff_config.resolve(), fnf_keys=fnf_keys)
+	if not suppressed:
+		return []
+	found = []
+	for item, copy in zip(items, copies, strict=True):
+		if cint(copy.get("is_free_item")):
+			gone = all(copy is not k for k in kept)
+		else:
+			gone = (flt(copy.get("discount_amount")), flt(copy.get("discount_percentage"))) != (
+				flt(item.get("discount_amount")),
+				flt(item.get("discount_percentage")),
+			)
+		if gone:
+			found.append(_disagreement(ff_paid.GIFT_WITH_FNF, item, rules=suppressed))
+	return found
 
 
 def _clear_paid_fnf_markers(item) -> None:

@@ -287,6 +287,9 @@ def _disagreement_message(reason: str) -> str:
 		ff_paid.UNDER_DISCOUNT: _("Paid line carries less Friends & Family than the customer is entitled to."),
 		ff_paid.OVER_DISCOUNT: _("Paid line carries more Friends & Family than the program gives."),
 		ff_paid.HEADER_DISCOUNT: _("Paid invoice discount is stacked on Friends & Family or above its coupon."),
+		ff_paid.GIFT_WITH_FNF: _(
+			"Paid invoice keeps a gift that may not be combined with Friends & Family; it was not removed."
+		),
 	}
 	return messages.get(reason) or reason
 

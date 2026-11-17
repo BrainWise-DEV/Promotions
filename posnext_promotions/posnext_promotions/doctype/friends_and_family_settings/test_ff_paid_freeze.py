@@ -45,7 +45,16 @@ from posnext_promotions.promotions.friends_and_family_testing import (
 	ff_settings_guard,
 	give_verified_email,
 )
-from posnext_promotions.test_promotions import ITEM_A, ITEM_B, ITEM_PRICES, _cart_payload, _ctx, _line, _make_rule
+from posnext_promotions.test_promotions import (
+	ITEM_A,
+	ITEM_B,
+	ITEM_C,
+	ITEM_PRICES,
+	_cart_payload,
+	_ctx,
+	_line,
+	_make_rule,
+)
 
 PREFIX = "_T-FFP-"
 RULE_PREFIX = "_PNXT_FFP_"
@@ -194,6 +203,33 @@ class PaidInvoiceFixture:
 		rows = frappe.get_all(ff_ledger.LEDGER_DOCTYPE, filters={"invoice": doc.name}, fields=["amount"])
 		return sum(flt(r.amount) for r in rows)
 
+	def _gift(self, trigger=ITEM_B):
+		"""Free ITEM_C with ``trigger`` (a Free Item gift: the gift policy decides it)."""
+		return _make_rule(
+			f"{RULE_PREFIX}GIFT",
+			apply_on="Item Code",
+			items=[{"item_code": trigger}],
+			price_or_product_discount="Product",
+			rate_or_discount="Discount Percentage",
+			same_item=0,
+			free_item=ITEM_C,
+			min_qty=1,
+			free_qty=1,
+			free_item_uom="Nos",
+			free_item_rate=0,
+		)
+
+	def _free_row(self, rules, item_code=ITEM_C):
+		row = self._row(item_code, rules=rules)
+		row.update({"price_list_rate": 0, "rate": 0, "discount_amount": 0, "is_free_item": 1})
+		return row
+
+	def _gift_invoice(self, **kwargs):
+		"""Paid ITEM_B with F&F 30 % (marked) + its free ITEM_C gift."""
+		rule = self._gift()
+		rows = [self._row(ITEM_B, pct=30, marked=True, rules=rule), self._free_row(rule)]
+		return rule, self._invoice(rows, **kwargs)
+
 	def _bxgy(self):
 		return _make_rule(
 			f"{RULE_PREFIX}BXGY",
@@ -295,6 +331,26 @@ class TestFFPaidFreeze(PaidInvoiceFixture, FrappeTestCase):
 		self.assertIn("Row 1", str(caught.exception))
 		self.assertEqual(self._prices(doc), before)
 		self.assertEqual(doc["items"][0].get(FIELD_DISCOUNT_SOURCE), FNF)  # not stripped
+
+	def test_paid_online_forbidden_gift_logged_not_removed(self):
+		self._settings(allow_free_gift_with_ff=0)
+		rule, doc = self._gift_invoice()
+		before = self._prices(doc)
+		apply_friends_and_family_on_invoice(doc)  # never throws for a gift
+		self.assertEqual(self._prices(doc), before)
+		self.assertEqual([r.is_free_item for r in doc["items"]], [0, 1])
+		self.assertEqual(doc["items"][0].pricing_rules, rule)
+		gift = [e for e in self._entries(doc) if e["reason"] == ff_paid.GIFT_WITH_FNF]
+		self.assertEqual([(e["item_code"], e["rules"]) for e in gift], [(ITEM_C, [rule])])
+		log_invoice_submit(doc)
+		self.assertIn(ff_paid.GIFT_WITH_FNF, [log.reason for log in self._logs(doc, LOG_PAID_DISAGREEMENT)])
+
+	def test_paid_allowed_gift_not_logged(self):
+		self._settings(allow_free_gift_with_ff=1)
+		_rule, doc = self._gift_invoice()
+		apply_friends_and_family_on_invoice(doc)
+		self.assertNotIn(ff_paid.GIFT_WITH_FNF, [e["reason"] for e in self._entries(doc)])
+		self.assertEqual(len(doc["items"]), 2)
 
 	def test_paid_header_discount_not_rewritten(self):
 		doc = self._invoice([self._row(ITEM_B, qty=10)], coupon_code="FFP-COUPON", discount_amount=500)

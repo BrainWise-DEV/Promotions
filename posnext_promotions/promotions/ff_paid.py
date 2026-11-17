@@ -30,6 +30,8 @@ MISSING_FNF = "missing_fnf"
 OVER_DISCOUNT = "over_discount"
 HEADER_DISCOUNT = "header_discount"
 UNDER_DISCOUNT = "paid_under_discount"
+# A gift the gift policy forbids next to F&F: logged only (a paid invoice is never changed).
+GIFT_WITH_FNF = "gift_with_fnf"
 
 # Online, the cashier can still fix the cart: these stop the save.
 ONLINE_BLOCKING = frozenset({OVER_DISCOUNT, COMPATIBILITY, HEADER_DISCOUNT})

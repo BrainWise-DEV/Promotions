@@ -30,6 +30,8 @@ coupon SAVE15 (15%) …") and ``reason: better_discount_exists``.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field, replace
+
 import frappe
 from frappe import _
 from frappe.utils import cstr, flt
@@ -68,7 +70,8 @@ def _neutral_copy(item, ctx):
 def _capped_fnf_candidates(items, customer, posting_date, pos_profile=None) -> dict:
 	"""F&F the customer would get per line *without* the coupon — caps (PN-129) included.
 
-	The coupon then competes with that (possibly cap-reduced) F&F saving.
+	The coupon then competes with that (possibly cap-reduced) F&F saving. A capped
+	line is shown by its money value: its % is neither the program's nor meaningful.
 	"""
 	ctx = restore_context(customer, posting_date, pos_profile)
 	plan = compute_friends_and_family_discounts(
@@ -84,7 +87,7 @@ def _capped_fnf_candidates(items, customer, posting_date, pos_profile=None) -> d
 		candidates[line.get("idx")] = bd.Candidate(
 			source=bd.SOURCE_FRIENDS_AND_FAMILY,
 			amount=flt(line.get("discount_amount")),
-			percentage=flt(line.get("discount_percentage"), 2) or None,
+			percentage=None if line.get("capped") else (flt(line.get("discount_percentage"), 2) or None),
 		)
 	return candidates
 
@@ -109,6 +112,9 @@ def _existing_candidate(item, coupon_code: str) -> bd.Candidate | None:
 
 
 def _coupon_line_amount(update: dict, item) -> float:
+	"""What the coupon itself saves on the line (a stacked line's discount also holds the promotion)."""
+	if update.get("stacked"):
+		return flt(update.get("coupon_only_discount") or 0)
 	pct = flt(update.get("discount_percentage") or 0)
 	if pct > 0:
 		return bd.line_gross(item) * pct / 100.0
@@ -119,62 +125,169 @@ def is_line_level_coupon(coupon) -> bool:
 	return cstr(coupon.get("discount_type")) == "Percentage" and not flt(coupon.get("max_amount"))
 
 
-@ff_money.in_cart_currency
-def resolve_coupon_best_discount(coupon, items, customer=None, posting_date=None, pos_profile=None) -> dict:
-	"""Coupon result restricted to where the coupon is the best single discount."""
+def _coupon_percentage(coupon) -> float | None:
+	return flt(coupon.get("discount_percentage")) if cstr(coupon.get("discount_type")) == "Percentage" else None
+
+
+def _coupon_amounts(coupon, rows, tax_rate: float) -> list[float]:
+	"""Coupon money per row. A "Grand Total" % coupon also saves the exclusive tax on it.
+
+	``max_amount`` caps the total after the tax, as :func:`apply_coupon_discount` does.
+	"""
+	pct = _coupon_percentage(coupon)
+	scale = 1.0 + tax_rate if pct is not None else 1.0
+	amounts = [_coupon_line_amount(update, item) * scale for update, item in rows]
+	cap = flt(coupon.get("max_amount"))
+	total = sum(amounts)
+	if pct is not None and cap and total > cap:
+		amounts = [amount * cap / total for amount in amounts]
+	return amounts
+
+
+def _with_tax(candidate: bd.Candidate | None, tax_rate: float) -> bd.Candidate | None:
+	"""A line-discount candidate in grand-total money: it also saves its exclusive tax."""
+	if candidate is None or not tax_rate:
+		return candidate
+	return replace(candidate, amount=candidate.amount * (1.0 + tax_rate))
+
+
+def _line_updates(result: dict, items) -> list:
+	"""``(line update, its cart line)`` pairs of an ``apply_coupon_to_items`` result."""
+	return [
+		(update, items[update.get("line_key")])
+		for update in result.get("line_updates") or []
+		if update.get("line_key") is not None and update.get("line_key") < len(items)
+	]
+
+
+def coupon_value_on(coupon, lines, tax_rate: float = 0.0) -> float:
+	"""The coupon's money on ``lines`` — the one value rule for the cart and the invoice."""
 	from posnext_promotions.api.coupon_engine import apply_coupon_to_items
 
+	lines = [frappe._dict(dict(line)) for line in lines or []]
+	result = apply_coupon_to_items(coupon, lines)
+	if not result.get("valid"):
+		return 0.0
+	rate = tax_rate if cstr(coupon.get("apply_on")) == "Grand Total" else 0.0
+	return sum(_coupon_amounts(coupon, _line_updates(result, lines), rate))
+
+
+@dataclass
+class CouponDecision:
+	"""Coupon vs F&F (and the discounts already on the lines) for one cart.
+
+	``validate_coupon`` and ``calculate_coupon_discount`` both read this, so they
+	always agree on the winner and on the coupon's value.
+	"""
+
+	coupon_code: str
+	granularity: str
+	result: dict  # apply_coupon_to_items on the lines without their F&F stamp
+	items: list
+	coupon_value: float = 0.0  # what the coupon gives on every line it can take
+	line_decisions: list = field(default_factory=list)
+	order_decision: bd.Decision | None = None
+	kept: list = field(default_factory=list)  # line updates the coupon keeps ("replaces" set)
+	kept_total: float = 0.0
+	fnf_lines: int = 0  # lines where the customer has F&F without the coupon
+	rejection: dict | None = None  # reason + messages when the coupon keeps nothing
+
+	@property
+	def coupon_wins(self) -> bool:
+		return bool(self.kept)
+
+	@property
+	def summary(self) -> dict:
+		return bd.summarize(self.line_decisions, self.order_decision)
+
+
+def _rejection(decision: CouponDecision) -> dict:
+	headline = decision.order_decision or next(
+		(d for d in decision.line_decisions if d.winner_source != bd.SOURCE_COUPON), None
+	)
+	summary = decision.summary
+	msgs = headline.messages() if headline else {"message": summary["message"], "en": "", "ar": ""}
+	return {
+		"reason": REASON_BETTER_DISCOUNT_EXISTS,
+		"message": msgs["message"],
+		"message_en": msgs["en"],
+		"message_ar": msgs["ar"],
+		"customer_message": msgs.get("customer"),
+	}
+
+
+@ff_money.in_cart_currency
+def decide_coupon_vs_fnf(cart, coupon, customer=None, pos_profile=None) -> CouponDecision:
+	"""The one coupon-vs-F&F resolver (PN-128).
+
+	``cart``: ``items``, optional ``posting_date`` and ``taxes`` (the cart's tax rows;
+	without them the POS Profile's tax template decides which taxes are exclusive).
+	Granularity: an uncapped % coupon is compared per line, any other coupon on the
+	order total. On the order the rival is every F&F line (an order coupon replaces
+	F&F on the whole cart) plus the best other discount on the coupon's lines.
+	"""
+	from posnext_promotions.api.coupon_engine import apply_coupon_to_items, exclusive_tax_rate
+
+	cart = cart or {}
+	pos_profile = pos_profile or cart.get("pos_profile")
+	posting_date = cart.get("posting_date")
 	code = cstr(coupon.get("coupon_code")).upper()
-	items = enrich_items_with_catalog([frappe._dict(dict(i)) for i in items or []])
-	eligibility = get_customer_eligibility(customer, posting_date, pos_profile)
-	program = eligibility.program if eligibility.eligible else None
+	items = enrich_items_with_catalog([frappe._dict(dict(i)) for i in cart.get("items") or []])
+	granularity = bd.GRANULARITY_LINE if is_line_level_coupon(coupon) else bd.GRANULARITY_ORDER
 
 	ctx = restore_context(customer, posting_date, pos_profile)
 	result = apply_coupon_to_items(coupon, [_neutral_copy(i, ctx) for i in items])
+	decision = CouponDecision(coupon_code=code, granularity=granularity, result=result, items=items)
 	if not result.get("valid"):
-		result["best_discount"] = bd.summarize([])
-		return result
+		return decision
 
+	eligibility = get_customer_eligibility(customer, posting_date, pos_profile)
+	program = eligibility.program if eligibility.eligible else None
 	fnf_by_line = _capped_fnf_candidates(items, customer, posting_date, pos_profile) if program is not None else {}
-	updates = list(result.get("line_updates") or [])
-	pct = flt(coupon.get("discount_percentage")) if cstr(coupon.get("discount_type")) == "Percentage" else None
-	rows = []
-	for update in updates:
-		idx = update.get("line_key")
-		if idx is None or idx >= len(items):
-			continue
-		item = items[idx]
-		rows.append(
-			(
-				update,
-				item,
-				bd.Candidate(
-					source=bd.SOURCE_COUPON, amount=_coupon_line_amount(update, item), percentage=pct, code=code
-				),
-				fnf_by_line.get(idx),
-				_existing_candidate(item, code),
-			)
-		)
+	decision.fnf_lines = len(fnf_by_line)
 
-	decisions = []
-	order_decision = None
-	if is_line_level_coupon(coupon):
-		kept = []
-		for update, item, coupon_c, fnf_c, existing_c in rows:
-			decision = bd.decide(
-				[fnf_c, existing_c, coupon_c], idx=update.get("line_key"), item_code=item.get("item_code")
-			)
-			decisions.append(decision)
-			if decision.winner_source == bd.SOURCE_COUPON:
-				replaced = bd.pick_best([fnf_c, existing_c])
-				kept.append({**update, "replaces": replaced.source if replaced else None})
+	tax_rate = (
+		exclusive_tax_rate(cart.get("taxes"), pos_profile) if cstr(coupon.get("apply_on")) == "Grand Total" else 0.0
+	)
+	if tax_rate:
+		# Ruling 56: one unit for every candidate — what the customer saves including the
+		# exclusive tax. A line discount also lowers the tax charged on that line.
+		fnf_by_line = {idx: _with_tax(c, tax_rate) for idx, c in fnf_by_line.items()}
+	updates = _line_updates(result, items)
+	amounts = _coupon_amounts(coupon, updates, tax_rate)
+	decision.coupon_value = sum(amounts)
+	pct = _coupon_percentage(coupon)
+	rows = [
+		(
+			update,
+			item,
+			bd.Candidate(source=bd.SOURCE_COUPON, amount=amount, percentage=pct, code=code),
+			fnf_by_line.get(update.get("line_key")),
+			_with_tax(_existing_candidate(item, code), tax_rate),
+		)
+		for (update, item), amount in zip(updates, amounts, strict=True)
+	]
+
+	def replaced(row):
+		best = bd.pick_best([row[3], row[4]])
+		return best.source if best else None
+
+	kept_rows = []
+	if granularity == bd.GRANULARITY_LINE:
+		for row in rows:
+			line = bd.decide([row[3], row[4], row[2]], idx=row[0].get("line_key"), item_code=row[1].get("item_code"))
+			decision.line_decisions.append(line)
+			if line.winner_source == bd.SOURCE_COUPON:
+				kept_rows.append(row)
 	else:
-		coupon_total = sum(r[2].amount for r in rows)
-		fnf_part = 0.0
+		row_keys = {row[0].get("line_key") for row in rows}
+		# F&F on lines the coupon cannot take is lost too when the order coupon wins.
+		fnf_part = sum(c.amount for idx, c in fnf_by_line.items() if idx not in row_keys)
+		fnf_capped = any(c.percentage is None for c in fnf_by_line.values())
 		other_part = 0.0
 		other_source = None
-		for _update, _item, _coupon_c, fnf_c, existing_c in rows:
-			best = bd.pick_best([fnf_c, existing_c])
+		for row in rows:
+			best = bd.pick_best([row[3], row[4]])
 			if best is None:
 				continue
 			if best.source == bd.SOURCE_FRIENDS_AND_FAMILY:
@@ -187,67 +300,74 @@ def resolve_coupon_best_discount(coupon, items, customer=None, posting_date=None
 			bd.Candidate(
 				source=rival_source,
 				amount=fnf_part + other_part,
-				percentage=flt(program.discount_percentage) if fnf_part and program else None,
+				percentage=flt(program.discount_percentage) if fnf_part and program and not fnf_capped else None,
 			)
 			if rival_source != bd.SOURCE_NONE
 			else None
 		)
-		order_decision = bd.decide(
-			[rival, bd.Candidate(source=bd.SOURCE_COUPON, amount=coupon_total, percentage=pct, code=code)],
+		decision.order_decision = bd.decide(
+			[rival, bd.Candidate(source=bd.SOURCE_COUPON, amount=decision.coupon_value, percentage=pct, code=code)],
 			granularity=bd.GRANULARITY_ORDER,
 		)
-		if order_decision.winner_source == bd.SOURCE_COUPON:
-			kept = [
-				{**r[0], "replaces": (bd.pick_best([r[3], r[4]]).source if bd.pick_best([r[3], r[4]]) else None)}
-				for r in rows
-			]
-		else:
-			kept = []
+		if decision.order_decision.winner_source == bd.SOURCE_COUPON:
+			kept_rows = list(rows)
 
-	summary = bd.summarize(decisions, order_decision)
-	result["best_discount"] = summary
+	if not kept_rows:
+		decision.rejection = _rejection(decision)
+		return decision
 
-	if not kept:
-		headline = order_decision or next((d for d in decisions if d.winner_source != bd.SOURCE_COUPON), None)
-		msgs = headline.messages() if headline else {"message": summary["message"], "en": "", "ar": ""}
+	if len(kept_rows) != len(rows):
+		kept_base = sum(bd.line_gross(row[1]) for row in kept_rows)
+		min_amount = flt(coupon.get("min_amount"))
+		if min_amount and kept_base < min_amount:
+			decision.rejection = {
+				"reason": REASON_BETTER_DISCOUNT_EXISTS,
+				"message": _(
+					"Coupon {0} only beats other discounts on items worth {1}, below its minimum of {2}."
+				).format(code, ff_money.fmt(kept_base), ff_money.fmt(min_amount)),
+			}
+			return decision
+
+	decision.kept = [{**row[0], "replaces": replaced(row)} for row in kept_rows]
+	decision.kept_total = sum(row[2].amount for row in kept_rows)
+	return decision
+
+
+@ff_money.in_cart_currency
+def resolve_coupon_best_discount(
+	coupon, items, customer=None, posting_date=None, pos_profile=None, taxes=None
+) -> dict:
+	"""``validate_coupon`` result: the coupon only where it is the best single discount."""
+	decision = decide_coupon_vs_fnf(
+		{"items": items, "posting_date": posting_date, "taxes": taxes}, coupon, customer, pos_profile
+	)
+	result = dict(decision.result)
+	result["coupon_value"] = flt(decision.coupon_value, 6)
+	result["best_discount"] = decision.summary
+	if not result.get("valid"):
+		result["best_discount"] = bd.summarize([])
+		return result
+
+	if decision.rejection:
 		result.update(
 			{
 				"valid": False,
-				"reason": REASON_BETTER_DISCOUNT_EXISTS,
-				"message": msgs["message"],
-				"message_en": msgs["en"],
-				"message_ar": msgs["ar"],
-				"customer_message": msgs.get("customer"),
+				"message_en": None,
+				"message_ar": None,
+				"customer_message": None,
+				**decision.rejection,
 				"line_updates": [],
 				"total_discount": 0,
 			}
 		)
 		return result
 
-	kept_keys = {u.get("line_key") for u in kept}
-	if len(kept) != len(rows):
-		kept_base = sum(bd.line_gross(items[k]) for k in kept_keys)
-		min_amount = flt(coupon.get("min_amount"))
-		if min_amount and kept_base < min_amount:
-			result.update(
-				{
-					"valid": False,
-					"reason": REASON_BETTER_DISCOUNT_EXISTS,
-					"message": _(
-						"Coupon {0} only beats other discounts on items worth {1}, below its minimum of {2}."
-					).format(code, frappe.format_value(kept_base, {"fieldtype": "Currency"}), min_amount),
-					"line_updates": [],
-					"total_discount": 0,
-				}
-			)
-			return result
-
-	total = sum(r[2].amount for r in rows if r[0].get("line_key") in kept_keys)
+	summary = result["best_discount"]
 	result.update(
 		{
-			"line_updates": kept,
-			"eligible_item_codes": [items[k].get("item_code") for k in kept_keys],
-			"total_discount": flt(total, 6),
+			"line_updates": decision.kept,
+			"eligible_item_codes": [decision.items[u.get("line_key")].get("item_code") for u in decision.kept],
+			"total_discount": flt(decision.kept_total, 6),
 			"message": summary["message"] if summary.get("suppressed") else result.get("message"),
 			"message_en": summary.get("message_en"),
 			"message_ar": summary.get("message_ar"),

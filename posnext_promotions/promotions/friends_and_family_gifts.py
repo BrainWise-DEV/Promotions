@@ -166,9 +166,15 @@ def _rule_name_from_free_key(key) -> str:
 	return ""
 
 
-def _clear_line_gift_stamp(item) -> None:
-	"""Undo a paid-line free-unit / GWP stamp so F&F can reclaim the line."""
+def _clear_line_gift_stamp(item, rule_names=None) -> None:
+	"""Undo a paid-line free-unit / GWP stamp so F&F can reclaim the line.
+
+	``rule_names``: the gift rules to detach; the line keeps its other rules
+	(e.g. a Price rule). ``None`` detaches every rule.
+	"""
 	price_list_rate = flt(item.get("price_list_rate") or item.get("rate") or 0)
+	drop = None if rule_names is None else set(rule_names)
+	kept = [] if drop is None else [name for name in _item_rule_names(item) if name not in drop]
 	for key, value in (
 		("discount_amount", 0),
 		("discount_percentage", 0),
@@ -176,7 +182,7 @@ def _clear_line_gift_stamp(item) -> None:
 		("gwp_free_qty", 0),
 		("discount_source", None),
 		("rate", price_list_rate),
-		("pricing_rules", ""),
+		("pricing_rules", ",".join(kept)),
 	):
 		_set(item, key, value)
 

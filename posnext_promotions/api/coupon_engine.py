@@ -471,12 +471,47 @@ def apply_coupon_to_items(coupon, items):
 	}
 
 
-def apply_coupon_discount(coupon, cart_total, net_total=None, items=None, tax_amount=0):
-	"""Calculate discount amount based on coupon configuration (legacy cart-level helper)."""
+def exclusive_tax_rate(taxes=None, pos_profile=None) -> float:
+	"""Fraction the exclusive "On Net Total" tax rows add on top of the line amounts.
+
+	Taxes with ``included_in_print_rate`` are already inside the line amounts, so they
+	add nothing to a "Grand Total" coupon's base. ``taxes`` are the document's (or the
+	cart's) tax rows; ``None`` (a cart that sent none) reads the POS Profile's tax
+	template. Other charge types (Actual, On Previous Row …) are not added.
+	"""
+	if taxes is None:
+		template = frappe.db.get_value("POS Profile", pos_profile, "taxes_and_charges") if pos_profile else None
+		taxes = (
+			frappe.get_all(
+				"Sales Taxes and Charges",
+				filters={"parent": template, "parenttype": "Sales Taxes and Charges Template"},
+				fields=["charge_type", "rate", "included_in_print_rate"],
+			)
+			if template
+			else []
+		)
+	return (
+		sum(
+			flt(row.get("rate"))
+			for row in taxes or []
+			if row.get("charge_type") == "On Net Total" and not cint(row.get("included_in_print_rate"))
+		)
+		/ 100.0
+	)
+
+
+def apply_coupon_discount(coupon, cart_total, net_total=None, items=None, tax_amount=0, tax_rate=0):
+	"""Calculate discount amount based on coupon configuration (legacy cart-level helper).
+
+	With ``items`` the base is the coupon's in-scope, matrix-eligible lines (same scope
+	rule as :func:`apply_coupon_to_items`); a "Grand Total" coupon adds ``tax_rate``
+	(:func:`exclusive_tax_rate`) of that base, plus any ``tax_amount`` passed in.
+	"""
 	from posnext_promotions.api.promotion_exclusions import (
 		PROMOTION_TARGET_COUPON,
 		get_eligible_subtotal,
 		get_excluded_subtotal,
+		get_line_net_amount,
 		mark_item_discount_flags,
 	)
 
@@ -493,13 +528,17 @@ def apply_coupon_discount(coupon, cart_total, net_total=None, items=None, tax_am
 			"promotion_target": PROMOTION_TARGET_COUPON,
 			"excluded_brands": excluded_brands,
 		}
+		in_scope = [item for item in prepared_items if _item_matches_scope(coupon, item)]
+		out_of_scope = sum(
+			get_line_net_amount(item)
+			for item in prepared_items
+			if not cint(item.get("is_free_item")) and not _item_matches_scope(coupon, item)
+		)
+		eligible_base = get_eligible_subtotal(in_scope, **subtotal_kwargs)
+		excluded_base = get_excluded_subtotal(in_scope, **subtotal_kwargs) + out_of_scope
 		if coupon.apply_on == "Grand Total":
-			eligible_base = get_eligible_subtotal(prepared_items, **subtotal_kwargs)
+			eligible_base += eligible_base * flt(tax_rate)
 			eligible_base += flt(tax_amount) if flt(tax_amount) > 0 else 0
-			excluded_base = get_excluded_subtotal(prepared_items, **subtotal_kwargs)
-		else:
-			eligible_base = get_eligible_subtotal(prepared_items, **subtotal_kwargs)
-			excluded_base = get_excluded_subtotal(prepared_items, **subtotal_kwargs)
 		base_amount = eligible_base
 	else:
 		base_amount = cart_total if coupon.apply_on == "Grand Total" else (net_total or cart_total)
