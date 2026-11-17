@@ -6,9 +6,20 @@
 Rules
 -----
 * **Buy X Get Y (BXGY)** and **Routine** (Promotional Scheme of type *Item Level
-  Discount*) are *not eligible* for F&F. Lines matched by such a scheme never
-  receive F&F — they keep their promotion (free units / item-level discount).
-  Other cart lines still get F&F. See :func:`mark_fnf_ineligible_lines` and
+  Discount*) are *never eligible* for F&F, in any case — whatever the
+  Settings (``allow_free_gift_with_ff`` on or off) and whatever the discount
+  % of the promotion vs F&F. Lines matched by such a scheme never receive F&F
+  and are not entered in the best-discount comparison; they keep their
+  promotion (free units / item-level discount). Other cart lines still get
+  F&F. BXGY covers:
+
+  - Product schemes with a same-item free row (Buy 1 Get 1, B2G1, …), even
+    when labelled GWP;
+  - Price Discount schemes that give 100% off a limited number of units
+    (Min/Max price + qty limit, e.g. dev-miraaya "buy one"), whatever their
+    Promotion Type label.
+
+  See :func:`scheme_blocking_kind`, :func:`mark_fnf_ineligible_lines` and
   :func:`line_blocked_by_scheme`.
 * **Allow Free Gift with F&F** (Friends and Family Settings, global, default
   off) controls Free Item, GWP, Gift Pool, Cart Total Gift and Brand Gift:
@@ -74,6 +85,10 @@ _RULE_FIELDS = (
 	"min_qty",
 	"coupon_code_based",
 	"apply_discount_on_price",
+	"min_or_max_discount_qty_limit",
+	"rate_or_discount",
+	"discount_percentage",
+	"rate",
 )
 
 
@@ -91,7 +106,7 @@ def _rule_values(rule_or_name):
 	else:
 		row = rule_or_name
 		name = cstr(row.get("name"))
-		if all(field in row for field in ("same_item", "apply_on", "price_or_product_discount")):
+		if all(field in row for field in _RULE_FIELDS):
 			return row
 	if not name:
 		return row
@@ -147,15 +162,48 @@ def classify_gift_rule(rule) -> str | None:
 	return GIFT_KIND_FREE_ITEM
 
 
+def is_price_bxgy_rule(rule) -> bool:
+	"""Price Discount Buy X Get Y: 100% off a limited number of units (e.g. "buy one").
+
+	A Min/Max price rule with a positive discounted-qty limit whose discount
+	makes those units free (100% or a zero Rate). This is Buy X Get Y, not a
+	flat Routine / Auto percentage, so it must never compete with F&F.
+	"""
+	rule = _rule_values(rule)
+	if not rule:
+		return False
+	if cstr(rule.get("price_or_product_discount") or "Price") != "Price":
+		return False
+	if cstr(rule.get("apply_discount_on_price")) not in ("Min", "Max"):
+		return False
+	if flt(rule.get("min_or_max_discount_qty_limit")) <= 0:
+		return False
+	kind = cstr(rule.get("rate_or_discount") or "Discount Percentage")
+	if kind == "Discount Percentage":
+		return flt(rule.get("discount_percentage")) >= 100.0 - 0.0001
+	if kind == "Rate":
+		return flt(rule.get("rate")) <= 0
+	return False
+
+
+def is_bxgy_rule(rule) -> bool:
+	"""Any Buy X Get Y mechanic (Product same-item free row or Price "buy one")."""
+	return classify_gift_rule(rule) == GIFT_KIND_BXGY or is_price_bxgy_rule(rule)
+
+
 def scheme_blocking_kind(rule) -> str | None:
-	"""``bxgy`` / ``item_level`` when lines under this rule must not get F&F."""
+	"""``bxgy`` / ``item_level`` when lines under this rule must never get F&F.
+
+	Unconditional: does not read ``allow_free_gift_with_ff`` and is checked
+	before the F&F best-discount comparison, so the promotion's % never matters.
+	"""
 	rule = _rule_values(rule)
 	if not rule:
 		return None
 	if cint(rule.get("coupon_code_based")):
 		# Coupons keep the best-discount comparison.
 		return None
-	if classify_gift_rule(rule) == GIFT_KIND_BXGY:
+	if is_bxgy_rule(rule):
 		return SCHEME_KIND_BXGY
 	if (
 		cstr(rule.get("promotion_type")).strip() == PROMOTION_TYPE_ITEM_LEVEL
