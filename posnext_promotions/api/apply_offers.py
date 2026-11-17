@@ -36,12 +36,13 @@ from posnext_promotions.promotions.friends_and_family_apply import (
 	summarize_line_payloads,
 )
 from posnext_promotions.promotions.friends_and_family_caps import FIELD_FNF_REPLACED
-from posnext_promotions.promotions.friends_and_family_gifts import (
-	allow_free_gift_with_ff,
-	fnf_stamped_indices,
-	mark_fnf_ineligible_lines,
-	suppress_incompatible_gifts,
+from posnext_promotions.promotions import ff_config
+from posnext_promotions.promotions.ff_compatibility import (
+	block_ineligible_lines,
+	enforce_gift_policy,
+	row_key_list,
 )
+from posnext_promotions.promotions.friends_and_family_gifts import fnf_stamped_indices
 from posnext_promotions.promotions.schedule import (
 	filter_rules_by_schedule,
 	get_inactive_rules,
@@ -1062,12 +1063,45 @@ def _friends_and_family_response_block(ff_result) -> dict:
 	}
 
 
+def _one_time_rule_used(record, customer, default_customer) -> bool:
+	"""One-time-per-customer rule that may not apply: anonymous sale, or already redeemed.
+
+	Looked up by fields: the usage autoname is ``{customer}:{pricing_rule}``, so a
+	hand-built name check never matched (same filter as ``ff_compatibility``).
+	"""
+	if not cint(record.get("one_time_per_customer")):
+		return False
+	if not customer or customer == default_customer:
+		return True
+	return bool(
+		frappe.db.exists("One Time Customer Offer Usage", {"customer": customer, "pricing_rule": record.name})
+	)
+
+
+def _compat_doc(invoice, customer) -> frappe._dict:
+	"""Doc context for the shared BXGY / Routine rule source (same one invoice validate uses)."""
+	pos_profile = invoice.get("pos_profile")
+	company = invoice.get("company") or (
+		frappe.db.get_value("POS Profile", pos_profile, "company") if pos_profile else None
+	)
+	return frappe._dict(
+		company=company,
+		customer=customer,
+		pos_profile=pos_profile,
+		posting_date=invoice.get("posting_date") or nowdate(),
+		posting_time=invoice.get("posting_time"),
+		selling_price_list=invoice.get("selling_price_list") or invoice.get("price_list"),
+	)
+
+
 def _friends_and_family_only_response(items, prepared_items, customer, invoice) -> dict:
 	"""No promotion applies to the cart — Friends & Family still must.
 
 	Without this the early "no pricing rules" returns skipped F&F entirely, so
 	the POS cart never showed it until the invoice was saved.
 	"""
+	# A BXGY rule blocks its lines even when no offer was selected (Ruling 19).
+	block_ineligible_lines(prepared_items, doc=_compat_doc(invoice, customer))
 	ff_result = apply_friends_and_family_to_items(
 		prepared_items,
 		customer=customer,
@@ -1545,11 +1579,8 @@ def apply_offers(invoice_data, selected_offers=None):
 				# customers who have already redeemed this rule. Dropping the rule
 				# here keeps its discount out of the per-item loop below (which only
 				# applies rules present in rule_map), mirroring the coupon skip above.
-				if record.one_time_per_customer:
-					if not customer or customer == default_customer:
-						continue
-					if frappe.db.exists("One Time Customer Offer Usage", f"{customer}::{record.name}"):
-						continue
+				if _one_time_rule_used(record, customer, default_customer):
+					continue
 
 				# Include both promotional scheme rules and standalone pricing rules
 				rule_map[record.name] = record
@@ -1601,6 +1632,9 @@ def apply_offers(invoice_data, selected_offers=None):
 				)
 				for record in extra_records:
 					if record.coupon_code_based:
+						continue
+					# A selected offer is still one-time: same gate as above.
+					if _one_time_rule_used(record, customer, default_customer):
 						continue
 					rule_map[record.name] = record
 
@@ -1771,7 +1805,9 @@ def apply_offers(invoice_data, selected_offers=None):
 		# Miraaya: Buy X Get Y / Routine (Item Level Discount) lines are not
 		# eligible for F&F. Flag them *before* F&F runs — BXGY free units are only
 		# valued further down, so the paid line would otherwise look undiscounted.
-		mark_fnf_ineligible_lines(prepared_items, rule_map)
+		# One rule source with invoice validate (Ruling 19): rules tagged on the lines plus
+		# every applicable blocking rule, not only the offers the client selected.
+		block_ineligible_lines(prepared_items, doc=_compat_doc(invoice, customer))
 		pre_fnf_items = [frappe._dict(dict(item)) for item in prepared_items]
 		ff_result = apply_friends_and_family_to_items(
 			prepared_items,
@@ -1820,7 +1856,9 @@ def apply_offers(invoice_data, selected_offers=None):
 				_mark_fnf_lost_to_order(ff_result)
 
 		# Paid lines that hold F&F before the gift passes (Allow Free Gift with F&F).
-		fnf_line_indices = fnf_stamped_indices(prepared_items)
+		# Keyed by row (gift passes never reorder prepared_items).
+		line_keys = row_key_list(prepared_items)
+		fnf_line_keys = {line_keys[idx] for idx in fnf_stamped_indices(prepared_items)}
 
 		# Per-item results win on collisions because they already carry full
 		# discount metadata from the per-item engine result.
@@ -1849,11 +1887,11 @@ def apply_offers(invoice_data, selected_offers=None):
 		# Item / GWP / Gift Pool / Brand gift whose trigger line got F&F, or a
 		# cart-total gift on a cart with F&F, is dropped when the setting is off.
 		# BXGY is never dropped here — its lines carry no F&F.
-		gift_suppressed = suppress_incompatible_gifts(
-			fnf_indices=fnf_line_indices,
-			allow_free_gift=allow_free_gift_with_ff(),
-			prepared_items=prepared_items,
-			free_items_map=free_items_map,
+		gift_suppressed = enforce_gift_policy(
+			prepared_items,
+			free_items_map,
+			ff_config.resolve(),
+			fnf_keys=fnf_line_keys,
 			rule_map=rule_map,
 			applied_rules=applied_rules,
 		)

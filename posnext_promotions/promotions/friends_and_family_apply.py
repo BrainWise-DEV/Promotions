@@ -67,6 +67,8 @@ from posnext_promotions.promotions.friends_and_family_caps import (
 	ceil_cents,
 	get_cap_context,
 )
+from posnext_promotions.promotions import ff_compatibility, ff_config
+from posnext_promotions.promotions import friends_and_family_gifts as gifts
 from posnext_promotions.promotions.friends_and_family_gifts import line_blocked_by_scheme
 from posnext_promotions.promotions.friends_and_family_eligibility import (
 	REASON_PROFILE_NOT_ALLOWED,
@@ -1102,6 +1104,48 @@ def _stamp_return_usage(items) -> None:
 		_set_item_attr(row, FIELD_FNF_AMOUNT, -bd.money(abs(flt(row.get("qty"))) * max(0.0, per_unit)))
 
 
+def _remove_invoice_rows(doc, rows) -> None:
+	drop = {id(row) for row in rows}
+	kept = [row for row in doc.get("items") if id(row) not in drop]
+	if isinstance(doc, dict):
+		doc["items"] = kept
+		return
+	doc.set("items", kept)
+	for position, row in enumerate(doc.get("items"), start=1):
+		row.idx = position
+
+
+def _enforce_invoice_gift_policy(doc, items) -> bool:
+	"""Remove free rows the gift policy forbids. True when F&F should be re-run.
+
+	A removed gift's trigger rows lose that gift's rule tag (the policy detaches it).
+	A row whose discount came only from removed gift rules also loses that discount,
+	so F&F can reclaim it, like ``apply_offers`` does after it drops a gift. A row
+	that still carries other rules keeps its discount and those rules.
+	"""
+	free_rows = [row for row in items if cint(row.get("is_free_item"))]
+	if not free_rows:
+		return False
+	# Rules on paid rows that still carry a non-F&F discount, before the policy detaches them.
+	tagged = {
+		id(row): set(gifts._item_rule_names(row))
+		for row in items
+		if not cint(row.get("is_free_item"))
+		and not _is_fnf_stamped(row)
+		and (flt(row.get("discount_percentage")) or flt(row.get("discount_amount")))
+	}
+	kept = list(free_rows)
+	suppressed = set(ff_compatibility.enforce_gift_policy(items, kept, ff_config.resolve()))
+	removed = [row for row in free_rows if all(row is not k for k in kept)]
+	if not removed:
+		return False
+	_remove_invoice_rows(doc, removed)
+	for row in doc.get("items"):
+		if tagged.get(id(row), set()) & suppressed and not gifts._item_rule_names(row):
+			gifts._clear_line_gift_stamp(row)
+	return True
+
+
 def apply_friends_and_family_on_invoice(doc, method=None):
 	"""Sales Invoice / POS Invoice ``validate`` — enforce Settings % and best-only.
 
@@ -1144,6 +1188,8 @@ def apply_friends_and_family_on_invoice(doc, method=None):
 	# Re-open earlier decisions: lines get back the discount F&F replaced.
 	for item in items:
 		_restore_replaced_discount(item)
+	# Buy X Get Y / Routine lines get no F&F (same rule as the cart).
+	ff_compatibility.block_ineligible_lines(items, doc=doc)
 	snapshots = [_snapshot_line(i) for i in items]
 	posting_date = doc.get("posting_date") or nowdate()
 
@@ -1167,6 +1213,20 @@ def apply_friends_and_family_on_invoice(doc, method=None):
 		pos_profile=pos_profile,
 	)
 	order_decision = _resolve_order_level(doc, items, snapshots, b_line_values, ff_payload, fnf_like)
+	# Gift policy after the order-level decision, as on the cart: a gift goes only when
+	# its trigger line kept F&F. The invoice never adds gifts, it only removes them.
+	rerun = _enforce_invoice_gift_policy(doc, items)
+	if rerun:
+		items = doc.get("items")
+		ff_payload = apply_friends_and_family_to_items(
+			items,
+			customer=doc.get("customer"),
+			posting_date=posting_date,
+			amount_basis=bd.AMOUNT_BASIS_UNIT,
+			exclude_invoice=doc.get("name") or None,
+			pos_profile=pos_profile,
+		)
+	items = doc.get("items")
 	if order_decision:
 		ff_payload["best_discount"]["order"] = order_decision
 		ff_payload["best_discount"]["granularity"] = bd.GRANULARITY_ORDER
@@ -1180,6 +1240,6 @@ def apply_friends_and_family_on_invoice(doc, method=None):
 
 	# frappe._dict answers any attribute with None, so test callability.
 	recalc = getattr(doc, "calculate_taxes_and_totals", None)
-	if _invoice_state(doc, items) != before and callable(recalc):
+	if _invoice_state(doc, doc.get("items")) != before and callable(recalc):
 		recalc()
 	return ff_payload

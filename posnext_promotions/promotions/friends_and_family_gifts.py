@@ -8,8 +8,8 @@ Rules
 * **Buy X Get Y (BXGY)** and **Routine** (Promotional Scheme of type *Item Level
   Discount*) are *not eligible* for F&F. Lines matched by such a scheme never
   receive F&F — they keep their promotion (free units / item-level discount).
-  Other cart lines still get F&F. See :func:`mark_fnf_ineligible_lines` and
-  :func:`line_blocked_by_scheme`.
+  Other cart lines still get F&F. See
+  :func:`ff_compatibility.block_ineligible_lines` and :func:`line_blocked_by_scheme`.
 * **Allow Free Gift with F&F** (Friends and Family Settings, global, default
   off) controls Free Item, GWP, Gift Pool, Cart Total Gift and Brand Gift:
 
@@ -145,39 +145,10 @@ def line_blocked_by_scheme(item) -> list[str]:
 
 
 def mark_fnf_ineligible_lines(prepared_items, rule_map) -> set[int]:
-	"""Flag paid lines matched by a BXGY / Routine scheme before F&F runs.
+	"""Wrapper: see :func:`ff_compatibility.block_ineligible_lines`. Returns the positions flagged."""
+	from posnext_promotions.promotions import ff_compatibility
 
-	BXGY free units are valued *after* F&F, so the paid line can look
-	undiscounted at that point (the qty-4 switch to F&F). A line is flagged
-	when the BXGY rule's scope covers it and the line qty reaches the rule's
-	``min_qty`` — independently of whether the free units were already stamped.
-	Routine (item-level) lines carry the rule in ``pricing_rules`` already.
-
-	Returns the indices flagged.
-	"""
-	bxgy_rules = [name for name, row in (rule_map or {}).items() if scheme_blocking_kind(row or name) == SCHEME_KIND_BXGY]
-	flagged: set[int] = set()
-	for idx, item in enumerate(prepared_items or []):
-		if cint(item.get("is_free_item")):
-			_set(item, FIELD_FNF_BLOCKED_BY, "")
-			continue
-		names: list[str] = [
-			rule_name for rule_name in _item_rule_names(item) if scheme_blocking_kind(rule_map.get(rule_name) or rule_name)
-		]
-		qty = _line_qty(item)
-		for rule_name in bxgy_rules:
-			if rule_name in names:
-				continue
-			row = _rule_values(rule_map.get(rule_name) or rule_name) or {}
-			min_qty = flt(row.get("min_qty"))
-			if qty <= 0 or (min_qty and qty < min_qty):
-				continue
-			if _rule_scope_matches(item, rule_name):
-				names.append(rule_name)
-		_set(item, FIELD_FNF_BLOCKED_BY, ",".join(names))
-		if names:
-			flagged.add(idx)
-	return flagged
+	return ff_compatibility.block_ineligible_lines(prepared_items, rule_map or {})
 
 
 def fnf_stamped_indices(prepared_items) -> set[int]:
@@ -220,16 +191,6 @@ def _line_has_gift_stamp(item) -> bool:
 	)
 
 
-def _trigger_got_fnf(rule_name, prepared_items, fnf_indices) -> bool:
-	for idx in fnf_indices:
-		if idx >= len(prepared_items):
-			continue
-		item = prepared_items[idx]
-		if rule_name in _item_rule_names(item) or _rule_scope_matches(item, rule_name):
-			return True
-	return False
-
-
 def suppress_incompatible_gifts(
 	*,
 	fnf_indices,
@@ -244,6 +205,8 @@ def suppress_incompatible_gifts(
 	``fnf_indices``: paid lines that received F&F *before* the gift passes ran.
 	Returns the Pricing Rule names suppressed.
 	"""
+	from posnext_promotions.promotions import ff_compatibility
+
 	fnf_indices = set(fnf_indices or ())
 	if not fnf_indices:
 		return set()
@@ -251,46 +214,13 @@ def suppress_incompatible_gifts(
 		allow_free_gift = allow_free_gift_with_ff()
 	if allow_free_gift:
 		return set()
-
-	suppressed: set[str] = set()
-	for key in list(free_items_map.keys()):
-		rule_name = _rule_name_from_free_key(key)
-		kind = classify_gift_rule(rule_map.get(rule_name) or rule_name) if rule_name else GIFT_KIND_FREE_ITEM
-		if kind not in CONFIGURABLE_GIFT_KINDS:
-			continue
-		if kind == GIFT_KIND_CART_TOTAL or not rule_name or _trigger_got_fnf(rule_name, prepared_items, fnf_indices):
-			free_items_map.pop(key, None)
-			if rule_name:
-				suppressed.add(rule_name)
-
-	# GWP / free-unit stamps placed on a line that had F&F (gift passes run after F&F).
-	for idx in fnf_indices:
-		if idx >= len(prepared_items):
-			continue
-		item = prepared_items[idx]
-		if not _line_has_gift_stamp(item):
-			continue
-		rule_names = _item_rule_names(item)
-		kinds = {classify_gift_rule(rule_map.get(n) or n) for n in rule_names}
-		kinds.discard(None)
-		if not kinds and cstr(item.get("discount_source")) in _GIFT_LINE_SOURCES:
-			kinds = {GIFT_KIND_FREE_ITEM}
-		if kinds & CONFIGURABLE_GIFT_KINDS and GIFT_KIND_BXGY not in kinds:
-			suppressed.update(rule_names)
-			_clear_line_gift_stamp(item)
-
-	if suppressed:
-		# Detach the dropped gift rules from their trigger lines so the POS does
-		# not show them as applied without a gift.
-		for item in prepared_items or []:
-			if cint(item.get("is_free_item")):
-				continue
-			names = _item_rule_names(item)
-			kept = [n for n in names if n not in suppressed]
-			if len(kept) != len(names):
-				_set(item, "pricing_rules", ",".join(kept))
-		if applied_rules is not None:
-			still_used = {rule for (_code, rule) in free_items_map}
-			applied_rules.difference_update(suppressed - still_used)
-
+	keys = ff_compatibility.row_key_list(prepared_items)
+	fnf_keys = {keys[idx] for idx in fnf_indices if idx < len(keys)}
+	snapshot = ff_compatibility.normalize(prepared_items, free_items_map)
+	suppressed, dropped = ff_compatibility._decide_gifts(snapshot, fnf_keys, rule_map or {})
+	for gift in dropped:
+		free_items_map.pop(gift.ref, None)
+	if suppressed and applied_rules is not None:
+		still_used = {rule for (_code, rule) in free_items_map}
+		applied_rules.difference_update(suppressed - still_used)
 	return suppressed
