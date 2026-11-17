@@ -65,6 +65,8 @@ from dataclasses import dataclass, field
 from frappe import _
 from frappe.utils import cstr, flt
 
+from posnext_promotions.promotions import ff_money
+
 # ---- candidate sources ---------------------------------------------------
 
 SOURCE_FRIENDS_AND_FAMILY = "friends_and_family"
@@ -117,8 +119,6 @@ GRANULARITY_ORDER = "order"
 AMOUNT_BASIS_LINE = "line"  # POS cart payloads: discount_amount is the line total
 AMOUNT_BASIS_UNIT = "unit"  # saved invoice rows: ERPNext discount_amount is per unit
 
-MONEY_PRECISION = 2
-
 RULE_PAYLOAD = {
 	"rule": "best_only_no_stacking",
 	"tie_breaker": SOURCE_FRIENDS_AND_FAMILY,
@@ -127,7 +127,8 @@ RULE_PAYLOAD = {
 
 
 def money(value) -> float:
-	return flt(value, MONEY_PRECISION)
+	"""``value`` at the precision of the currency the engine is pricing in."""
+	return ff_money.money(value)
 
 
 # ---- line helpers --------------------------------------------------------
@@ -385,7 +386,7 @@ def _value_text(candidate: Candidate | None) -> str:
 		return "0"
 	if candidate.percentage:
 		return f"{flt(candidate.percentage):g}%"
-	return f"{money(candidate.amount):.2f}"
+	return ff_money.fmt(money(candidate.amount))
 
 
 def build_messages(outcome: str, fnf: Candidate | None, other: Candidate | None) -> dict:

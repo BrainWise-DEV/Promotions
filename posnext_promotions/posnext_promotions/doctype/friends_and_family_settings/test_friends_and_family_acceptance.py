@@ -34,6 +34,7 @@ from posnext_promotions.posnext_promotions.report.friends_and_family_performance
 	execute as run_report,
 )
 from posnext_promotions.promotions import best_discount as bd
+from posnext_promotions.promotions import ff_money
 from posnext_promotions.promotions import friends_and_family_demo
 from posnext_promotions.promotions.friends_and_family_caps import (
 	FIELD_DISCOUNT_SOURCE,
@@ -276,15 +277,31 @@ class TestFriendsAndFamilyAcceptance(FrappeTestCase):
 		self.assertEqual(flt(self._row(doc, "laptop").rate), 1000)
 
 	def test_01c_pos_cart_payload_contract(self):
-		response = apply_offers(
-			{
-				"customer": self.staff,
-				"pos_profile": self.profile,
-				"company": self.company,
-				"posting_date": self.today,
-				"items": self._cart(("laptop", 1), ("headset", 1)),
-			}
-		)
+		from posnext_promotions.api import apply_offers as apply_offers_module
+
+		apply_ff = apply_offers_module.apply_friends_and_family_to_items
+		seen = []
+
+		def spy(*args, **kwargs):
+			# Before the F&F function's own context: what the rest of the request prices in.
+			seen.append(ff_money.current_currency())
+			return apply_ff(*args, **kwargs)
+
+		with patch.object(apply_offers_module, "apply_friends_and_family_to_items", spy):
+			response = apply_offers(
+				{
+					"customer": self.staff,
+					"pos_profile": self.profile,
+					"company": self.company,
+					"posting_date": self.today,
+					"items": self._cart(("laptop", 1), ("headset", 1)),
+				}
+			)
+		# The whole cart request prices in the cart's currency, not only the F&F call.
+		profile_currency = frappe.get_cached_value("POS Profile", self.profile, "currency")
+		self.assertTrue(seen)
+		self.assertEqual(set(seen), {profile_currency or ff_money.company_currency(self.company)})
+		self.assertIsNone(ff_money.current_currency())
 		ff = response["friends_and_family"]
 		self.assertTrue(ff["eligible"])
 		self.assertEqual(ff["discount_percentage"], 30)
@@ -540,7 +557,7 @@ class TestFriendsAndFamilyAcceptance(FrappeTestCase):
 		self.assertEqual(flt(self._row(doc, "laptop").get(FIELD_FNF_AMOUNT)), 100)
 		caps = self._payload(doc)["caps"]
 		self.assertEqual((caps["cap_hit"], caps["fnf_uncapped_total"], caps["fnf_applied_total"]), ("order", 300, 100))
-		self.assertIn("per-order maximum of 100.00", caps["message_en"])
+		self.assertIn(f"per-order maximum of {ff_money.fmt(100, doc.currency)}", caps["message_en"])
 		self.assertTrue(caps["message_ar"])
 		types = [log.log_type for log in self._logs(doc)]
 		self.assertEqual(sorted(types), ["Cap Hit", "Discount Applied"])
@@ -559,11 +576,11 @@ class TestFriendsAndFamilyAcceptance(FrappeTestCase):
 		second = self._sell(self.staff, [("laptop", 1)])
 		self.assertEqual(flt(self._row(second, "laptop").rate), 800)  # 200 left
 		self.assertEqual(self._payload(second)["caps"]["cap_hit"], "monthly")
-		self.assertIn("reduced to 200.00", self._payload(second)["message_en"])
+		self.assertIn(f"reduced to {ff_money.fmt(200, second.currency)}", self._payload(second)["message_en"])
 
 		third = self._sell(self.staff, [("phone", 1)])
 		self.assertEqual(flt(self._row(third, "phone").rate), 500)
-		self.assertIn("Monthly Friends & Family limit of 500.00 reached", self._payload(third)["message_en"])
+		self.assertIn(f"Monthly Friends & Family limit of {ff_money.fmt(500, third.currency)} reached", self._payload(third)["message_en"])
 		self.assertEqual(self._logs(third, item_code=self.items["phone"])[0].log_type, "Cap Hit")
 		self.assertEqual(get_monthly_usage(self.staff, self.today, company=self.company), 500)
 

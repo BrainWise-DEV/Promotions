@@ -35,6 +35,7 @@ from frappe import _
 from frappe.utils import cstr, flt
 
 from posnext_promotions.promotions import best_discount as bd
+from posnext_promotions.promotions import ff_money
 from posnext_promotions.promotions.friends_and_family_apply import (
 	_is_fnf_stamped,
 	_restore_replaced_discount,
@@ -118,6 +119,7 @@ def is_line_level_coupon(coupon) -> bool:
 	return cstr(coupon.get("discount_type")) == "Percentage" and not flt(coupon.get("max_amount"))
 
 
+@ff_money.in_cart_currency
 def resolve_coupon_best_discount(coupon, items, customer=None, posting_date=None, pos_profile=None) -> dict:
 	"""Coupon result restricted to where the coupon is the best single discount."""
 	from posnext_promotions.api.coupon_engine import apply_coupon_to_items

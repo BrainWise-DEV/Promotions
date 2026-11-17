@@ -15,6 +15,7 @@ import frappe
 from frappe import _
 from frappe.utils import cint, cstr, flt, getdate, nowdate
 
+from posnext_promotions.promotions import ff_money
 from posnext_promotions.promotions.schedule import SCHEDULE_FIELDS, to_client_payload as schedule_payload
 from posnext_promotions.promotions.scope import (
 	APPLY_ON_CHILD_DOCTYPE,
@@ -1121,6 +1122,7 @@ def _validate_coupon(
 
 
 @frappe.whitelist()
+@ff_money.in_cart_currency
 def calculate_coupon_discount(
 	coupon_code: str, invoice_data, customer: str | None = None, company: str | None = None
 ):

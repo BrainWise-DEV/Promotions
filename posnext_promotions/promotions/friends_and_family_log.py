@@ -55,7 +55,7 @@ from frappe import _
 from frappe.utils import cint, cstr, flt, now_datetime, nowdate
 
 from posnext_promotions.promotions import best_discount as bd
-from posnext_promotions.promotions import ff_ledger
+from posnext_promotions.promotions import ff_ledger, ff_money
 from posnext_promotions.promotions.friends_and_family_caps import (
 	FIELD_DISCOUNT_SOURCE,
 	FIELD_FNF_AMOUNT,
@@ -271,6 +271,7 @@ def _log_return(doc, items) -> None:
 
 
 @_safe
+@ff_money.in_document_currency
 def log_invoice_submit(doc, method=None):
 	"""Sales Invoice / POS Invoice ``on_submit``."""
 	if cint(doc.get("is_consolidated")):
@@ -345,6 +346,7 @@ def log_invoice_submit(doc, method=None):
 
 
 @_safe
+@ff_money.in_document_currency
 def log_invoice_cancel(doc, method=None):
 	"""Sales Invoice / POS Invoice ``on_cancel`` — flag earlier rows, append reversals."""
 	if cint(doc.get("is_consolidated")):

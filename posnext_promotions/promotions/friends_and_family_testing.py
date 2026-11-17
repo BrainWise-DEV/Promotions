@@ -55,6 +55,8 @@ def ff_settings_guard():
 	meanwhile is written to the log file (not the DB: the transaction may be the
 	reason the body failed) instead of replacing it.
 	"""
+	from posnext_promotions.promotions import ff_money
+
 	snapshot = frappe.get_doc(FF_SETTINGS).as_dict(convert_dates_to_str=False)
 	try:
 		yield
@@ -66,6 +68,9 @@ def ff_settings_guard():
 		raise
 	else:
 		_restore_ff_settings(snapshot)
+	finally:
+		# A test may change Currency / System Settings precision inside the guard.
+		ff_money.clear_cache()
 
 
 def _restore_ff_settings(snapshot: dict) -> None:

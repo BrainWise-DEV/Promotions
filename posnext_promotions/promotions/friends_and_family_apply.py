@@ -67,10 +67,9 @@ from posnext_promotions.promotions.friends_and_family_caps import (
 	allocate,
 	build_cap_payload,
 	cart_cap_basis,
-	ceil_cents,
 	get_cap_context,
 )
-from posnext_promotions.promotions import ff_compatibility, ff_config, ff_ledger, ff_snapshot
+from posnext_promotions.promotions import ff_compatibility, ff_config, ff_ledger, ff_money, ff_snapshot
 from posnext_promotions.promotions import friends_and_family_gifts as gifts
 from posnext_promotions.promotions.friends_and_family_gifts import line_blocked_by_scheme
 from posnext_promotions.promotions.friends_and_family_eligibility import (
@@ -410,14 +409,16 @@ def _capped_line_values(price_list_rate: float, qty: float, line_amount: float, 
 	"""``(actual line saving, net rate, percentage, stored discount_amount)`` for a capped line.
 
 	Saved invoice rows hold a per-unit rate in currency precision, so the rate is
-	rounded **up** to the cent — the line never saves more than its allowance.
+	rounded **up** to the currency's smallest unit — the line never saves more
+	than its allowance.
 	"""
 	gross = price_list_rate * qty
 	if gross <= 0 or qty <= 0:
 		return 0.0, price_list_rate, 0.0, 0.0
 	line_amount = max(0.0, min(flt(line_amount), gross))
 	if amount_basis == bd.AMOUNT_BASIS_UNIT:
-		rate = min(price_list_rate, max(0.0, ceil_cents(price_list_rate - line_amount / qty)))
+		rate = ff_money.ceil_money(price_list_rate - line_amount / qty)
+		rate = min(price_list_rate, max(0.0, rate))
 		stored = bd.money(price_list_rate - rate)
 		actual = bd.money(stored * qty)
 	else:
@@ -795,6 +796,7 @@ def _base_payload(eligibility, program) -> dict:
 	}
 
 
+@ff_money.in_cart_currency
 def compute_friends_and_family_discounts(
 	customer=None,
 	items=None,
@@ -849,6 +851,7 @@ def compute_friends_and_family_discounts(
 	return payload
 
 
+@ff_money.in_cart_currency
 def apply_friends_and_family_to_items(
 	items,
 	customer=None,
@@ -1266,6 +1269,7 @@ def _enforce_invoice_gift_policy(doc, items) -> bool:
 	return True
 
 
+@ff_money.in_document_currency
 def apply_friends_and_family_on_invoice(doc, method=None):
 	"""Sales Invoice / POS Invoice ``validate`` — enforce Settings % and best-only.
 

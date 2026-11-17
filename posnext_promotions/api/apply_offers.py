@@ -36,7 +36,7 @@ from posnext_promotions.promotions.friends_and_family_apply import (
 	summarize_line_payloads,
 )
 from posnext_promotions.promotions.friends_and_family_caps import FIELD_FNF_REPLACED
-from posnext_promotions.promotions import ff_config
+from posnext_promotions.promotions import ff_config, ff_money
 from posnext_promotions.promotions.ff_compatibility import (
 	block_ineligible_lines,
 	enforce_gift_policy,
@@ -1303,6 +1303,7 @@ def _prune_suppressed_rules(applied_rules, ff_result, prepared_items, free_items
 
 
 @frappe.whitelist()
+@ff_money.in_cart_currency
 def apply_offers(invoice_data, selected_offers=None):
 	"""Calculate and apply promotional offers using ERPNext Pricing Rules.
 

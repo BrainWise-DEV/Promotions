@@ -40,14 +40,14 @@ spread **proportionally** over the covered lines where F&F wins. Because a
 smaller F&F can lose to a line's own promotion, the engine re-checks: lines
 where the reduced F&F now loses (tie still → F&F) drop out and the allowance is
 re-spread over the rest (a dropped line is not re-admitted, which keeps the
-loop finite and deterministic). Line amounts are rounded **down** to the cent,
-so the applied total never exceeds the cap.
+loop finite and deterministic). Line amounts are rounded **down** to the
+currency's smallest unit (:mod:`ff_money`), so the applied total never exceeds
+the cap.
 """
 
 from __future__ import annotations
 
 import calendar
-import math
 from dataclasses import dataclass
 
 import frappe
@@ -55,6 +55,7 @@ from frappe import _
 from frappe.utils import flt, getdate, nowdate
 
 from posnext_promotions.promotions import best_discount as bd
+from posnext_promotions.promotions import ff_money
 
 FIELD_FNF_AMOUNT = "posnext_fnf_discount_amount"
 FIELD_DISCOUNT_SOURCE = "posnext_discount_source"
@@ -142,14 +143,6 @@ def ensure_invoice_item_fields() -> None:
 		create_custom_fields(specs, update=True)
 
 
-def floor_cents(value) -> float:
-	return math.floor(flt(value) * 100 + 1e-6) / 100.0
-
-
-def ceil_cents(value) -> float:
-	return math.ceil(flt(value) * 100 - 1e-6) / 100.0
-
-
 def month_bounds(on_date=None) -> tuple:
 	d = getdate(on_date or nowdate())
 	last = calendar.monthrange(d.year, d.month)[1]
@@ -217,6 +210,13 @@ class CapContext:
 	monthly_cap: float = 0.0
 	monthly_used: float = 0.0
 	conversion_rate: float = 1.0
+	# ``None``: the engine's current currency / the invoice currency.
+	currency: str | None = None
+	company_currency: str | None = None
+
+	def __post_init__(self):
+		self.currency = self.currency or ff_money.current_currency()
+		self.company_currency = self.company_currency or self.currency
 
 	@property
 	def active(self) -> bool:
@@ -226,7 +226,7 @@ class CapContext:
 	def monthly_remaining(self) -> float | None:
 		if self.monthly_cap <= 0:
 			return None
-		return max(0.0, bd.money(self.monthly_cap - self.monthly_used))
+		return max(0.0, ff_money.money(self.monthly_cap - self.monthly_used, self.company_currency))
 
 	@property
 	def allowance(self) -> float | None:
@@ -235,7 +235,7 @@ class CapContext:
 		if not limits:
 			return None
 		rate = flt(self.conversion_rate) or 1.0
-		return min(limits) if rate == 1.0 else floor_cents(min(limits) / rate)
+		return min(limits) if rate == 1.0 else ff_money.floor_money(min(limits) / rate, self.currency)
 
 	@property
 	def binding_cap(self) -> str | None:
@@ -267,6 +267,7 @@ def get_cap_context(
 			get_monthly_usage(customer, posting_date, exclude=exclude, company=company) if monthly_cap > 0 else 0.0
 		),
 		conversion_rate=flt(conversion_rate) or 1.0,
+		company_currency=ff_money.company_currency(company),
 	)
 
 
@@ -276,43 +277,49 @@ def allocate(lines, allowance: float) -> dict:
 	Returns ``{idx: capped_amount}`` for lines where (capped) F&F still wins.
 	"""
 	allowance = max(0.0, flt(allowance))
+	floor = ff_money.floor_money
 	winning = [ln for ln in lines if flt(ln[1]) > 0 and bd.money(ln[1]) >= bd.money(ln[2])]
 	factor = 1.0
 	while winning:
 		total = sum(flt(ln[1]) for ln in winning)
 		factor = 1.0 if total <= allowance else (allowance / total if total else 0.0)
-		still = [
-			ln for ln in winning if floor_cents(ln[1] * factor) > 0 and bd.money(floor_cents(ln[1] * factor)) >= bd.money(ln[2])
-		]
+		still = [ln for ln in winning if floor(ln[1] * factor) > 0 and bd.money(floor(ln[1] * factor)) >= bd.money(ln[2])]
 		if len(still) == len(winning):
 			break
 		winning = still
 	if factor >= 1.0:
 		return {ln[0]: flt(ln[1]) for ln in winning}
-	return {ln[0]: floor_cents(ln[1] * factor) for ln in winning}
-
-
-def _fmt(value) -> str:
-	return f"{bd.money(value):,.2f}"
+	return {ln[0]: floor(ln[1] * factor) for ln in winning}
 
 
 def build_cap_payload(ctx: CapContext, uncapped_total: float, applied_total: float) -> dict:
-	"""``caps`` block for API payloads: limits, usage, what was cut and why (EN + AR)."""
+	"""``caps`` block for API payloads: limits, usage, what was cut and why (EN + AR).
+
+	Caps and usage are in the company currency, F&F totals in the invoice currency;
+	each amount is rounded and shown in its own.
+	"""
 	remaining = ctx.monthly_remaining
-	capped = ctx.active and bd.money(applied_total) < bd.money(uncapped_total)
+
+	def company(value) -> float:
+		return ff_money.money(value, ctx.company_currency)
+
+	def invoice(value) -> float:
+		return ff_money.money(value, ctx.currency)
+
+	capped = ctx.active and invoice(applied_total) < invoice(uncapped_total)
 	payload = {
 		"active": ctx.active,
-		"max_discount_per_order": bd.money(ctx.per_order_cap),
-		"max_discount_per_customer_month": bd.money(ctx.monthly_cap),
-		"monthly_used": bd.money(ctx.monthly_used),
+		"max_discount_per_order": company(ctx.per_order_cap),
+		"max_discount_per_customer_month": company(ctx.monthly_cap),
+		"monthly_used": company(ctx.monthly_used),
 		"monthly_remaining": remaining,
 		"allowance": ctx.allowance,
-		"fnf_uncapped_total": bd.money(uncapped_total),
-		"fnf_applied_total": bd.money(applied_total),
+		"fnf_uncapped_total": invoice(uncapped_total),
+		"fnf_applied_total": invoice(applied_total),
 		"capped": bool(capped),
 		"cap_hit": None,
 		"monthly_remaining_after": (
-			max(0.0, bd.money(remaining - flt(applied_total) * (flt(ctx.conversion_rate) or 1.0)))
+			max(0.0, company(remaining - flt(applied_total) * (flt(ctx.conversion_rate) or 1.0)))
 			if remaining is not None
 			else None
 		),
@@ -324,24 +331,30 @@ def build_cap_payload(ctx: CapContext, uncapped_total: float, applied_total: flo
 	if not capped:
 		return payload
 
+	def fmt_company(value) -> str:
+		return ff_money.fmt(company(value), ctx.company_currency)
+
+	def fmt_invoice(value) -> str:
+		return ff_money.fmt(invoice(value), ctx.currency)
+
 	cap_hit = ctx.binding_cap
 	payload["cap_hit"] = cap_hit
-	if cap_hit == CAP_MONTHLY and bd.money(remaining or 0) <= 0:
+	if cap_hit == CAP_MONTHLY and company(remaining or 0) <= 0:
 		en = "Monthly Friends & Family limit of {0} reached — no Friends & Family discount on this order."
 		ar = "تم الوصول إلى الحد الشهري لخصم الأصدقاء والعائلة ({0}) — لن يتم تطبيق الخصم على هذه الفاتورة."
-		args = (_fmt(ctx.monthly_cap),)
+		args = (fmt_company(ctx.monthly_cap),)
 	elif cap_hit == CAP_MONTHLY:
 		en = "Friends & Family discount reduced to {0} — monthly limit {1}, {2} left this month before this order."
 		ar = "تم تخفيض خصم الأصدقاء والعائلة إلى {0} — الحد الشهري {1}، والمتبقي هذا الشهر قبل هذه الفاتورة {2}."
-		args = (_fmt(applied_total), _fmt(ctx.monthly_cap), _fmt(remaining))
+		args = (fmt_invoice(applied_total), fmt_company(ctx.monthly_cap), fmt_company(remaining))
 	else:
 		en = "Friends & Family discount capped at the per-order maximum of {0} (full discount would be {1})."
 		ar = "تم تحديد خصم الأصدقاء والعائلة بالحد الأقصى للفاتورة ({0}) بدلاً من {1}."
-		args = (_fmt(ctx.per_order_cap), _fmt(uncapped_total))
+		args = (fmt_company(ctx.per_order_cap), fmt_invoice(uncapped_total))
 	payload["message_en"] = en.format(*args)
 	payload["message_ar"] = ar.format(*args)
 	payload["message"] = _(en).format(*args)
-	if cap_hit == CAP_MONTHLY and bd.money(remaining or 0) <= 0:
+	if cap_hit == CAP_MONTHLY and company(remaining or 0) <= 0:
 		from posnext_promotions.promotions.friends_and_family_messages import (
 			EVENT_MONTHLY_CAP_REACHED,
 			get_customer_message,

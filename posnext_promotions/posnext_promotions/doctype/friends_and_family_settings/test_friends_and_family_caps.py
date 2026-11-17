@@ -11,6 +11,7 @@ from frappe.utils import flt
 
 from posnext_promotions.promotions.friends_and_family_testing import approved_domain_rows, give_verified_email
 from posnext_promotions.promotions import best_discount as bd
+from posnext_promotions.promotions import ff_money
 from posnext_promotions.promotions import ff_ledger
 from posnext_promotions.promotions.best_discount_coupon import resolve_coupon_best_discount
 from posnext_promotions.promotions.friends_and_family import get_active_program
@@ -266,7 +267,7 @@ class TestFriendsAndFamilyCaps(FrappeTestCase):
 		self.assertEqual(caps["fnf_uncapped_total"], 90)
 		self.assertEqual(caps["fnf_applied_total"], 49.99)
 		self.assertEqual(payload["cap_hit"], CAP_ORDER)
-		self.assertIn("per-order maximum of 50.00", payload["message_en"])
+		self.assertIn(f"per-order maximum of {ff_money.fmt(50, ff_money.default_currency())}", payload["message_en"])
 		self.assertIn("الحد الأقصى للفاتورة", payload["message_ar"])
 		self.assertEqual(payload["best_discount"]["caps"]["cap_hit"], CAP_ORDER)
 
@@ -303,7 +304,7 @@ class TestFriendsAndFamilyCaps(FrappeTestCase):
 		self.assertEqual(caps["monthly_used"], 100)
 		self.assertEqual(caps["monthly_remaining"], 0)
 		self.assertEqual(caps["cap_hit"], CAP_MONTHLY)
-		self.assertIn("Monthly Friends & Family limit of 100.00 reached", payload["message_en"])
+		self.assertIn(f"Monthly Friends & Family limit of {ff_money.fmt(100, ff_money.default_currency())} reached", payload["message_en"])
 		self.assertIn("الحد الشهري", payload["message_ar"])
 		# Other customers are unaffected.
 		other = compute_friends_and_family_discounts(OTHER_CUSTOMER, [self._line()], DATE)
@@ -318,7 +319,7 @@ class TestFriendsAndFamilyCaps(FrappeTestCase):
 		self.assertEqual(caps["allowance"], 20)  # min(order 50, monthly 100 - 80)
 		self.assertEqual(caps["cap_hit"], CAP_MONTHLY)
 		self.assertEqual(caps["monthly_remaining_after"], 0)
-		self.assertIn("reduced to 20.00", payload["message_en"])
+		self.assertIn(f"reduced to {ff_money.fmt(20, ff_money.default_currency())}", payload["message_en"])
 
 	def test_monthly_usage_ledger_rules(self):
 		self._ledger([25])  # counts

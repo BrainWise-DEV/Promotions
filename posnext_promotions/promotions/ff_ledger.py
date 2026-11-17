@@ -43,12 +43,12 @@ import hashlib
 import frappe
 from frappe import _
 from frappe.query_builder.functions import Coalesce, IfNull, Sum
-from frappe.utils import cint, cstr, flt, fmt_money, getdate, now_datetime
+from frappe.utils import cint, cstr, flt, getdate, now_datetime
 from pypika.terms import ExistsCriterion, ValueWrapper, Values
 
-from posnext_promotions.promotions import best_discount as bd
 from posnext_promotions.promotions import ff_config
 from posnext_promotions.promotions import ff_constants as const
+from posnext_promotions.promotions import ff_money
 from posnext_promotions.promotions.friends_and_family_caps import (
 	CAP_MONTHLY,
 	CAP_ORDER,
@@ -305,13 +305,6 @@ def line_fnf_amount(row) -> float:
 # ---- returns ----------------------------------------------------------------
 
 
-def _item_precision(doctype: str, currency: str | None) -> int:
-	from frappe.model.meta import get_field_precision
-
-	field = frappe.get_meta(f"{doctype} Item").get_field(FIELD_FNF_AMOUNT)
-	return get_field_precision(field, currency=currency) if field else bd.MONEY_PRECISION
-
-
 def _original_rows(doc, links: set) -> dict:
 	"""Original rows by name: on ``return_against``, submitted, same customer.
 
@@ -408,7 +401,7 @@ def return_credits(doc, for_update: bool = False) -> list[frappe._dict]:
 	links = {cstr(r.get(link_field)) for r in rows if link_field and r.get(link_field)}
 	originals = _original_rows(doc, links)
 	prior = _prior_credits(doc, set(originals), for_update=for_update)
-	precision = _item_precision(doctype, doc.get("currency"))
+	precision = ff_money.precision_for(ff_money.document_currency(doc))
 	results = []
 	for row in rows:
 		result = frappe._dict(row=row, credit=0.0, original=None, warning=None)
@@ -455,16 +448,6 @@ def _ledger_posting_date(doc):
 	return doc.get("posting_date")
 
 
-def _precision(fieldname: str, currency: str | None) -> int:
-	from frappe.model.meta import get_field_precision
-
-	return get_field_precision(frappe.get_meta(LEDGER_DOCTYPE).get_field(fieldname), currency=currency)
-
-
-def _company_currency(company) -> str | None:
-	return frappe.get_cached_value("Company", company, "default_currency") if company else None
-
-
 def ledger_rows(doc, credits: list | None = None) -> list[dict]:
 	"""Ledger values for each F&F line of ``doc`` (empty when the invoice is not tracked).
 
@@ -473,11 +456,11 @@ def ledger_rows(doc, credits: list | None = None) -> list[dict]:
 	if not is_tracked(doc) or not doc.get("customer"):
 		return []
 	company = doc.get("company")
-	company_currency = _company_currency(company)
-	currency = doc.get("currency") or company_currency
+	company_currency = ff_money.company_currency(company)
+	currency = ff_money.document_currency(doc)
 	conversion_rate = flt(doc.get("conversion_rate")) or 1.0
-	amount_precision = _precision("amount", currency)
-	base_precision = _precision("base_amount", company_currency)
+	amount_precision = ff_money.precision_for(currency)
+	base_precision = ff_money.precision_for(company_currency)
 	period = period_key(_ledger_posting_date(doc))
 	if cint(doc.get("is_return")):
 		# Never from the return row's prices: a crafted price_list_rate would credit anything.
@@ -556,10 +539,6 @@ def record_rows(rows: list[dict]) -> list[dict]:
 # ---- caps at submit ---------------------------------------------------------
 
 
-def _money(value, currency) -> str:
-	return fmt_money(value, currency=currency)
-
-
 def _over(value: float, cap: float, unit: float) -> bool:
 	"""``value`` exceeds ``cap`` by more than one precision unit (per-line rounding)."""
 	return flt(value) > flt(cap) + unit
@@ -572,11 +551,11 @@ def _check_caps(doc, rows, used: float) -> dict | None:
 	program = get_active_program(doc.get("posting_date"))
 	if program is None or not program.has_caps:
 		return None
-	total = bd.money(sum(flt(r["base_amount"]) for r in rows))
+	currency = ff_money.company_currency(doc.get("company"))
+	total = ff_money.money(sum(flt(r["base_amount"]) for r in rows), currency)
 	if total <= 0:
 		return None
-	currency = _company_currency(doc.get("company"))
-	unit = 10 ** -_precision("base_amount", currency)
+	unit = 10 ** -ff_money.precision_for(currency)
 	per_order = flt(program.max_discount_per_order)
 	if per_order > 0 and _over(total, per_order, unit):
 		return {
@@ -586,7 +565,7 @@ def _check_caps(doc, rows, used: float) -> dict | None:
 			"invoice_total": total,
 			"currency": currency,
 			"message": _("Friends & Family discount {0} on this invoice exceeds the per-order cap of {1}.").format(
-				_money(total, currency), _money(per_order, currency)
+				ff_money.fmt(total, currency), ff_money.fmt(per_order, currency)
 			),
 		}
 	monthly = flt(program.max_discount_per_customer_month)
@@ -596,14 +575,14 @@ def _check_caps(doc, rows, used: float) -> dict | None:
 	return {
 		"cap_hit": CAP_MONTHLY,
 		"cap": monthly,
-		"used": bd.money(used),
+		"used": ff_money.money(used, currency),
 		"invoice_total": total,
 		"period_key": period,
 		"currency": currency,
 		"message": _(
 			"Friends & Family discount {0} on this invoice exceeds the customer's remaining monthly allowance: "
 			"{1} of the {2} cap already used in {3}."
-		).format(_money(total, currency), _money(used, currency), _money(monthly, currency), period),
+		).format(ff_money.fmt(total, currency), ff_money.fmt(used, currency), ff_money.fmt(monthly, currency), period),
 	}
 
 
@@ -705,6 +684,7 @@ def _on_submit_return(doc) -> None:
 		_add_to_total(customer, company, period, delta)
 
 
+@ff_money.in_document_currency
 def on_submit(doc, method=None):
 	"""Sales Invoice / POS Invoice ``on_submit``: lock the counter, check the caps, record usage."""
 	if cint(doc.get("is_return")):
