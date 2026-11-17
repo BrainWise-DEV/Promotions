@@ -36,7 +36,10 @@
   "exclusions_section",
   "excluded_items",
   "excluded_item_groups",
-  "excluded_brands"
+  "excluded_brands",
+  "global_rules_section",
+  "on_cap_breach_at_submit",
+  "unclassified_promotion_policy"
  ],
  "fields": [
   {
@@ -241,11 +244,32 @@
    "label": "Excluded Brands",
    "options": "Friends and Family Excluded Brand",
    "description": "Brands listed here stay at standard price when scope is Entire Cart."
+  },
+  {
+   "fieldname": "global_rules_section",
+   "fieldtype": "Section Break",
+   "label": "Global Rules"
+  },
+  {
+   "default": "Allow and log",
+   "description": "What happens when an invoice is submitted with F&F above the customer's remaining cap.",
+   "fieldname": "on_cap_breach_at_submit",
+   "fieldtype": "Select",
+   "label": "On Cap Breach at Submit",
+   "options": "Allow and log\nBlock submit"
+  },
+  {
+   "default": "Compete",
+   "description": "How F&F treats a promotion the classifier cannot place.",
+   "fieldname": "unclassified_promotion_policy",
+   "fieldtype": "Select",
+   "label": "Unclassified Promotion Policy",
+   "options": "Compete\nBlock F&F on line"
   }
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-11-16 14:00:00.000000",
+ "modified": "2026-11-16 16:00:00.000000",
  "modified_by": "Administrator",
  "module": "POSNext Promotions",
  "name": "Friends and Family Settings",
