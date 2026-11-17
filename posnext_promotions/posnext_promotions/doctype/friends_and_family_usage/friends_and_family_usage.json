@@ -61,7 +61,8 @@
    "in_list_view": 1,
    "in_standard_filter": 1,
    "description": "Cap period from the invoice posting date (YYYY-MM). A return uses its original invoice's period.",
-   "read_only": 1
+   "read_only": 1,
+   "search_index": 1
   },
   {
    "fieldname": "column_break_main",
@@ -161,7 +162,7 @@
  "in_create": 1,
  "index_web_pages_for_search": 0,
  "links": [],
- "modified": "2026-11-17 10:00:00.000000",
+ "modified": "2026-11-17 18:00:00.000000",
  "modified_by": "Administrator",
  "module": "POSNext Promotions",
  "name": "Friends and Family Usage",

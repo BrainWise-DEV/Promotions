@@ -53,6 +53,7 @@ from dataclasses import dataclass
 import frappe
 from frappe import _
 from frappe.utils import flt, getdate, nowdate
+from frappe.utils.caching import request_cache
 
 from posnext_promotions.promotions import best_discount as bd
 from posnext_promotions.promotions import ff_money
@@ -149,6 +150,7 @@ def month_bounds(on_date=None) -> tuple:
 	return d.replace(day=1), d.replace(day=last)
 
 
+@request_cache
 def get_monthly_usage(
 	customer: str | None, on_date=None, exclude: str | None = None, company: str | None = None
 ) -> float:
@@ -156,7 +158,8 @@ def get_monthly_usage(
 
 	Reads the usage counter (that company's currency). Caps are per company:
 	``company`` is required whenever there is a customer. No lock: validate may
-	see a stale value; submit re-checks under the counter lock.
+	see a stale value; submit re-checks under the counter lock. Cached for the
+	request; the ledger forgets it whenever it writes a counter.
 	"""
 	from posnext_promotions.promotions import ff_ledger
 

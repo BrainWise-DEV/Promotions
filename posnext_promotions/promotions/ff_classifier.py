@@ -38,7 +38,7 @@ _RULE_FIELDS = (
 
 
 def _rule_values(rule_or_name):
-	"""Rule row with the fields classification needs (loads from DB when missing)."""
+	"""Rule row with the fields classification needs (from the cached Pricing Rule when missing)."""
 	if not rule_or_name:
 		return None
 	if isinstance(rule_or_name, str):
@@ -50,16 +50,8 @@ def _rule_values(rule_or_name):
 			return row
 	if not name:
 		return row
-	cache = getattr(frappe.local, "_fnf_rule_values_cache", None)
-	if cache is None:
-		cache = {}
-		frappe.local._fnf_rule_values_cache = cache
-	if name not in cache:
-		values = None
-		if frappe.db.exists("Pricing Rule", name):
-			values = frappe.db.get_value("Pricing Rule", name, list(_RULE_FIELDS), as_dict=True)
-		cache[name] = values
-	values = cache[name]
+	# None for a missing rule. The document cache is cleared on save and db.set_value.
+	values = frappe.get_cached_value("Pricing Rule", name, list(_RULE_FIELDS), as_dict=True)
 	if values is None:
 		return row
 	merged = frappe._dict(values)
@@ -67,11 +59,6 @@ def _rule_values(rule_or_name):
 		for key, value in dict(row).items():
 			merged.setdefault(key, value)
 	return merged
-
-
-def clear_rule_cache() -> None:
-	if hasattr(frappe.local, "_fnf_rule_values_cache"):
-		frappe.local._fnf_rule_values_cache = {}
 
 
 def is_price_bxgy_rule(rule_or_name) -> bool:

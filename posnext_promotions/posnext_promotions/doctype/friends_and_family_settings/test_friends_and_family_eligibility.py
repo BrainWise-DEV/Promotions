@@ -303,6 +303,8 @@ class TestFriendsandFamilyEligibility(FrappeTestCase):
 					eligibility_module.VERIFIED_EMAIL_FIELD: verified or None,
 				},
 			)
+		# db.set_value skips Customer.on_update, which forgets this request's eligibility.
+		eligibility_module.clear_cache()
 
 	def test_no_enabled_domain_blocks_everyone(self):
 		self._configure()

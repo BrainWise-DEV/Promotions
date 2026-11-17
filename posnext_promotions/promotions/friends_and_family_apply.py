@@ -75,6 +75,7 @@ from posnext_promotions.promotions import (
 	ff_ledger,
 	ff_money,
 	ff_paid,
+	ff_scope,
 	ff_snapshot,
 )
 from posnext_promotions.promotions import friends_and_family_gifts as gifts
@@ -219,39 +220,20 @@ class FriendsAndFamilyLineResult:
 
 
 def enrich_items_with_catalog(items) -> list:
-	"""Backfill ``brand`` / ``item_group`` from Item when the cart payload omits them."""
+	"""Set ``item_group`` / ``brand`` / ``variant_of`` from Item on every line (one cached query).
+
+	Scope fields are always overwritten: a client-sent group or brand never decides
+	coverage (an unknown item code gets none). ``item_name`` is only backfilled.
+	"""
 	items = list(items or [])
-	codes = list({cstr(i.get("item_code")) for i in items if i.get("item_code")})
-	if not codes:
-		return items
-
-	details = {
-		r.name: r
-		for r in frappe.get_all(
-			"Item",
-			filters={"name": ["in", codes]},
-			fields=["name", "item_group", "brand", "item_name"],
-		)
-	}
-
-	def _set(item, key, value):
-		if isinstance(item, dict):
-			item[key] = value
-		elif hasattr(item, "set"):
-			item.set(key, value)
-		else:
-			setattr(item, key, value)
-
+	catalog = ff_scope.item_scope_fields(i.get("item_code") for i in items)
 	for item in items:
-		cached = details.get(cstr(item.get("item_code")))
-		if not cached:
-			continue
-		if not item.get("item_group"):
-			_set(item, "item_group", cached.item_group)
-		if not item.get("brand"):
-			_set(item, "brand", cached.brand)
-		if not item.get("item_name") and cached.item_name:
-			_set(item, "item_name", cached.item_name)
+		row = catalog.get(cstr(item.get("item_code"))) or {}
+		for field in ff_scope.SCOPE_FIELDS:
+			if item.get(field) != row.get(field):
+				_set_item_attr(item, field, row.get(field))
+		if not item.get("item_name") and row.get("item_name"):
+			_set_item_attr(item, "item_name", row["item_name"])
 	return items
 
 
@@ -503,10 +485,10 @@ def promotion_competes_with_ff(item) -> bool:
 	the check ticked, compete on money saved as before.
 	"""
 	for rule in _pricing_rule_names(item):
-		scheme = frappe.db.get_value("Pricing Rule", rule, "promotional_scheme")
+		scheme = frappe.get_cached_value("Pricing Rule", rule, "promotional_scheme")
 		if not scheme:
 			continue
-		flag = frappe.db.get_value("Promotional Scheme", scheme, SCHEME_APPLY_WITH_FF_FIELD)
+		flag = frappe.get_cached_value("Promotional Scheme", scheme, SCHEME_APPLY_WITH_FF_FIELD)
 		if not cint(flag):
 			return False
 	return True
@@ -887,6 +869,7 @@ def apply_friends_and_family_to_items(
 	pos_profile: str | None = None,
 	conversion_rate: float | None = None,
 	company: str | None = None,
+	eligibility=None,
 ) -> dict:
 	"""Mutate ``items``: stamp F&F where it wins, strip stale F&F stamps otherwise.
 
@@ -896,13 +879,14 @@ def apply_friends_and_family_to_items(
 
 	Safe to call repeatedly (idempotent). Returns the same payload shape as
 	:func:`compute_friends_and_family_discounts`, reflecting the post-mutation
-	state.
+	state. ``eligibility``: the caller's :func:`get_customer_eligibility` for the
+	same customer, date and profile (invoice validate computes it once).
 	"""
 	posting_date = posting_date or nowdate()
 	items = enrich_items_with_catalog(list(items or []))
 	signed_for = restore_context(customer, posting_date, pos_profile)
 	restored = {idx for idx, item in enumerate(items) if _restore_replaced_discount(item, signed_for)}
-	eligibility = get_customer_eligibility(customer, posting_date, pos_profile)
+	eligibility = eligibility or get_customer_eligibility(customer, posting_date, pos_profile)
 	program = eligibility.program if eligibility.eligible else None
 	payload = _base_payload(eligibility, program)
 	payload["suppressed_pricing_rules"] = []
@@ -1229,7 +1213,7 @@ def _order_level_decision(doc, items, snapshots, b_line_values, ff_payload, fnf_
 				# keeping whatever else the line carried (Pricing Rules, tags).
 				_strip_line_discount(item)
 		if order_b.source == bd.SOURCE_ORDER_COUPON and not header_pct:
-			doc.discount_amount = order_b.amount
+			doc.discount_amount = ff_money.money(order_b.amount, ff_money.document_currency(doc))
 		ff_payload["applied_count"] = 0
 		ff_payload["reason"] = REASON_ORDER_DISCOUNT_BETTER
 		if ff_payload.get("caps"):
@@ -1509,7 +1493,8 @@ def _freeze_paid_invoice(doc, items) -> None:
 	  entitlement is kept and logged (``paid_under_discount``).
 	"""
 	offline = ff_paid.is_offline(doc)
-	copies = [_row_copy(i) for i in items]
+	# Copies only: a paid invoice keeps its rows; scope comes from Item.
+	copies = enrich_items_with_catalog([_row_copy(i) for i in items])
 	ff_compatibility.block_ineligible_lines(copies, doc=doc)
 	kwargs = {
 		"customer": doc.get("customer"),
@@ -1704,6 +1689,8 @@ def apply_friends_and_family_on_invoice(doc, method=None):
 		return None
 
 	before = _invoice_state(doc, items)
+	# Scope fields from Item before any rule scope is matched.
+	enrich_items_with_catalog(items)
 	# Re-open earlier decisions: lines get back the discount F&F replaced.
 	for item in items:
 		_restore_replaced_discount(item, doc)
@@ -1716,8 +1703,8 @@ def apply_friends_and_family_on_invoice(doc, method=None):
 	pos_profile = doc.get("pos_profile")
 	# Caps are company currency (ledger base_amount); this invoice may be in another.
 	conversion_rate = flt(doc.get("conversion_rate")) or 1.0
-	program = get_customer_eligibility(doc.get("customer"), posting_date, pos_profile)
-	program = program.program if program.eligible else None
+	eligibility = get_customer_eligibility(doc.get("customer"), posting_date, pos_profile)
+	program = eligibility.program if eligibility.eligible else None
 	b_line_values = []
 	fnf_like = []
 	for item in items:
@@ -1734,6 +1721,7 @@ def apply_friends_and_family_on_invoice(doc, method=None):
 		pos_profile=pos_profile,
 		conversion_rate=conversion_rate,
 		company=doc.get("company"),
+		eligibility=eligibility,
 	)
 	order_decision = _resolve_order_level(doc, items, snapshots, b_line_values, ff_payload, fnf_like)
 	# Gift policy after the order-level decision, as on the cart: a gift goes only when
@@ -1750,6 +1738,7 @@ def apply_friends_and_family_on_invoice(doc, method=None):
 			pos_profile=pos_profile,
 			conversion_rate=conversion_rate,
 			company=doc.get("company"),
+			eligibility=eligibility,
 		)
 	items = doc.get("items")
 	if order_decision:

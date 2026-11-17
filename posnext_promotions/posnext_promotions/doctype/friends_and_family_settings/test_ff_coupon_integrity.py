@@ -65,6 +65,10 @@ class TestFFCouponIntegrity(PaidInvoiceFixture, FrappeTestCase):
 		for item_code, qty, price, brand in specs:
 			line = _line(self.ctx, item_code, qty=qty, price_list_rate=price)
 			line["brand"] = brand
+			if brand:
+				# F&F reads scope fields from Item, never from the line (Task 6f).
+				frappe.db.set_value("Item", item_code, "brand", brand)
+				getattr(frappe.local, "request_cache", {}).clear()
 			lines.append(line)
 		return lines
 

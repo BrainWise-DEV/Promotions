@@ -41,6 +41,10 @@ def give_verified_email(customer: str, domain: str = TEST_EMAIL_DOMAIN, email: s
 		if meta.has_field("custom_email_verified_on"):
 			values["custom_email_verified_on"] = now_datetime()
 	frappe.db.set_value("Customer", customer, values, update_modified=False)
+	# db.set_value skips Customer.on_update, which forgets this request's eligibility.
+	from posnext_promotions.promotions.friends_and_family_eligibility import clear_cache
+
+	clear_cache()
 	return email
 
 

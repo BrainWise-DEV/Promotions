@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 
 import frappe
+from frappe import _
 from frappe.utils import cstr
 
 from posnext_promotions.promotions.friends_and_family import get_active_program, profile_allows_ff
@@ -32,6 +33,32 @@ def _parse_items(items):
 	return list(items or [])
 
 
+def _require_seller(pos_profile: str | None = None) -> None:
+	"""Raise PermissionError unless the user may create a Sales Invoice or is a user of an
+	enabled POS Profile (``pos_profile`` when given)."""
+	if frappe.has_permission("Sales Invoice", "create"):
+		return
+	profile = frappe.qb.DocType("POS Profile")
+	profile_user = frappe.qb.DocType("POS Profile User")
+	query = (
+		frappe.qb.from_(profile_user)
+		.join(profile)
+		.on(profile.name == profile_user.parent)
+		.select(profile_user.name)
+		.where(
+			(profile_user.parenttype == "POS Profile")
+			& (profile_user.user == frappe.session.user)
+			& (profile.disabled == 0)
+		)
+		.limit(1)
+	)
+	if pos_profile:
+		query = query.where(profile.name == pos_profile)
+	if query.run():
+		return
+	frappe.throw(_("Not permitted to read the Friends & Family program"), frappe.PermissionError)
+
+
 @frappe.whitelist()
 def get_friends_and_family_program(posting_date: str | None = None, pos_profile: str | None = None) -> dict:
 	"""The live program for ``posting_date`` (today when omitted).
@@ -40,7 +67,11 @@ def get_friends_and_family_program(posting_date: str | None = None, pos_profile:
 	dates, or has nothing in scope. Clients should re-fetch rather than cache
 	indefinitely so admin changes take effect on the next recalculation.
 	A ``pos_profile`` with **Allow F&F** off always gets ``{"active": False}``.
+
+	Only for users who sell: a POS Profile user, or anyone who may create a
+	Sales Invoice (DocPerm decides which roles).
 	"""
+	_require_seller(pos_profile)
 	program = get_active_program(posting_date) if profile_allows_ff(pos_profile) else None
 	if program is None:
 		return {"active": False}

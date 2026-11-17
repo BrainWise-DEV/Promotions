@@ -36,7 +36,6 @@ from posnext_promotions.promotions.ff_classifier import (  # noqa: F401
 	PROMOTION_TYPE_ITEM_LEVEL,
 	_rule_values,
 	classify_promotion,
-	clear_rule_cache,
 	is_gift_kind,
 	is_price_bxgy_rule,
 )

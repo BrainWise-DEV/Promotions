@@ -115,7 +115,17 @@ doc_events = {
 	},
 	"Customer": {
 		"validate": "posnext_promotions.promotions.friends_and_family_eligibility.guard_flag_changes",
-		"on_update": "posnext_promotions.promotions.friends_and_family_log.log_customer_eligibility_change",
+		"on_update": [
+			"posnext_promotions.promotions.friends_and_family_log.log_customer_eligibility_change",
+			"posnext_promotions.promotions.friends_and_family_eligibility.clear_cache",
+		],
+	},
+	# F&F caches what these decide for the rest of the request (and item-group trees in Redis).
+	"POS Profile": {"on_update": "posnext_promotions.promotions.friends_and_family_eligibility.clear_cache"},
+	"Item Group": {
+		"on_update": "posnext_promotions.promotions.ff_scope.clear_item_group_cache",
+		"on_trash": "posnext_promotions.promotions.ff_scope.clear_item_group_cache",
+		"after_rename": "posnext_promotions.promotions.ff_scope.clear_item_group_cache",
 	},
 }
 

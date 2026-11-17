@@ -23,7 +23,6 @@ from posnext_promotions.api.apply_offers import apply_offers
 from posnext_promotions.posnext_promotions.doctype.friends_and_family_settings.test_ff_compatibility import _pos_rows
 from posnext_promotions.promotions import ff_config, ff_ledger, ff_paid
 from posnext_promotions.promotions import friends_and_family_apply as ffa
-from posnext_promotions.promotions import friends_and_family_gifts as gifts
 from posnext_promotions.promotions.friends_and_family_apply import (
 	DISCOUNT_SOURCE_FRIENDS_AND_FAMILY as FNF,
 	apply_friends_and_family_on_invoice,
@@ -79,14 +78,12 @@ class PaidInvoiceFixture:
 		give_verified_email(self.ctx.customer)
 		for name in frappe.get_all("Pricing Rule", filters={"title": ["like", f"{RULE_PREFIX}%"]}, pluck="name"):
 			frappe.delete_doc("Pricing Rule", name, force=True, ignore_permissions=True)
-		gifts.clear_rule_cache()
 		self._seq = 0
 		self._settings()
 
 	def tearDown(self):
 		frappe.db.rollback(save_point="ff_paid")
 		self._stack.close()
-		gifts.clear_rule_cache()
 		ff_config.clear_cache()
 
 	# ---- helpers ------------------------------------------------------------

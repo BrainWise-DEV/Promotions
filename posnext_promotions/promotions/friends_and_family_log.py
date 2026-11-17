@@ -103,24 +103,51 @@ def _json(value) -> str | None:
 	return json.dumps(value, ensure_ascii=False, default=str, indent=1)
 
 
+def log_values(log_type: str, **values) -> dict:
+	"""Field values of one log row (``details`` as JSON)."""
+	details = values.pop("details", None)
+	return {
+		"log_type": log_type,
+		"posting_date": values.pop("posting_date", None) or nowdate(),
+		"timestamp": now_datetime(),
+		"user": frappe.session.user,
+		"details": _json(details) if not isinstance(details, str) else details,
+		**values,
+	}
+
+
 def write_log(log_type: str, **values):
 	"""Insert one log row (system write — cashiers have no permission on the DocType)."""
-	details = values.pop("details", None)
-	doc = frappe.get_doc(
-		{
-			"doctype": LOG_DOCTYPE,
-			"log_type": log_type,
-			"posting_date": values.pop("posting_date", None) or nowdate(),
-			"timestamp": now_datetime(),
-			"user": frappe.session.user,
-			"details": _json(details) if not isinstance(details, str) else details,
-			**values,
-		}
-	)
+	doc = frappe.get_doc({"doctype": LOG_DOCTYPE, **log_values(log_type, **values)})
 	doc.flags.ignore_permissions = True
 	doc.flags.ignore_links = True
 	doc.insert()
 	return doc
+
+
+def write_logs(rows: list[dict]) -> None:
+	"""Insert the log rows of one invoice event (:func:`log_values`) with one ``bulk_insert``.
+
+	Each row is named from the DocType's series, so later single inserts never
+	collide. System write: no permission or link checks, as in :func:`write_log`.
+	All or nothing: one bad row (e.g. an over-long value) loses the event's rows.
+	"""
+	if not rows:
+		return
+	from frappe.model.naming import set_new_name
+
+	now = now_datetime()
+	user = frappe.session.user
+	records = []
+	for values in rows:
+		doc = frappe.new_doc(LOG_DOCTYPE)
+		doc.update(values)
+		set_new_name(doc)
+		doc.owner = doc.modified_by = user
+		doc.creation = doc.modified = now
+		records.append(doc.get_valid_dict(convert_dates_to_str=True, ignore_nulls=False))
+	fields = list(records[0])
+	frappe.db.bulk_insert(LOG_DOCTYPE, fields, [[record.get(f) for f in fields] for record in records])
 
 
 def _safe(fn):
@@ -253,11 +280,12 @@ def _return_warning_message(reason: str, against: str | None) -> str:
 	return _("Return row has no link to its original invoice row: no Friends & Family usage credited.")
 
 
-def _log_return(doc, items) -> None:
+def _return_rows(doc, items) -> list[dict]:
 	"""``Discount Returned`` per F&F return row, plus a zero-amount warning per row that got no credit.
 
 	Rows carry the ORIGINAL invoice's POS Profile: the credit belongs to that sale.
 	"""
+	rows = []
 	against = doc.get("return_against")
 	context = _invoice_context(doc)
 	if against and doc.get("doctype"):
@@ -265,32 +293,37 @@ def _log_return(doc, items) -> None:
 	for row in items:
 		if not _is_fnf_row(row):
 			continue
-		write_log(
-			LOG_RETURNED,
-			**context,
-			**_row_context(row),
-			discount_source=FNF,
-			discount_amount=_row_fnf_amount(row),
-			discount_percentage=flt(row.get(FIELD_FNF_PERCENTAGE)),
-			return_against=against,
-			reason="return",
-			message=_("Friends & Family discount returned against {0}").format(against),
+		rows.append(
+			log_values(
+				LOG_RETURNED,
+				**context,
+				**_row_context(row),
+				discount_source=FNF,
+				discount_amount=_row_fnf_amount(row),
+				discount_percentage=flt(row.get(FIELD_FNF_PERCENTAGE)),
+				return_against=against,
+				reason="return",
+				message=_("Friends & Family discount returned against {0}").format(against),
+			)
 		)
 	flags = getattr(doc, "flags", None)
 	by_name = {row.get("name"): row for row in items}
 	for warning in (flags.get("ff_return_warnings") if flags is not None else None) or []:
 		row = by_name.get(warning.get("invoice_row")) or frappe._dict(warning)
-		write_log(
-			LOG_RETURNED,
-			**context,
-			**_row_context(row),
-			discount_source=FNF,
-			discount_amount=0.0,
-			return_against=against,
-			reason=warning.get("reason"),
-			message=_return_warning_message(warning.get("reason"), against),
-			details=warning,
+		rows.append(
+			log_values(
+				LOG_RETURNED,
+				**context,
+				**_row_context(row),
+				discount_source=FNF,
+				discount_amount=0.0,
+				return_against=against,
+				reason=warning.get("reason"),
+				message=_return_warning_message(warning.get("reason"), against),
+				details=warning,
+			)
 		)
+	return rows
 
 
 def _disagreement_message(reason: str) -> str:
@@ -310,86 +343,97 @@ def _disagreement_message(reason: str) -> str:
 	return messages.get(reason) or reason
 
 
-def _log_paid_disagreements(doc, items) -> None:
+def _paid_disagreement_rows(doc, items) -> list[dict]:
 	"""One row per disagreement the paid-invoice freeze found at validate (never on drafts)."""
 	flags = getattr(doc, "flags", None)
 	found = flags.get(ff_paid.DISAGREEMENTS_FLAG) if flags is not None else None
 	if not found:
-		return
+		return []
+	rows = []
 	log_type = LOG_OFFLINE_DISAGREEMENT if found.get("offline") else LOG_PAID_DISAGREEMENT
 	by_name = {row.get("name"): row for row in items if row.get("name")}
 	by_idx = {row.get("idx"): row for row in items if row.get("idx")}
 	for entry in found.get("entries") or []:
 		row = by_name.get(entry.get("invoice_row")) or by_idx.get(entry.get("idx"))
-		write_log(
-			log_type,
-			**_invoice_context(doc),
-			**(_row_context(row) if row is not None else {}),
-			discount_source=FNF,
-			discount_amount=flt(entry.get("carried")),
-			fnf_uncapped_amount=flt(entry.get("entitled_uncapped")),
-			capped=cint(entry.get("reason") == ff_paid.CAP_EXCEEDED),
-			reason=entry.get("reason"),
-			message=_disagreement_message(entry.get("reason")),
-			details=entry,
+		rows.append(
+			log_values(
+				log_type,
+				**_invoice_context(doc),
+				**(_row_context(row) if row is not None else {}),
+				discount_source=FNF,
+				discount_amount=flt(entry.get("carried")),
+				fnf_uncapped_amount=flt(entry.get("entitled_uncapped")),
+				capped=cint(entry.get("reason") == ff_paid.CAP_EXCEEDED),
+				reason=entry.get("reason"),
+				message=_disagreement_message(entry.get("reason")),
+				details=entry,
+			)
 		)
+	return rows
 
 
 @_safe
 @ff_money.in_document_currency
 def log_invoice_submit(doc, method=None):
-	"""Sales Invoice / POS Invoice ``on_submit``."""
+	"""Sales Invoice / POS Invoice ``on_submit``: every row of the invoice in one insert."""
 	if cint(doc.get("is_consolidated")):
 		return
 	items = doc.get("items") or []
 	if cint(doc.get("is_return")):
-		_log_return(doc, items)
+		write_logs(_return_rows(doc, items))
 		return
+	write_logs(_paid_disagreement_rows(doc, items) + _submit_rows(doc, items))
 
-	_log_paid_disagreements(doc, items)
+
+def _submit_rows(doc, items) -> list[dict]:
+	"""Rows for the decision the validate hook took (``doc.flags.friends_and_family``)."""
 	flags = getattr(doc, "flags", None)
 	payload = flags.get("friends_and_family") if flags is not None else None
 	if not payload:
 		# The validate hook did not run (e.g. non-POS invoice); log what the rows carry.
-		for row in items:
-			if _is_fnf_row(row):
-				write_log(
-					LOG_APPLIED,
-					**_invoice_context(doc),
-					**_row_context(row),
-					discount_source=FNF,
-					discount_amount=_row_fnf_amount(row),
-					discount_percentage=flt(row.get("discount_percentage")),
-					reason="applied",
-				)
-		return
+		return [
+			log_values(
+				LOG_APPLIED,
+				**_invoice_context(doc),
+				**_row_context(row),
+				discount_source=FNF,
+				discount_amount=_row_fnf_amount(row),
+				discount_percentage=flt(row.get("discount_percentage")),
+				reason="applied",
+			)
+			for row in items
+			if _is_fnf_row(row)
+		]
 
 	if payload.get("reason") == "profile_not_allowed":
 		# POS Profile has "Allow F&F" off: F&F is disabled there — nothing to log.
-		return
+		return []
 
 	lines = payload.get("items") or []
 	if not payload.get("eligible") and not any(ln.get("reason") == "stripped" for ln in lines):
-		return
+		return []
 
+	rows = []
 	for row, line in zip(items, lines, strict=False):
 		entry = _line_entry(doc, row, line, payload)
 		if entry:
-			write_log(entry[0], **entry[1])
+			rows.append(log_values(entry[0], **entry[1]))
 
 	caps = payload.get("caps") or {}
 	if caps.get("capped"):
-		write_log(
-			LOG_CAP_HIT,
-			**_invoice_context(doc),
-			discount_source=FNF,
-			discount_amount=flt(caps.get("fnf_applied_total")),
-			fnf_uncapped_amount=flt(caps.get("fnf_uncapped_total")),
-			capped=1,
-			cap_hit=caps.get("cap_hit"),
-			reason="cap_reached",
-			message=caps.get("message_en") or caps.get("message"),
-			details=caps,
+		rows.append(
+			log_values(
+				LOG_CAP_HIT,
+				**_invoice_context(doc),
+				discount_source=FNF,
+				discount_amount=flt(caps.get("fnf_applied_total")),
+				fnf_uncapped_amount=flt(caps.get("fnf_uncapped_total")),
+				capped=1,
+				cap_hit=caps.get("cap_hit"),
+				reason="cap_reached",
+				message=caps.get("message_en") or caps.get("message"),
+				details=caps,
+			)
 		)
 
 	order = (payload.get("best_discount") or {}).get("order")
@@ -397,18 +441,21 @@ def log_invoice_submit(doc, method=None):
 		candidates = {c.get("source"): c for c in order.get("candidates") or []}
 		fnf_c = candidates.pop(FNF, None) or {}
 		other = next(iter(candidates.values()), {})
-		write_log(
-			LOG_ORDER_COMPARISON,
-			**_invoice_context(doc),
-			discount_source=order.get("winner"),
-			discount_amount=flt(fnf_c.get("amount")) if order.get("winner") == FNF else 0.0,
-			comparison_outcome=order.get("outcome"),
-			competing_source=other.get("source"),
-			competing_amount=flt(other.get("amount")),
-			reason="order_comparison",
-			message=order.get("message_en"),
-			details=order,
+		rows.append(
+			log_values(
+				LOG_ORDER_COMPARISON,
+				**_invoice_context(doc),
+				discount_source=order.get("winner"),
+				discount_amount=flt(fnf_c.get("amount")) if order.get("winner") == FNF else 0.0,
+				comparison_outcome=order.get("outcome"),
+				competing_source=other.get("source"),
+				competing_amount=flt(other.get("amount")),
+				reason="order_comparison",
+				message=order.get("message_en"),
+				details=order,
+			)
 		)
+	return rows
 
 
 @_safe
@@ -422,20 +469,25 @@ def log_invoice_cancel(doc, method=None):
 		where reference_doctype = %s and reference_name = %s and is_cancelled = 0""",
 		(doc.get("doctype"), doc.get("name")),
 	)
-	for row in doc.get("items") or []:
-		if not _is_fnf_row(row):
-			continue
-		write_log(
-			LOG_REVERSED,
-			**_invoice_context(doc),
-			**_row_context(row),
-			discount_source=FNF,
-			discount_amount=-_row_fnf_amount(row),
-			return_against=doc.get("return_against"),
-			reason="cancelled",
-			is_cancelled=1,
-			message=_("Invoice {0} cancelled — Friends & Family discount reversed").format(doc.get("name")),
-		)
+	write_logs(
+		[
+			log_values(
+				LOG_REVERSED,
+				**_invoice_context(doc),
+				**_row_context(row),
+				discount_source=FNF,
+				discount_amount=-_row_fnf_amount(row),
+				return_against=doc.get("return_against"),
+				reason="cancelled",
+				is_cancelled=1,
+				message=_("Invoice {0} cancelled — Friends & Family discount reversed").format(
+					doc.get("name")
+				),
+			)
+			for row in doc.get("items") or []
+			if _is_fnf_row(row)
+		]
+	)
 
 
 # ---- customer eligibility -------------------------------------------------

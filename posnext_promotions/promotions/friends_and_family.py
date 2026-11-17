@@ -22,7 +22,9 @@ from dataclasses import dataclass
 
 import frappe
 from frappe.utils import cint, cstr, flt, getdate, nowdate
+from frappe.utils.caching import request_cache
 
+from posnext_promotions.promotions.ff_scope import scope_brand, scope_item_group, scope_keys
 from posnext_promotions.promotions.scope import get_item_group_with_descendants
 
 SETTINGS_DOCTYPE = "Friends and Family Settings"
@@ -72,7 +74,7 @@ class FriendsAndFamilyProgram:
 
 		Order:
 		  1. Free / GWP lines are never covered.
-		  2. Explicit excluded items.
+		  2. Explicit excluded items (a variant's template counts as the variant).
 		  3. Excluded item groups (incl. descendants).
 		  4. Scope inclusion (Entire Cart / Brand / Item Group / Item Code).
 		  5. For Entire Cart only: excluded brands.
@@ -80,15 +82,17 @@ class FriendsAndFamilyProgram:
 		if item.get("is_free_item"):
 			return COVER_FREE_ITEM
 
-		item_code = cstr(item.get("item_code"))
-		if item_code and item_code in self.excluded_items:
+		# ``variant_of`` / ``item_group`` / ``brand`` come from Item (ff_scope), never the client.
+		codes = scope_keys(item.get("item_code"), item.get("variant_of"))
+		if any(code in self.excluded_items for code in codes):
 			return COVER_EXCLUDED_ITEM
 
-		item_group = cstr(item.get("item_group"))
+		# A variant with a blank group / brand is matched on its template's.
+		item_group = scope_item_group(item)
 		if item_group and item_group in self.excluded_item_groups:
 			return COVER_EXCLUDED_ITEM_GROUP
 
-		brand = cstr(item.get("brand"))
+		brand = scope_brand(item)
 
 		if self.discount_scope == SCOPE_ENTIRE_CART:
 			if brand and brand in self.excluded_brands:
@@ -102,7 +106,7 @@ class FriendsAndFamilyProgram:
 			return COVER_OK if item_group in self.item_groups else COVER_OUT_OF_SCOPE
 
 		if self.discount_scope == SCOPE_ITEM_CODE:
-			return COVER_OK if item_code in self.items else COVER_OUT_OF_SCOPE
+			return COVER_OK if any(code in self.items for code in codes) else COVER_OUT_OF_SCOPE
 
 		return COVER_OUT_OF_SCOPE
 
@@ -143,8 +147,19 @@ def get_settings():
 	return frappe.get_cached_doc(SETTINGS_DOCTYPE)
 
 
+def forget_request_cache(*fns) -> None:
+	"""Drop what the ``@request_cache`` functions ``fns`` cached in this request (after a write they read)."""
+	cache = getattr(frappe.local, "request_cache", None)
+	if not cache:
+		return
+	for fn in fns:
+		# request_cache keys its entries by the undecorated function.
+		cache.pop(getattr(fn, "__wrapped__", fn), None)
+
+
+@request_cache
 def profile_allows_ff(pos_profile) -> bool:
-	"""Whether F&F may run on ``pos_profile`` (the **Allow F&F** check).
+	"""Whether F&F may run on ``pos_profile`` (the **Allow F&F** check). Cached for the request.
 
 	No profile (desk / API calls without one), an unknown profile, or a site
 	where the field is not installed yet all mean "allowed", so existing setups

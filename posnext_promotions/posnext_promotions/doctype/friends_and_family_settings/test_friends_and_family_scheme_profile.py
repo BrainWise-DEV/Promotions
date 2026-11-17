@@ -42,6 +42,7 @@ from posnext_promotions.promotions.friends_and_family_eligibility import (
 	get_customer_eligibility,
 )
 from posnext_promotions.promotions.friends_and_family_log import LOG_DOCTYPE, log_invoice_submit
+from posnext_promotions.promotions import friends_and_family_eligibility
 
 DATE = nowdate()
 FF_GROUP = "_Test FF Scheme Customer Group"
@@ -54,6 +55,11 @@ RULE_WITHOUT_SCHEME = "_Test FF Rule Without Scheme"
 def _first_company():
 	return frappe.defaults.get_global_default("company") or frappe.db.get_value("Company", {})
 
+
+def _set_allow(profile, value):
+	"""Allow F&F as an admin changes it: db.set_value skips the hook, so forget this request's answer."""
+	frappe.db.set_value("POS Profile", profile, "allow_friends_family", value)
+	friends_and_family_eligibility.clear_cache()
 
 class TestFriendsAndFamilySchemeAndProfile(FrappeTestCase):
 	@classmethod
@@ -170,8 +176,8 @@ class TestFriendsAndFamilySchemeAndProfile(FrappeTestCase):
 		if not name:
 			self.skipTest("no POS Profile on the site")
 		old = frappe.db.get_value("POS Profile", name, "allow_friends_family")
-		frappe.db.set_value("POS Profile", name, "allow_friends_family", allow)
-		self.addCleanup(lambda: frappe.db.set_value("POS Profile", name, "allow_friends_family", old))
+		_set_allow(name, allow)
+		self.addCleanup(_set_allow, name, old)
 		return name
 
 	# ---- fields exist -------------------------------------------------------
@@ -258,7 +264,7 @@ class TestFriendsAndFamilySchemeAndProfile(FrappeTestCase):
 		self.assertTrue(profile_allows_ff("_No Such POS Profile_"))
 		name = self._profile(1)
 		self.assertTrue(profile_allows_ff(name))
-		frappe.db.set_value("POS Profile", name, "allow_friends_family", 0)
+		_set_allow(name, 0)
 		self.assertFalse(profile_allows_ff(name))
 
 	def test_profile_allowed_applies_normally(self):
@@ -316,7 +322,7 @@ class TestFriendsAndFamilySchemeAndProfile(FrappeTestCase):
 		apply_friends_and_family_to_items([line], customer=ELIGIBLE, posting_date=DATE, pos_profile=name)
 		self.assertEqual(line.discount_source, DISCOUNT_SOURCE_FRIENDS_AND_FAMILY)
 
-		frappe.db.set_value("POS Profile", name, "allow_friends_family", 0)
+		_set_allow(name, 0)
 		payload = apply_friends_and_family_to_items(
 			[line], customer=ELIGIBLE, posting_date=DATE, pos_profile=name
 		)
@@ -347,7 +353,7 @@ class TestFriendsAndFamilySchemeAndProfile(FrappeTestCase):
 		self.assertEqual(frappe.db.count(LOG_DOCTYPE), before)
 
 		# Same invoice on an allowed profile gets F&F.
-		frappe.db.set_value("POS Profile", name, "allow_friends_family", 1)
+		_set_allow(name, 1)
 		doc.flags = frappe._dict()
 		row.discount_percentage = 0
 		apply_friends_and_family_on_invoice(doc)

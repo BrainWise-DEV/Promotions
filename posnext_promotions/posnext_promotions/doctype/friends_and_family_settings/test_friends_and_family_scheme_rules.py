@@ -39,12 +39,10 @@ class TestFriendsAndFamilySchemeRules(FrappeTestCase):
 		frappe.db.savepoint("ff_scheme_rules")
 		for name in frappe.get_all("Pricing Rule", filters={"title": ["like", "_PNXT_FF_%"]}, pluck="name"):
 			frappe.delete_doc("Pricing Rule", name, force=True, ignore_permissions=True)
-		gifts.clear_rule_cache()
 		self._settings()
 
 	def tearDown(self):
 		frappe.db.rollback(save_point="ff_scheme_rules")
-		gifts.clear_rule_cache()
 
 	def _settings(self, **values):
 		doc = frappe.get_single("Friends and Family Settings")
@@ -184,7 +182,6 @@ class TestFriendsAndFamilySchemeRules(FrappeTestCase):
 		if promotion_type is not None and frappe.get_meta("Pricing Rule").has_field("promotion_type"):
 			frappe.db.set_value("Pricing Rule", rule, "promotion_type", promotion_type)
 			frappe.clear_document_cache("Pricing Rule", rule)
-		gifts.clear_rule_cache()
 		return rule
 
 	@staticmethod
@@ -241,7 +238,6 @@ class TestFriendsAndFamilySchemeRules(FrappeTestCase):
 			self._settings(allow_free_gift_with_ff=allow)
 			# 10% < F&F 30%: best-discount would pick F&F, the rule must not.
 			rule = self._routine("_PNXT_FF_ROUTINE_ALLOW", 10)
-			gifts.clear_rule_cache()
 			resp = self._apply([(ITEM_A, 2), (ITEM_B, 1)], [rule])
 			msg = f"allow={allow}"
 			line = self._item(resp, ITEM_A)

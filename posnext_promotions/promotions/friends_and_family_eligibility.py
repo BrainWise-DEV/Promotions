@@ -32,10 +32,12 @@ from dataclasses import dataclass
 
 import frappe
 from frappe import _
-from frappe.utils import cint, cstr
+from frappe.utils import cint, cstr, getdate, nowdate
+from frappe.utils.caching import request_cache
 
 from posnext_promotions.promotions.friends_and_family import (
 	FriendsAndFamilyProgram,
+	forget_request_cache,
 	get_active_program,
 	get_settings,
 	profile_allows_ff,
@@ -199,9 +201,29 @@ def get_customer_eligibility(
 ) -> CustomerEligibility:
 	"""Whether ``customer`` gets Friends & Family on ``on_date`` (today when omitted).
 
-	Eligibility is approved email domain + OTP-verified email only.
+	Eligibility is approved email domain + OTP-verified email only. Computed once
+	per request for the same customer, date and profile (:func:`clear_cache` after
+	a write it reads).
 	"""
-	customer = cstr(customer).strip() or None
+	return _cached_eligibility(
+		cstr(customer).strip() or None, getdate(on_date or nowdate()), cstr(pos_profile).strip() or None
+	)
+
+
+@request_cache
+def _cached_eligibility(customer: str | None, on_date, pos_profile: str | None) -> CustomerEligibility:
+	return _compute_eligibility(customer, on_date, pos_profile)
+
+
+def clear_cache(doc=None, method=None) -> None:
+	"""Forget this request's eligibility and Allow-F&F answers.
+
+	Customer / POS Profile ``on_update``; Settings saves clear every request cache.
+	"""
+	forget_request_cache(_cached_eligibility, profile_allows_ff)
+
+
+def _compute_eligibility(customer: str | None, on_date, pos_profile: str | None) -> CustomerEligibility:
 	if not profile_allows_ff(pos_profile):
 		return CustomerEligibility(customer=customer, eligible=False, reason=REASON_PROFILE_NOT_ALLOWED)
 	if not customer:

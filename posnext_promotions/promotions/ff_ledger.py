@@ -57,7 +57,9 @@ from posnext_promotions.promotions.friends_and_family_caps import (
 	FIELD_FNF_PERCENTAGE,
 	FIELD_FNF_PROGRAM,
 	INVOICE_DOCTYPES,
+	get_monthly_usage,
 )
+from posnext_promotions.promotions.friends_and_family import forget_request_cache
 
 LEDGER_DOCTYPE = "Friends and Family Usage"
 TOTAL_DOCTYPE = "Friends and Family Usage Total"
@@ -106,10 +108,10 @@ def ensure_ledger_unique_key() -> None:
 			frappe.db.sql_ddl(f"alter table `{table}` add unique index `{UNIQUE_KEY}` ({cols})")
 		if not frappe.db.has_index(table, PERIOD_INDEX):
 			frappe.db.sql_ddl(f"alter table `{table}` add index `{PERIOD_INDEX}` (`customer`, `period_key`)")
-		if not frappe.db.has_index(table, PERIOD_ONLY_INDEX):
-			# The rebuild's locking SUM per period locks only that period's rows.
-			frappe.db.sql_ddl(f"alter table `{table}` add index `{PERIOD_ONLY_INDEX}` (`period_key`)")
-		_ensure_original_row_index(table)
+		# period_key: the rebuild's locking SUM per period locks only that period's rows.
+		# original_row: the return path forces this index by name.
+		for column in ("period_key", "original_row"):
+			_ensure_search_index(table, column)
 	if frappe.db.table_exists(TOTAL_DOCTYPE, cached=False):
 		table = f"tab{TOTAL_DOCTYPE}"
 		# SHOW INDEX lists a key's columns in order; Column_name is the 5th field.
@@ -123,20 +125,23 @@ def ensure_ledger_unique_key() -> None:
 			frappe.db.sql_ddl(f"alter table `{table}` add unique index `{TOTAL_UNIQUE_KEY}` ({fields})")
 
 
-def _ensure_original_row_index(table: str) -> None:
-	"""``original_row`` (``search_index``) under the name the return path forces: ``original_row_index``.
+def _ensure_search_index(table: str, column: str) -> None:
+	"""A ``search_index`` column's index under one name on every site: ``<column>_index``.
 
-	Frappe names a ``search_index`` index ``original_row`` when CREATE TABLE makes it
-	(fresh install) and ``original_row_index`` when ALTER adds the column later. The
-	CREATE name is renamed, so one index exists under one name on every site, and
-	Frappe's own sync (which checks indexes by column) neither adds nor drops one.
+	Frappe names a ``search_index`` index ``<column>`` when CREATE TABLE makes it
+	(fresh install) and ``<column>_index`` when ALTER adds it later. The CREATE name
+	is renamed, so one index exists under one name, and Frappe's own sync (which
+	checks indexes by column) neither adds nor drops one. The DocField must keep
+	``search_index``, or each schema sync drops the index. RENAME INDEX needs
+	MariaDB 10.5.2+.
 	"""
-	if not frappe.db.has_column(LEDGER_DOCTYPE, "original_row") or frappe.db.has_index(table, ORIGINAL_ROW_INDEX):
+	name = f"{column}_index"
+	if not frappe.db.has_column(table.removeprefix("tab"), column) or frappe.db.has_index(table, name):
 		return
-	if frappe.db.has_index(table, "original_row"):
-		frappe.db.sql_ddl(f"alter table `{table}` rename index `original_row` to `{ORIGINAL_ROW_INDEX}`")
+	if frappe.db.has_index(table, column):
+		frappe.db.sql_ddl(f"alter table `{table}` rename index `{column}` to `{name}`")
 	else:
-		frappe.db.sql_ddl(f"alter table `{table}` add index `{ORIGINAL_ROW_INDEX}` (`original_row`)")
+		frappe.db.sql_ddl(f"alter table `{table}` add index `{name}` (`{column}`)")
 
 
 # ---- periods ----------------------------------------------------------------
@@ -185,6 +190,12 @@ def _upsert_total(name: str, customer: str, company: str, period_key: str, base_
 	else:
 		query = query.on_duplicate_key_update(T.name, T.name)
 	query.run()
+	_forget_usage()
+
+
+def _forget_usage() -> None:
+	"""A counter changed: this request's cached monthly usage is stale."""
+	forget_request_cache(get_monthly_usage)
 
 
 def _busy(customer):
@@ -233,6 +244,7 @@ def _add_to_total(customer: str, company: str, period_key: str, delta: float) ->
 		.set(T.modified, now_datetime())
 		.where(T.name == total_name(customer, company, period_key))
 	).run()
+	_forget_usage()
 
 
 def _recorded_for_invoice(doctype: str, invoice: str) -> float:
@@ -807,6 +819,7 @@ def rebuild_totals(period_key: str) -> None:
 		(
 			frappe.qb.update(T).set(T.base_amount, 0).set(T.modified, now_datetime()).where(T.name.isin(stale))
 		).run()
+		_forget_usage()
 
 
 def backfill_return_links() -> int:

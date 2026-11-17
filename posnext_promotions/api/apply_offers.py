@@ -36,7 +36,7 @@ from posnext_promotions.promotions.friends_and_family_apply import (
 	summarize_line_payloads,
 )
 from posnext_promotions.promotions.friends_and_family_caps import FIELD_FNF_REPLACED
-from posnext_promotions.promotions import ff_config, ff_money
+from posnext_promotions.promotions import ff_config, ff_money, ff_scope
 from posnext_promotions.promotions.ff_compatibility import (
 	block_ineligible_lines,
 	enforce_gift_policy,
@@ -1313,10 +1313,13 @@ def apply_offers(invoice_data, selected_offers=None):
 	                When provided, results are filtered to only include these rules.
 	                ERPNext handles all conflict resolution based on priority.
 	"""
+	if isinstance(invoice_data, str):
+		invoice_data = json.loads(invoice_data or "{}")
+	# Outside the try: a PermissionError must not become "Error applying offers".
+	customer = cstr((invoice_data or {}).get("customer")).strip()
+	if customer and frappe.db.exists("Customer", customer):
+		frappe.has_permission("Customer", "read", doc=customer, throw=True)
 	try:
-		if isinstance(invoice_data, str):
-			invoice_data = json.loads(invoice_data or "{}")
-
 		invoice = frappe._dict(invoice_data or {})
 		items = invoice.get("items") or []
 
@@ -1344,16 +1347,11 @@ def apply_offers(invoice_data, selected_offers=None):
 		if profile.ignore_pricing_rule:
 			return {"items": items}
 
-		# Batch fetch all item details in a single query (reduces N queries to 1)
-		item_codes = list({item.get("item_code") for item in items if item.get("item_code")})
-		item_details_map = {}
-		if item_codes:
-			item_records = frappe.get_all(
-				"Item",
-				filters={"name": ["in", item_codes]},
-				fields=["name", "item_name", "item_group", "brand", "stock_uom"],
-			)
-			item_details_map = {r.name: r for r in item_records}
+		# Item details for every line in one query, cached for the request (F&F reuses it).
+		item_details_map = {
+			code: frappe._dict(row)
+			for code, row in ff_scope.item_scope_fields(item.get("item_code") for item in items).items()
+		}
 
 		pricing_items = []
 		index_map = []
@@ -1381,19 +1379,12 @@ def apply_offers(invoice_data, selected_offers=None):
 			cached = item_details_map.get(item_code)
 			if cached:
 				item.item_name = item.get("item_name") or cached.item_name
-				item.item_group = item.get("item_group") or cached.item_group
-				item.brand = item.get("brand") or cached.brand
 				item.stock_uom = item.get("stock_uom") or cached.stock_uom
 
-			# Backfill catalog attributes onto the line itself. The cart payload
-			# carries no item_group / brand, and rule scope matching reads them
-			# straight off prepared_items — without this, every Item Group and
-			# Brand rule silently matches nothing.
-			if cached:
-				if not item.get("item_group"):
-					item.item_group = cached.item_group
-				if not item.get("brand"):
-					item.brand = cached.brand
+			# Scope fields always come from Item, never from the client: rule scope
+			# matching reads them straight off prepared_items. An unknown item has none.
+			for field in ff_scope.SCOPE_FIELDS:
+				item[field] = cached.get(field) if cached else None
 
 			if item.get("is_free_item"):
 				continue
@@ -1408,8 +1399,8 @@ def apply_offers(invoice_data, selected_offers=None):
 						"name": item.get("name") or f"POS-{idx}",
 						"item_code": item_code,
 						"item_name": (cached.item_name if cached else item.get("item_name")),
-						"item_group": (cached.item_group if cached else item.get("item_group")),
-						"brand": (cached.brand if cached else item.get("brand")),
+						"item_group": item.get("item_group"),
+						"brand": item.get("brand"),
 						"qty": qty,
 						"stock_qty": qty * conversion_factor,
 						"conversion_factor": conversion_factor,

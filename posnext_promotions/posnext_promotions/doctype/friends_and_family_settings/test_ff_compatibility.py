@@ -129,13 +129,11 @@ class TestFFCompatibility(FrappeTestCase):
 		frappe.db.savepoint("ff_compat")
 		for name in frappe.get_all("Pricing Rule", filters={"title": ["like", f"{PREFIX}%"]}, pluck="name"):
 			frappe.delete_doc("Pricing Rule", name, force=True, ignore_permissions=True)
-		gifts.clear_rule_cache()
 		self._settings()
 
 	def tearDown(self):
 		frappe.db.rollback(save_point="ff_compat")
 		self._stack.close()
-		gifts.clear_rule_cache()
 		ff_config.clear_cache()
 
 	def _settings(self, **values):
@@ -200,7 +198,6 @@ class TestFFCompatibility(FrappeTestCase):
 				self.skipTest("Pricing Rule.promotion_type custom field missing")
 			frappe.db.set_value("Pricing Rule", rule, "promotion_type", promotion_type)
 			frappe.clear_document_cache("Pricing Rule", rule)
-			gifts.clear_rule_cache()
 		return rule
 
 	def _row(self, item_code, qty=1, rules="", free=False, idx=None):
@@ -533,7 +530,6 @@ class TestFFCompatibility(FrappeTestCase):
 		rule = self._price_rule(ITEM_B)
 		frappe.db.set_value("Pricing Rule", rule, "price_or_product_discount", "")
 		frappe.clear_document_cache("Pricing Rule", rule)
-		gifts.clear_rule_cache()
 		self.assertEqual(ff_compatibility.classify_promotion(rule), "unclassified")
 		row = self._row(ITEM_B, 1, rule)
 		row.update({"discount_percentage": 10, "discount_amount": 8, "rate": 72})
