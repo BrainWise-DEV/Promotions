@@ -135,6 +135,53 @@ class TestFriendsAndFamilyGiftClassification(FrappeTestCase):
 			)
 		)
 
+	def test_price_bxgy_buy_one_is_blocked_regardless_of_label(self):
+		base = dict(
+			price_or_product_discount="Price",
+			rate_or_discount="Discount Percentage",
+			discount_percentage=100,
+			apply_discount_on_price="Min",
+			min_or_max_discount_qty_limit=1,
+			min_qty=2,
+			apply_on="Brand",
+			same_item=0,
+		)
+		for label in ("", "Item Level Discount", "Auto Discount", "GWP"):
+			rule = _rule(promotion_type=label, **base)
+			self.assertTrue(gifts.is_price_bxgy_rule(rule), label)
+			self.assertEqual(gifts.scheme_blocking_kind(rule), gifts.SCHEME_KIND_BXGY, label)
+		# Free via Rate 0 on Max-priced units is BXGY too.
+		self.assertTrue(
+			gifts.is_price_bxgy_rule(
+				_rule(**{**base, "rate_or_discount": "Rate", "rate": 0, "apply_discount_on_price": "Max"})
+			)
+		)
+		# Not BXGY: partial % on the cheapest unit, no qty limit, or no Min/Max.
+		for extra in (
+			{"discount_percentage": 50},
+			{"min_or_max_discount_qty_limit": 0},
+			{"apply_discount_on_price": ""},
+		):
+			rule = _rule(**{**base, **extra})
+			self.assertFalse(gifts.is_price_bxgy_rule(rule), extra)
+			self.assertIsNone(gifts.scheme_blocking_kind(rule), extra)
+
+	def test_blocking_ignores_allow_free_gift_setting(self):
+		bxgy = _rule(price_or_product_discount="Product", same_item=1, apply_on="Item Code")
+		buy_one = _rule(
+			price_or_product_discount="Price",
+			rate_or_discount="Discount Percentage",
+			discount_percentage=100,
+			apply_discount_on_price="Min",
+			min_or_max_discount_qty_limit=1,
+		)
+		routine = _rule(promotion_type="Item Level Discount", price_or_product_discount="Price", apply_on="Item Code")
+		for allow in (False, True):
+			with patch.object(gifts, "allow_free_gift_with_ff", return_value=allow):
+				self.assertEqual(gifts.scheme_blocking_kind(bxgy), gifts.SCHEME_KIND_BXGY)
+				self.assertEqual(gifts.scheme_blocking_kind(buy_one), gifts.SCHEME_KIND_BXGY)
+				self.assertEqual(gifts.scheme_blocking_kind(routine), gifts.SCHEME_KIND_ITEM_LEVEL)
+
 	def _rule_map(self):
 		return {
 			"PR-FREE": _rule(name="PR-FREE", price_or_product_discount="Product", same_item=0, apply_on="Item Code"),
