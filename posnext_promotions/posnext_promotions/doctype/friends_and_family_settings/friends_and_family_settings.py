@@ -33,6 +33,11 @@ class FriendsandFamilySettings(Document):
 
 	def _validate_percentage(self):
 		percentage = self.discount_percentage
+		if not cint(self.enabled):
+			# The kill switch always saves: a blank rate is stored as 0 (the field is mandatory).
+			if percentage in (None, ""):
+				self.discount_percentage = 0
+			return
 		if percentage is None:
 			frappe.throw(_("Discount Percentage is required"))
 		if percentage < 0 or percentage > 100:

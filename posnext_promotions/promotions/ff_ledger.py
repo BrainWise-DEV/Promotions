@@ -48,7 +48,7 @@ from pypika.terms import ExistsCriterion, ValueWrapper, Values
 
 from posnext_promotions.promotions import ff_config
 from posnext_promotions.promotions import ff_constants as const
-from posnext_promotions.promotions import ff_money
+from posnext_promotions.promotions import ff_money, ff_paid
 from posnext_promotions.promotions.friends_and_family_caps import (
 	CAP_MONTHLY,
 	CAP_ORDER,
@@ -697,7 +697,8 @@ def on_submit(doc, method=None):
 	used = lock_usage(customer, company, period) - _recorded_for_invoice(doc.get("doctype"), doc.get("name"))
 	breach = _check_caps(doc, rows, max(0.0, used))  # clamp on read only
 	block = const.CAP_BREACH_POLICIES[1]
-	if breach and ff_config.resolve().on_cap_breach_at_submit.value == block:
+	# An offline sale already happened (the customer has left): log, never block.
+	if breach and ff_config.resolve().on_cap_breach_at_submit.value == block and not ff_paid.is_offline(doc):
 		frappe.throw(breach["message"], title=_("Friends & Family cap exceeded"))
 	record_rows(rows)
 	if breach:

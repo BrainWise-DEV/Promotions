@@ -28,6 +28,10 @@ What is logged, and when
 
   Drafts are never logged (they churn on every save); only what was really
   sold. Ineligible customers with nothing stripped produce no rows.
+* **Paid invoices** (Task 6c) — the validate hook never re-prices them; each
+  disagreement with the entitlement is one ``Offline Disagreement`` (offline
+  sync) or ``Paid Disagreement`` (payment collected online) row at submit, with
+  the reason code in ``reason`` and ``details.reason``.
 * **Returns** (``is_return`` submit) — ``Discount Returned`` per F&F row with
   the negative amount, ``return_against`` and the original invoice's POS
   Profile; a zero-amount ``Discount Returned`` warning per row that may have
@@ -55,7 +59,7 @@ from frappe import _
 from frappe.utils import cint, cstr, flt, now_datetime, nowdate
 
 from posnext_promotions.promotions import best_discount as bd
-from posnext_promotions.promotions import ff_ledger, ff_money
+from posnext_promotions.promotions import ff_ledger, ff_money, ff_paid
 from posnext_promotions.promotions.friends_and_family_caps import (
 	FIELD_DISCOUNT_SOURCE,
 	FIELD_FNF_AMOUNT,
@@ -74,6 +78,9 @@ LOG_ELIGIBILITY_REMOVED = "Eligibility Removed"
 LOG_REVERSED = "Discount Reversed"
 LOG_RETURNED = "Discount Returned"
 LOG_SETTINGS_CHANGED = "Settings Changed"
+# Paid invoices (Task 6c): the rows disagree with the entitlement; kept as paid.
+LOG_OFFLINE_DISAGREEMENT = "Offline Disagreement"
+LOG_PAID_DISAGREEMENT = "Paid Disagreement"
 
 FNF = "friends_and_family"
 
@@ -270,6 +277,45 @@ def _log_return(doc, items) -> None:
 		)
 
 
+def _disagreement_message(reason: str) -> str:
+	messages = {
+		ff_paid.NOT_ELIGIBLE: _("Paid line carries Friends & Family, but the customer is not eligible."),
+		ff_paid.PROGRAM_INACTIVE: _("Paid line carries Friends & Family, but the program is not active."),
+		ff_paid.COMPATIBILITY: _("Paid line carries Friends & Family on a line a promotion or gift owns."),
+		ff_paid.CAP_EXCEEDED: _("Paid invoice carries more Friends & Family than the customer's remaining cap."),
+		ff_paid.MISSING_FNF: _("Paid line carries less Friends & Family than the customer is entitled to."),
+		ff_paid.UNDER_DISCOUNT: _("Paid line carries less Friends & Family than the customer is entitled to."),
+		ff_paid.OVER_DISCOUNT: _("Paid line carries more Friends & Family than the program gives."),
+		ff_paid.HEADER_DISCOUNT: _("Paid invoice discount is stacked on Friends & Family or above its coupon."),
+	}
+	return messages.get(reason) or reason
+
+
+def _log_paid_disagreements(doc, items) -> None:
+	"""One row per disagreement the paid-invoice freeze found at validate (never on drafts)."""
+	flags = getattr(doc, "flags", None)
+	found = flags.get(ff_paid.DISAGREEMENTS_FLAG) if flags is not None else None
+	if not found:
+		return
+	log_type = LOG_OFFLINE_DISAGREEMENT if found.get("offline") else LOG_PAID_DISAGREEMENT
+	by_name = {row.get("name"): row for row in items if row.get("name")}
+	by_idx = {row.get("idx"): row for row in items if row.get("idx")}
+	for entry in found.get("entries") or []:
+		row = by_name.get(entry.get("invoice_row")) or by_idx.get(entry.get("idx"))
+		write_log(
+			log_type,
+			**_invoice_context(doc),
+			**(_row_context(row) if row is not None else {}),
+			discount_source=FNF,
+			discount_amount=flt(entry.get("carried")),
+			fnf_uncapped_amount=flt(entry.get("entitled_uncapped")),
+			capped=cint(entry.get("reason") == ff_paid.CAP_EXCEEDED),
+			reason=entry.get("reason"),
+			message=_disagreement_message(entry.get("reason")),
+			details=entry,
+		)
+
+
 @_safe
 @ff_money.in_document_currency
 def log_invoice_submit(doc, method=None):
@@ -281,6 +327,7 @@ def log_invoice_submit(doc, method=None):
 		_log_return(doc, items)
 		return
 
+	_log_paid_disagreements(doc, items)
 	flags = getattr(doc, "flags", None)
 	payload = flags.get("friends_and_family") if flags is not None else None
 	if not payload:

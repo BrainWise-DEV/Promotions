@@ -69,9 +69,17 @@ from posnext_promotions.promotions.friends_and_family_caps import (
 	cart_cap_basis,
 	get_cap_context,
 )
-from posnext_promotions.promotions import ff_compatibility, ff_config, ff_ledger, ff_money, ff_snapshot
+from posnext_promotions.promotions import (
+	ff_compatibility,
+	ff_config,
+	ff_ledger,
+	ff_money,
+	ff_paid,
+	ff_snapshot,
+)
 from posnext_promotions.promotions import friends_and_family_gifts as gifts
 from posnext_promotions.promotions.friends_and_family_gifts import line_blocked_by_scheme
+from posnext_promotions.promotions.ff_paid import is_paid  # noqa: F401  (public: Task 6c interface)
 from posnext_promotions.promotions.friends_and_family_eligibility import (
 	REASON_PROFILE_NOT_ALLOWED,
 	get_customer_eligibility,
@@ -680,13 +688,20 @@ def _plan_lines(
 	conversion_rate: float | None = None,
 	pos_profile: str | None = None,
 	company: str | None = None,
+	ignore_caps: bool = False,
 ) -> tuple:
 	"""Per-line decisions with PN-129 caps applied. Returns ``(results, cap context, uncapped total)``.
 
 	Caps are company currency and per company; ``conversion_rate`` turns them into
 	this order's currency. ``None`` (cart) = the POS Profile's company and rate,
-	looked up only when caps are set.
+	looked up only when caps are set. ``ignore_caps``: the full entitlement (paid
+	invoice check), no cap lookup.
 	"""
+	if ignore_caps:
+		results = [
+			_evaluate_line(item, program, idx=idx, amount_basis=amount_basis) for idx, item in enumerate(items)
+		]
+		return results, CapContext(), sum(r.discount_amount for r in results if r.applies)
 	if conversion_rate is None:
 		if program.has_caps:
 			profile_company, conversion_rate = cart_cap_basis(pos_profile, posting_date)
@@ -806,11 +821,13 @@ def compute_friends_and_family_discounts(
 	pos_profile: str | None = None,
 	conversion_rate: float | None = None,
 	company: str | None = None,
+	ignore_caps: bool = False,
 ) -> dict:
 	"""Per-line F&F decision for ``customer`` + cart ``items`` on ``posting_date``.
 
 	Does not mutate ``items``. The returned ``discount_percentage`` (header and
 	per applying line) always comes from Settings — never from the request.
+	``ignore_caps``: the entitlement before PN-129 caps.
 	"""
 	posting_date = posting_date or nowdate()
 	signed_for = restore_context(customer, posting_date, pos_profile)
@@ -839,7 +856,16 @@ def compute_friends_and_family_discounts(
 		return payload
 
 	results, ctx, uncapped_total = _plan_lines(
-		items, program, customer, posting_date, amount_basis, exclude_invoice, conversion_rate, pos_profile, company
+		items,
+		program,
+		customer,
+		posting_date,
+		amount_basis,
+		exclude_invoice,
+		conversion_rate,
+		pos_profile,
+		company,
+		ignore_caps=ignore_caps,
 	)
 	caps = build_cap_payload(ctx, uncapped_total, _applied_total(results))
 	applied = sum(1 for r in results if r.applies)
@@ -1269,6 +1295,249 @@ def _enforce_invoice_gift_policy(doc, items) -> bool:
 	return True
 
 
+# ---- paid invoices (Task 6c) ------------------------------------------------
+
+# Line reasons that mean "a scheme or gift owns this line": F&F on it is a compatibility breach.
+_COMPATIBILITY_LINE_REASONS = frozenset({REASON_SCHEME_NOT_ELIGIBLE, REASON_PROTECTED})
+
+
+def _row_copy(item) -> frappe._dict:
+	return frappe._dict(item.as_dict() if callable(getattr(item, "as_dict", None)) else dict(item))
+
+
+def _line_tolerance(item, unit: float) -> float:
+	"""One currency unit per unit sold: saved rows hold a per-unit rate rounded to the currency."""
+	return unit * max(1.0, abs(_line_qty(item)))
+
+
+def _carried_fnf(item, value: float, uncapped: float, capped: float, tolerance: float) -> float:
+	"""F&F the paid row carries, valued from its persisted prices (ERPNext order, as the ledger).
+
+	A row with an F&F marker carries its whole discount as F&F. The POS sends no
+	marker, so an unmarked row counts as F&F only when it has no Pricing Rule or
+	coupon tag and its discount is what the program gives it (full or capped).
+	Any other unmarked discount is a competitor the unpaid path would keep too.
+	"""
+	if value <= 0:
+		return 0.0
+	if _looks_like_fnf_stamp(item, None, bd.AMOUNT_BASIS_UNIT):
+		return value
+	if bd.has_pricing_rules(item) or item.get("posnext_coupon_code") or uncapped <= 0:
+		return 0.0
+	if abs(value - uncapped) <= tolerance or (capped > 0 and abs(value - capped) <= tolerance):
+		return value
+	return 0.0
+
+
+def _stamp_paid_fnf_audit(item, amount: float, percentage: float) -> None:
+	"""Audit markers only (ledger, log, reports). Prices and discounts stay as paid."""
+	_set_item_attr(item, FIELD_DISCOUNT_SOURCE, DISCOUNT_SOURCE_FRIENDS_AND_FAMILY)
+	_set_item_attr(item, FIELD_FNF_AMOUNT, bd.money(amount))
+	_set_item_attr(item, FIELD_FNF_PERCENTAGE, flt(percentage))
+	_set_item_attr(item, FIELD_FNF_PROGRAM, None)
+
+
+def _over_reason(payload: dict, line: dict) -> str:
+	"""Why a row may not carry the F&F it carries."""
+	if not payload.get("eligible"):
+		return (
+			ff_paid.PROGRAM_INACTIVE if payload.get("reason") == REASON_PROGRAM_INACTIVE else ff_paid.NOT_ELIGIBLE
+		)
+	if line.get("reason") in _COMPATIBILITY_LINE_REASONS:
+		return ff_paid.COMPATIBILITY
+	return ff_paid.OVER_DISCOUNT
+
+
+def _disagreement(
+	reason: str, item=None, carried: float = 0.0, uncapped: float = 0.0, capped: float = 0.0, **extra
+) -> dict:
+	entry = {
+		"reason": reason,
+		"carried": bd.money(carried),
+		"entitled_uncapped": bd.money(uncapped),
+		"entitled_capped": bd.money(capped),
+		**extra,
+	}
+	if item is not None:
+		entry.update(
+			{"invoice_row": item.get("name"), "idx": item.get("idx"), "item_code": item.get("item_code")}
+		)
+	return entry
+
+
+def _paid_header_disagreement(
+	doc, items, carried_total: float, applied_count: int, unit: float
+) -> dict | None:
+	"""Header discount on a paid invoice: never stacked on F&F, never above the coupon's value."""
+	header_amt = _header_discount_value(doc)
+	header_pct = flt(doc.get("additional_discount_percentage") or 0)
+	if header_amt <= 0 and header_pct <= 0:
+		return None
+	if carried_total > 0:
+		return _disagreement(ff_paid.HEADER_DISCOUNT, carried=carried_total, header=bd.money(header_amt), stacked=1)
+	if not cstr(doc.get("coupon_code")).strip() or not applied_count:
+		return None
+	snapshots = [_snapshot_line(i) for i in items]
+	b_line_values = [bd.line_discount_value(i, bd.AMOUNT_BASIS_UNIT) for i in items]
+	coupon = _order_candidate_without_fnf(doc, items, b_line_values, snapshots, [False] * len(items))
+	if header_amt > flt(coupon.amount) + unit:
+		return _disagreement(
+			ff_paid.HEADER_DISCOUNT,
+			header=bd.money(header_amt),
+			coupon_code=coupon.code,
+			coupon_value=bd.money(coupon.amount),
+		)
+	return None
+
+
+def _paid_throw_message(entry: dict) -> str:
+	if entry["reason"] == ff_paid.HEADER_DISCOUNT:
+		if entry.get("stacked"):
+			return _(
+				"The invoice discount {0} cannot be combined with the Friends & Family discount on its lines."
+			).format(ff_money.fmt(entry["header"]))
+		return _("The invoice discount {0} is more than coupon {1} gives ({2}).").format(
+			ff_money.fmt(entry["header"]), entry.get("coupon_code"), ff_money.fmt(entry["coupon_value"])
+		)
+	if entry["reason"] == ff_paid.COMPATIBILITY:
+		return _(
+			"Row {0} ({1}): a promotion or gift on this line cannot be combined with Friends & Family, "
+			"but the line carries a Friends & Family discount of {2}."
+		).format(entry.get("idx"), entry.get("item_code"), ff_money.fmt(entry["carried"]))
+	return _(
+		"Row {0} ({1}): Friends & Family discount {2} is more than the {3} this customer is entitled to."
+	).format(
+		entry.get("idx"),
+		entry.get("item_code"),
+		ff_money.fmt(entry["carried"]),
+		ff_money.fmt(entry["entitled_uncapped"]),
+	)
+
+
+def _freeze_paid_invoice(doc, items) -> None:
+	"""Paid invoice: compare its F&F with the entitlement, never re-price it.
+
+	The entitlement is computed read-only, uncapped and capped, on copies of the
+	rows. Rows that carry F&F get the audit markers (for the usage ledger and the
+	log); prices, discounts, totals and the header discount are never changed.
+
+	* Offline (the customer has left): never throws; each disagreement goes to
+	  ``doc.flags`` and is logged at submit (``Offline Disagreement``).
+	* Online: more F&F than the uncapped entitlement, F&F on a line a scheme owns,
+	  or a header discount that is stacked / above its coupon → throw, naming the
+	  row. F&F above the capped entitlement is a cap breach: logged, and the
+	  ledger applies ``on_cap_breach_at_submit`` at submit. Less F&F than the
+	  entitlement is kept and logged (``paid_under_discount``).
+	"""
+	offline = ff_paid.is_offline(doc)
+	copies = [_row_copy(i) for i in items]
+	ff_compatibility.block_ineligible_lines(copies, doc=doc)
+	kwargs = {
+		"customer": doc.get("customer"),
+		"items": copies,
+		"posting_date": doc.get("posting_date") or nowdate(),
+		"amount_basis": bd.AMOUNT_BASIS_UNIT,
+		"exclude_invoice": doc.get("name") or None,
+		"pos_profile": doc.get("pos_profile"),
+		"conversion_rate": flt(doc.get("conversion_rate")) or 1.0,
+		"company": doc.get("company"),
+	}
+	uncapped = compute_friends_and_family_discounts(ignore_caps=True, **kwargs)
+	capped = compute_friends_and_family_discounts(**kwargs)
+	percentage = flt(uncapped.get("discount_percentage"))
+	unit = 10 ** -ff_money.precision_for(ff_money.current_currency())
+
+	found = []
+	lines = []
+	carried_total = capped_total = within_total = tolerance_total = 0.0
+	for item, u_line, c_line in zip(items, uncapped["items"], capped["items"], strict=False):
+		if cint(item.get("is_free_item")):
+			continue
+		tolerance = _line_tolerance(item, unit)
+		u_amt = flt(u_line["discount_amount"]) if u_line.get("applies") else 0.0
+		c_amt = flt(c_line["discount_amount"]) if c_line.get("applies") else 0.0
+		carried = _carried_fnf(item, bd.line_discount_value(item, bd.AMOUNT_BASIS_UNIT), u_amt, c_amt, tolerance)
+		capped_total += c_amt
+		lines.append((item, carried, u_amt, c_amt, tolerance))
+		if carried <= 0:
+			# Ruling 48: a row left at full price carries no F&F — drop stale client markers,
+			# or the submit log would record a "Discount Applied" the row never gave.
+			_clear_paid_fnf_markers(item)
+			continue
+		_stamp_paid_fnf_audit(item, carried, percentage or flt(item.get("discount_percentage")))
+		carried_total += carried
+		within_total += min(carried, u_amt)
+		tolerance_total += tolerance
+		if carried > u_amt + tolerance:
+			found.append(_disagreement(_over_reason(uncapped, u_line), item, carried, u_amt, c_amt))
+
+	if within_total > capped_total + max(tolerance_total, unit):
+		found.append(
+			_disagreement(ff_paid.CAP_EXCEEDED, carried=within_total, capped=capped_total, caps=capped.get("caps"))
+		)
+	elif carried_total < capped_total - unit:
+		for item, carried, u_amt, c_amt, tolerance in lines:
+			if carried < c_amt - tolerance:
+				found.append(_disagreement(ff_paid.MISSING_FNF, item, carried, u_amt, c_amt))
+
+	header = _paid_header_disagreement(doc, items, carried_total, cint(uncapped.get("applied_count")), unit)
+	if header:
+		found.append(header)
+
+	if not offline:
+		for entry in found:
+			entry["reason"] = ff_paid.online_reason(entry["reason"])
+		# A header stacked on F&F rows is logged, not thrown: the cart may have sent
+		# both, and the unpaid path used to resolve that silently.
+		blocking = [e for e in found if e["reason"] in ff_paid.ONLINE_BLOCKING and not e.get("stacked")]
+		if blocking:
+			frappe.throw(
+				"<br>".join(_paid_throw_message(entry) for entry in blocking)
+				+ "<br>"
+				+ _("The invoice is already paid, so it was not re-priced. Correct the cart and take payment again."),
+				title=_("Friends & Family discount not allowed"),
+			)
+
+	flags = getattr(doc, "flags", None)
+	if flags is not None:
+		# Not the entitlement payload: the submit log then records what the rows carry.
+		flags.friends_and_family = None
+		flags[ff_paid.DISAGREEMENTS_FLAG] = {"offline": offline, "entries": found}
+
+
+def _clear_paid_fnf_markers(item) -> None:
+	"""Remove F&F markers only (audit fields and the cart source tag); prices stay as paid."""
+	_clear_fnf_audit_fields(item)
+	if cstr(item.get("discount_source")) == DISCOUNT_SOURCE_FRIENDS_AND_FAMILY:
+		_set_item_attr(item, "discount_source", None)
+
+
+def _loyalty_total(doc) -> float:
+	"""The total ERPNext checks a redemption against (``validate_loyalty_points``)."""
+	disabled = getattr(doc, "is_rounded_total_disabled", None)
+	if callable(disabled):
+		rounding_off = disabled()
+	else:  # plain dict invoice: same rule from its own field / Global Defaults
+		rounding_off = (
+			doc.get("disable_rounded_total")
+			if "disable_rounded_total" in doc
+			else frappe.db.get_single_value("Global Defaults", "disable_rounded_total")
+		)
+	return flt(doc.get("grand_total") if cint(rounding_off) else doc.get("rounded_total"))
+
+
+def _check_loyalty_redemption(doc) -> None:
+	"""Re-run ERPNext's redemption limit after the F&F step (Ruling 47).
+
+	Only when points are redeemed, against the same total and with the same
+	comparison as ERPNext, so nothing ERPNext accepts is rejected here.
+	"""
+	if not cint(doc.get("redeem_loyalty_points")):
+		return
+	if flt(doc.get("loyalty_amount")) > _loyalty_total(doc):
+		frappe.throw(_("Loyalty redemption exceeds the total after the Friends & Family discount."))
+
+
 @ff_money.in_document_currency
 def apply_friends_and_family_on_invoice(doc, method=None):
 	"""Sales Invoice / POS Invoice ``validate`` — enforce Settings % and best-only.
@@ -1287,6 +1556,10 @@ def apply_friends_and_family_on_invoice(doc, method=None):
 	  4. PN-129 caps (per order / monthly per customer) are applied inside the
 	     per-line plan; each F&F row persists ``posnext_discount_source`` and
 	     ``posnext_fnf_discount_amount`` for the monthly usage ledger.
+
+	  5. A paid invoice (:func:`ff_paid.is_paid`) is never re-priced: see
+	     :func:`_freeze_paid_invoice`. After the F&F step the loyalty redemption
+	     is re-checked against the grand total (not on offline sync).
 
 	Returns / credit notes only get their (negative) F&F usage stamped, from
 	the original rows. Consolidated invoices are left untouched.
@@ -1311,6 +1584,13 @@ def apply_friends_and_family_on_invoice(doc, method=None):
 	is_pos_doc = cstr(doc.get("doctype")) == "POS Invoice" or cint(doc.get("is_pos"))
 	if not is_pos_doc:
 		return
+
+	if ff_paid.is_paid(doc):
+		# Never re-price a paid invoice (offline sync or payment collected).
+		_freeze_paid_invoice(doc, items)
+		if not ff_paid.is_offline(doc):
+			_check_loyalty_redemption(doc)
+		return None
 
 	before = _invoice_state(doc, items)
 	# Re-open earlier decisions: lines get back the discount F&F replaced.
@@ -1376,4 +1656,5 @@ def apply_friends_and_family_on_invoice(doc, method=None):
 	recalc = getattr(doc, "calculate_taxes_and_totals", None)
 	if _invoice_state(doc, doc.get("items")) != before and callable(recalc):
 		recalc()
+	_check_loyalty_redemption(doc)
 	return ff_payload
