@@ -49,19 +49,34 @@ FF_SETTINGS = "Friends and Family Settings"
 
 @contextmanager
 def ff_settings_guard():
-	"""Snapshot the F&F Settings Single (fields + child rows) and restore it on exit."""
+	"""Snapshot the F&F Settings Single (fields + child rows) and restore it on exit.
+
+	If the body raises, that exception is what propagates: a restore that fails
+	meanwhile is written to the log file (not the DB: the transaction may be the
+	reason the body failed) instead of replacing it.
+	"""
 	snapshot = frappe.get_doc(FF_SETTINGS).as_dict(convert_dates_to_str=False)
 	try:
 		yield
-	finally:
-		doc = frappe.get_doc(FF_SETTINGS)
-		for df in doc.meta.fields:
-			if df.fieldtype in ("Table", "Table MultiSelect"):
-				doc.set(df.fieldname, [])
-				for row in snapshot.get(df.fieldname) or []:
-					doc.append(df.fieldname, {k: v for k, v in row.items() if k not in ("name", "idx", "parent", "parentfield", "parenttype", "creation", "modified")})
-			elif df.fieldtype not in frappe.model.no_value_fields:
-				doc.set(df.fieldname, snapshot.get(df.fieldname))
-		doc.flags.ignore_permissions = True
-		doc.flags.ignore_validate = True
-		doc.save(ignore_permissions=True)
+	except BaseException:
+		try:
+			_restore_ff_settings(snapshot)
+		except Exception:
+			frappe.logger("posnext_promotions").exception("ff_settings_guard: restore failed")
+		raise
+	else:
+		_restore_ff_settings(snapshot)
+
+
+def _restore_ff_settings(snapshot: dict) -> None:
+	doc = frappe.get_doc(FF_SETTINGS)
+	for df in doc.meta.fields:
+		if df.fieldtype in ("Table", "Table MultiSelect"):
+			doc.set(df.fieldname, [])
+			for row in snapshot.get(df.fieldname) or []:
+				doc.append(df.fieldname, {k: v for k, v in row.items() if k not in ("name", "idx", "parent", "parentfield", "parenttype", "creation", "modified")})
+		elif df.fieldtype not in frappe.model.no_value_fields:
+			doc.set(df.fieldname, snapshot.get(df.fieldname))
+	doc.flags.ignore_permissions = True
+	doc.flags.ignore_validate = True
+	doc.save(ignore_permissions=True)

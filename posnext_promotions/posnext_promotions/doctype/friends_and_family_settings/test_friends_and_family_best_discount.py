@@ -7,7 +7,11 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import flt
 
-from posnext_promotions.promotions.friends_and_family_testing import approved_domain_rows, give_verified_email
+from posnext_promotions.promotions.friends_and_family_testing import (
+	TEST_EMAIL_DOMAIN,
+	approved_domain_rows,
+	give_verified_email,
+)
 from posnext_promotions.api.apply_offers import (
 	_decide_fnf_vs_order_promotion,
 	_friends_and_family_only_response,
@@ -37,6 +41,7 @@ from posnext_promotions.promotions.friends_and_family_eligibility import (
 )
 
 DATE = "2026-10-05"
+NOT_APPROVED_DOMAIN = "not-approved.example"
 FF_GROUP = "_Test FF Best Customer Group"
 OTHER_GROUP = "_Test FF Best Other Customer Group"
 ELIGIBLE = "_Test FF Best Eligible Customer"
@@ -69,7 +74,10 @@ class TestFriendsAndFamilyBestDiscount(FrappeTestCase):
 			if not frappe.db.exists("Customer", name):
 				frappe.get_doc({"doctype": "Customer", "customer_name": name, "customer_group": group}).insert()
 			frappe.db.set_value("Customer", name, {FLAG_FIELD: 0, "disabled": 0})
-			give_verified_email(name)
+			# Eligibility is approved email domain + OTP-verified email only (Customer
+			# Group is ignored, patches/v2_6_0/hide_ff_group_flag_eligibility): the
+			# ineligible customer gets a verified email on a domain that is not approved.
+			give_verified_email(name, domain=TEST_EMAIL_DOMAIN if name == ELIGIBLE else NOT_APPROVED_DOMAIN)
 
 		item_group = frappe.db.get_value("Item Group", {"is_group": 0}) or "Products"
 		for code in (ITEM, ITEM_2, EXCLUDED_ITEM):
@@ -353,11 +361,15 @@ class TestFriendsAndFamilyBestDiscount(FrappeTestCase):
 		self.assertEqual(result["line_updates"][0]["discount_percentage"], 15)
 
 	def test_coupon_never_overrides_bigger_promotion(self):
+		# A coupon's `promotion_conflict` (not exclude_already_discounted_items, which the
+		# coupon engine now ignores) decides discounted lines; "Better of the two" lets the
+		# coupon compete with the promotion, and the bigger promotion keeps the line.
 		line = self._promo_line(pct=50)
-		coupon = self._coupon(pct=20, exclude_already_discounted_items=0)
+		coupon = self._coupon(pct=20, promotion_conflict="Better of the two")
 		result = resolve_coupon_best_discount(coupon, [line], customer=INELIGIBLE, posting_date=DATE)
 		self.assertFalse(result["valid"])
-		self.assertEqual(result["best_discount"]["lines"][0]["winner"], bd.SOURCE_PROMOTION)
+		self.assertEqual(result["line_updates"], [])
+		self.assertEqual(result["kept_promotion_items"], [ITEM])
 
 	# ---- invoice validate (server-side enforcement) -----------------------
 

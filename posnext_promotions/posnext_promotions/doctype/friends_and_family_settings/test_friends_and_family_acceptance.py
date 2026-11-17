@@ -12,7 +12,11 @@ is left behind on the site.
 
 Needs a POS Profile that can submit invoices: ``profile 1`` when present,
 otherwise the first enabled profile (override with the
-``FF_ACCEPTANCE_POS_PROFILE`` environment variable).
+``FF_ACCEPTANCE_POS_PROFILE`` environment variable). Prices come from a
+test-owned selling Price List in the profile's currency (set as the demo
+customers' default price list), so the expected amounts hold whatever currency
+the profile's own price list uses; the site's other Pricing Rules are disabled
+for the run (rolled back with everything else).
 """
 
 import os
@@ -56,6 +60,21 @@ def _pick_pos_profile() -> str | None:
 	return frappe.db.get_value("POS Profile", {"disabled": 0})
 
 
+def _ensure_price_list(profile) -> str:
+	"""Selling Price List in the invoice currency, so list prices are not converted.
+
+	A profile's own list may be in another currency than the invoice (e.g. an EGP
+	list on a SAR profile), which would scale every expected amount.
+	"""
+	currency = profile.currency or frappe.get_cached_value("Company", profile.company, "default_currency")
+	name = f"{PREFIX} Selling {currency}"
+	if not frappe.db.exists("Price List", name):
+		frappe.get_doc(
+			{"doctype": "Price List", "price_list_name": name, "currency": currency, "selling": 1, "enabled": 1}
+		).insert(ignore_permissions=True)
+	return name
+
+
 class TestFriendsAndFamilyAcceptance(FrappeTestCase):
 	@classmethod
 	def setUpClass(cls):
@@ -76,11 +95,21 @@ class TestFriendsAndFamilyAcceptance(FrappeTestCase):
 			),
 			profile.payments[0].mode_of_payment if profile.payments else None,
 		)
-		cls.demo = build_demo_data(prefix=PREFIX, company=cls.company, price_list=profile.selling_price_list)
+		cls.demo = build_demo_data(prefix=PREFIX, company=cls.company, price_list=_ensure_price_list(profile))
 		cls.items = cls.demo["items"]
 		cls.staff = cls.demo["customers"]["staff"]
 		cls.flagged = cls.demo["customers"]["flagged"]
 		cls.public = cls.demo["customers"]["public"]
+		# The invoice takes the customer's default price list before the profile's.
+		for customer in cls.demo["customers"].values():
+			frappe.db.set_value("Customer", customer, "default_price_list", cls.demo["price_list"])
+		# Only the demo Pricing Rules may price these invoices: a site's own rules
+		# (e.g. a cart-wide Transaction rule) would add discounts the scenarios do not
+		# expect. Disabled inside the class transaction (rolled back by the class cleanup).
+		frappe.db.sql(
+			"update `tabPricing Rule` set disable = 1 where disable = 0 and name not in %(keep)s",
+			{"keep": tuple(cls.demo["pricing_rules"].values()) or ("",)},
+		)
 		cls.today = nowdate()
 
 	@classmethod
@@ -487,6 +516,9 @@ class TestFriendsAndFamilyAcceptance(FrappeTestCase):
 
 		def coupon(pct, code):
 			def apply(doc):
+				# The POS sends the coupon on the header as well as on the lines it
+				# tags; validate_scoped_coupon_lines rejects a tag without it.
+				doc.coupon_code = code
 				row = self._row(doc, "laptop")
 				row.discount_percentage = pct
 				row.posnext_coupon_code = code

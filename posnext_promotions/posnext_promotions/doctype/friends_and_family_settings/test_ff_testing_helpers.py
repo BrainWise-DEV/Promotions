@@ -3,9 +3,12 @@
 
 """Tests for the F&F test helpers themselves."""
 
+from unittest.mock import patch
+
 import frappe
 from frappe.tests.utils import FrappeTestCase
 
+from posnext_promotions.promotions import friends_and_family_testing as testing
 from posnext_promotions.promotions.friends_and_family_testing import (
 	FF_SETTINGS,
 	approved_domain_rows,
@@ -31,5 +34,14 @@ class TestFFSettingsGuard(FrappeTestCase):
 				doc.append("approved_domains", row)
 			doc.save(ignore_permissions=True)
 			self.assertNotEqual(state(), before)
-		frappe.db.commit()
 		self.assertEqual(state(), before)
+
+	def test_failed_restore_does_not_mask_body_error(self):
+		def broken_restore(_snapshot):
+			raise RuntimeError("restore failed")
+
+		with patch.object(testing, "_restore_ff_settings", broken_restore), patch.object(frappe, "logger") as logger:
+			with self.assertRaisesRegex(ValueError, "body failed"):
+				with ff_settings_guard():
+					raise ValueError("body failed")
+		logger.return_value.exception.assert_called_once()
