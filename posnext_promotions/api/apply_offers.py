@@ -73,7 +73,6 @@ try:
 	from posnext_promotions.api.gwp import (
 		GWP_BASIS_MAX,
 		PROMOTION_TYPE_GWP,
-		calculate_gwp_discount_amount,
 		distribute_gwp_free_units_for_basis,
 		get_gwp_same_item_free_qty,
 		get_gwp_slab_free_qty,
@@ -103,7 +102,6 @@ except Exception:  # pragma: no cover
 	PROMOTION_TYPE_ITEM_LEVEL = "Item Level Discount"
 	PROMOTION_TYPE_GWP = "GWP"
 	PROMOTION_TYPE_GIFT_POOL = "Gift Pool"
-	calculate_gwp_discount_amount = None
 	get_gwp_slab_free_qty = None
 	get_gwp_same_item_free_qty = None
 	distribute_gwp_free_units_for_basis = None
@@ -150,22 +148,6 @@ def _item_pricing_rule_names(item) -> list[str]:
 def _floor_free_item_qty(qty) -> int:
 	"""Free gift lines are always whole units (floor, never round up)."""
 	return max(0, int(math.floor(flt(qty))))
-
-
-def _stamp_gwp_line_discount(item_doc, line_free_qty, price_list_rate) -> None:
-	line_free_qty = _floor_free_item_qty(line_free_qty)
-	purchased_qty = flt(item_doc.get("qty") or item_doc.get("quantity") or 0)
-	price_list_rate = flt(price_list_rate)
-	line_discount = calculate_gwp_discount_amount(line_free_qty, price_list_rate)
-	if line_discount <= 0 or purchased_qty <= 0:
-		return
-
-	item_doc.discount_amount = line_discount
-	item_doc.discount_percentage = 0
-	item_doc.gwp_free_qty = line_free_qty
-	item_doc.free_qty = line_free_qty
-	item_doc.discount_source = DISCOUNT_SOURCE_GWP
-	item_doc.rate = flt(price_list_rate - (line_discount / purchased_qty))
 
 
 def _make_free_item_doc(item_code, qty, rule_name, full_rule, promotional_scheme=None, **extra):
@@ -346,18 +328,53 @@ def _recompute_recursive_product_free_items(prepared_items, free_items_map, rule
 		if not line_gave_free and applied_rules is not None:
 			applied_rules.discard(rule_name)
 
+
+def _add_gwp_gift_row(free_items_map, item_doc, free_qty, rule_name, full_rule, promotional_scheme) -> None:
+	"""Add ``free_qty`` units of the paid line's item as a GWP free row, on top of the paid qty.
+
+	The paid line is never discounted: a gift is always its own ``is_free_item``
+	row, so a line can't reach 100 % or a zero rate. The row is priced at the rule's
+	free item rate (0 when unset), as same-item GWP is. Rows of one item merge.
+	"""
+	free_qty = _floor_free_item_qty(free_qty)
+	if free_qty <= 0:
+		return
+	item_code = item_doc.get("item_code")
+	existing = free_items_map.get((item_code, rule_name))
+	if existing:
+		existing.qty = _floor_free_item_qty(flt(existing.get("qty")) + free_qty)
+		return
+	# The units are counted in the paid line's UOM, so the gift row uses it too.
+	line_uom = item_doc.get("uom")
+	uom_fields = (
+		{"uom": line_uom, "conversion_factor": flt(item_doc.get("conversion_factor")) or 1}
+		if line_uom
+		else {}
+	)
+	free_items_map[(item_code, rule_name)] = _make_free_item_doc(
+		item_code,
+		free_qty,
+		rule_name,
+		full_rule,
+		promotional_scheme,
+		discount_source=DISCOUNT_SOURCE_GWP,
+		**uom_fields,
+	)
+
+
 def _apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_rules=None) -> None:
-	"""Apply GWP: same-SKU gifts as a free row; mixed SKUs as line discounts.
+	"""Apply GWP: every gift is a free row on top of the paid quantity.
 
 	Same item (one SKU in the cart): paid qty (excluding echoed free rows)
 	must reach min_qty; free units are added on top as a separate free row.
 	Buy 2 get 1 free: 2 paid scans -> +1 free row.
 
 	Multi-item / item-group with mixed SKUs: total qty must fall between
-	min_qty and max_qty; free_qty is discounted on cheapest (Max Price basis)
-	or most expensive (Min Price basis) lines.
+	min_qty and max_qty; free_qty units of the cheapest (Max Price basis) or
+	most expensive (Min Price basis) lines are added as free rows. The paid
+	lines keep their price and carry the rule (the gift's trigger).
 	"""
-	if not calculate_gwp_discount_amount or not get_gwp_slab_free_qty:
+	if not get_gwp_slab_free_qty:
 		return
 
 	gwp_rule_names = [
@@ -453,12 +470,9 @@ def _apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_
 			)
 			for item_doc, line_free in zip(paid_lines, free_per_line, strict=False):
 				append_pricing_rule(item_doc, rule_name)
-				if line_free <= 0:
-					continue
-				price_list_rate = flt(
-					item_doc.get("price_list_rate") or item_doc.get("rate") or 0
+				_add_gwp_gift_row(
+					free_items_map, item_doc, line_free, rule_name, full_rule, promotional_scheme
 				)
-				_stamp_gwp_line_discount(item_doc, line_free, price_list_rate)
 			continue
 
 		if slab_free_qty <= 0:
@@ -477,10 +491,7 @@ def _apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_
 			if line_free <= 0:
 				continue
 
-			price_list_rate = flt(
-				item_doc.get("price_list_rate") or item_doc.get("rate") or 0
-			)
-			_stamp_gwp_line_discount(item_doc, line_free, price_list_rate)
+			_add_gwp_gift_row(free_items_map, item_doc, line_free, rule_name, full_rule, promotional_scheme)
 			append_pricing_rule(item_doc, rule_name)
 
 
@@ -1717,6 +1728,12 @@ def apply_offers(invoice_data, selected_offers=None):
 				line_discount_amount = per_unit_discount * qty
 			else:
 				line_discount_amount = per_unit_discount
+
+			# Several rules' discounts are summed above; they stop at the line's value
+			# (100 %), never beyond it.
+			discount_percentage = min(discount_percentage, 100.0)
+			if qty and price_list_rate:
+				line_discount_amount = min(line_discount_amount, price_list_rate * qty)
 
 			if not discount_percentage and line_discount_amount and qty and price_list_rate:
 				base_amount = price_list_rate * qty

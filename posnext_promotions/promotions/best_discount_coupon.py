@@ -37,7 +37,7 @@ from frappe import _
 from frappe.utils import cstr, flt
 
 from posnext_promotions.promotions import best_discount as bd
-from posnext_promotions.promotions import ff_money
+from posnext_promotions.promotions import ff_money, ff_non_invoice
 from posnext_promotions.promotions.friends_and_family_apply import (
 	_is_fnf_stamped,
 	_restore_replaced_discount,
@@ -220,8 +220,9 @@ def _rejection(decision: CouponDecision) -> dict:
 def decide_coupon_vs_fnf(cart, coupon, customer=None, pos_profile=None) -> CouponDecision:
 	"""The one coupon-vs-F&F resolver (PN-128).
 
-	``cart``: ``items``, optional ``posting_date`` and ``taxes`` (the cart's tax rows;
-	without them the POS Profile's tax template decides which taxes are exclusive).
+	``cart``: ``items``, optional ``posting_date``, ``taxes`` (the cart's tax rows;
+	without them the POS Profile's tax template decides which taxes are exclusive) and
+	``doctype`` (on a Sales Order / Quotation F&F never applies, so it is no rival).
 	Granularity: an uncapped % coupon is compared per line, any other coupon on the
 	order total. On the order the rival is every F&F line (an order coupon replaces
 	F&F on the whole cart) plus the best other discount on the coupon's lines.
@@ -241,8 +242,10 @@ def decide_coupon_vs_fnf(cart, coupon, customer=None, pos_profile=None) -> Coupo
 	if not result.get("valid"):
 		return decision
 
-	eligibility = get_customer_eligibility(customer, posting_date, pos_profile)
-	program = eligibility.program if eligibility.eligible else None
+	program = None
+	if ff_non_invoice.ff_applies_to(cart.get("doctype")):
+		eligibility = get_customer_eligibility(customer, posting_date, pos_profile)
+		program = eligibility.program if eligibility.eligible else None
 	fnf_by_line = _capped_fnf_candidates(items, customer, posting_date, pos_profile) if program is not None else {}
 	decision.fnf_lines = len(fnf_by_line)
 
@@ -335,11 +338,14 @@ def decide_coupon_vs_fnf(cart, coupon, customer=None, pos_profile=None) -> Coupo
 
 @ff_money.in_cart_currency
 def resolve_coupon_best_discount(
-	coupon, items, customer=None, posting_date=None, pos_profile=None, taxes=None
+	coupon, items, customer=None, posting_date=None, pos_profile=None, taxes=None, doctype=None
 ) -> dict:
 	"""``validate_coupon`` result: the coupon only where it is the best single discount."""
 	decision = decide_coupon_vs_fnf(
-		{"items": items, "posting_date": posting_date, "taxes": taxes}, coupon, customer, pos_profile
+		{"items": items, "posting_date": posting_date, "taxes": taxes, "doctype": doctype},
+		coupon,
+		customer,
+		pos_profile,
 	)
 	result = dict(decision.result)
 	result["coupon_value"] = flt(decision.coupon_value, 6)

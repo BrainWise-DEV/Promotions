@@ -25,8 +25,15 @@ from posnext_promotions.promotions.friends_and_family_caps import (
 )
 
 FNF = "friends_and_family"
+# Documents F&F never applies to (their validate strips it, see hooks.py).
+NON_INVOICE_DOCTYPES = frozenset({"Sales Order", "Quotation"})
 _LINE_KEYS = (FIELD_DISCOUNT_SOURCE, FIELD_FNF_AMOUNT, FIELD_FNF_PERCENTAGE)
 _HEADER_PREFIX = "posnext_fnf_"
+
+
+def ff_applies_to(doctype) -> bool:
+	"""False for a Sales Order / Quotation: there F&F is never a rival discount."""
+	return cstr(doctype) not in NON_INVOICE_DOCTYPES
 
 
 def _is_fnf_line(item) -> bool:

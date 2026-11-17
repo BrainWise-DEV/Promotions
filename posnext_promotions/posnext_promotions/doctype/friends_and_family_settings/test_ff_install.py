@@ -31,4 +31,4 @@ class TestFFInstall(FrappeTestCase):
 		self.assertTrue(frappe.get_meta("Customer").has_field(CUSTOMER_FLAG_FIELD_SPEC["fieldname"]))
 
 	def test_contract_constant(self):
-		self.assertEqual(posnext_promotions.FF_CONTRACT, 1)
+		self.assertEqual(posnext_promotions.FF_CONTRACT, 2)

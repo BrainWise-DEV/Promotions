@@ -3,7 +3,7 @@
 
 import frappe
 from frappe import _
-from frappe.utils import cint, flt, getdate, today
+from frappe.utils import cint, cstr, flt, getdate, today
 
 # What a coupon does on a line that already carries a discount (promotion or manual)
 PROMOTION_CONFLICT_SKIP = "Skip the line"
@@ -16,6 +16,24 @@ def get_promotion_conflict_mode(coupon) -> str:
 	"""The coupon's own choice for already-discounted lines; blank means skip them."""
 	mode = (getattr(coupon, "promotion_conflict", None) or "").strip()
 	return mode if mode in PROMOTION_CONFLICT_OPTIONS else PROMOTION_CONFLICT_SKIP
+
+
+def with_item_master_scope(items) -> list:
+	"""Copies of ``items`` whose ``brand`` / ``item_group`` come from the Item master.
+
+	Coupon scope and brand exclusions never trust the client line. These are the
+	Item's own values with no template fallback (that fallback is F&F scope only);
+	an unknown item code gets none.
+	"""
+	from posnext_promotions.promotions import ff_scope
+
+	rows = [frappe._dict(row) for row in items or []]
+	catalog = ff_scope.item_scope_fields(row.get("item_code") for row in rows)
+	for row in rows:
+		master = catalog.get(cstr(row.get("item_code"))) or {}
+		row.brand = master.get("brand")
+		row.item_group = master.get("item_group")
+	return rows
 
 
 def _line_existing_discount(item) -> float:
@@ -155,7 +173,7 @@ def get_coupon_eligible_items(coupon, items):
 	)
 
 	mode = get_promotion_conflict_mode(coupon)
-	prepared_items = [frappe._dict(row) for row in items]
+	prepared_items = with_item_master_scope(items)
 	all_rule_names: list[str] = []
 	for item in prepared_items:
 		all_rule_names.extend(_parse_pricing_rules(item.get("pricing_rules")))
@@ -306,7 +324,7 @@ def _coupon_rejection_message(coupon, items) -> str:
 	excluded_brands = _get_excluded_brands(coupon)
 	reasons: list[str] = []
 
-	for item in items or []:
+	for item in with_item_master_scope(items):
 		if cint(item.get("is_free_item") or 0):
 			continue
 		code = item.get("item_code") or _("Item")
@@ -515,7 +533,7 @@ def apply_coupon_discount(coupon, cart_total, net_total=None, items=None, tax_am
 		mark_item_discount_flags,
 	)
 
-	prepared_items = [frappe._dict(row) for row in (items or [])]
+	prepared_items = with_item_master_scope(items)
 	excluded_brands = _get_excluded_brands(coupon)
 	if prepared_items:
 		mark_item_discount_flags(prepared_items)

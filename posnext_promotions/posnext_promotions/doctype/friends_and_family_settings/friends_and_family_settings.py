@@ -42,6 +42,10 @@ class FriendsandFamilySettings(Document):
 			frappe.throw(_("Discount Percentage is required"))
 		if percentage < 0 or percentage > 100:
 			frappe.throw(_("Discount Percentage must be between 0 and 100"))
+		# Below 100: a 100 % line is a free item, and a free good must come from an offer.
+		# Only a change to 100 is refused, so a site already at 100 can still save Settings.
+		if percentage >= 100 and (self.is_new() or self.has_value_changed("discount_percentage")):
+			frappe.throw(_("Discount Percentage must be below 100"))
 		if cint(self.enabled) and percentage <= 0:
 			frappe.throw(_("Discount Percentage must be greater than 0 while the program is enabled"))
 

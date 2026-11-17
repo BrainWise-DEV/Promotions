@@ -1003,6 +1003,7 @@ def validate_coupon(
 	items=None,
 	pos_profile: str | None = None,
 	taxes=None,
+	target_doctype: str | None = None,
 ) -> dict:
 	"""Validate a coupon code and optionally compute line-level discounts for cart items.
 
@@ -1016,9 +1017,19 @@ def validate_coupon(
 
 	``taxes`` (optional, the cart's tax rows): which taxes are exclusive, for a "Grand
 	Total" coupon; without them the POS Profile's tax template decides.
+
+	``target_doctype`` (optional, default Sales Invoice): the document the coupon is for.
+	On a Sales Order / Quotation F&F never applies, so it is not compared at all.
 	"""
 	return _validate_coupon(
-		coupon_code, customer, company, items=items, resolve_best=True, pos_profile=pos_profile, taxes=taxes
+		coupon_code,
+		customer,
+		company,
+		items=items,
+		resolve_best=True,
+		pos_profile=pos_profile,
+		taxes=taxes,
+		target_doctype=target_doctype,
 	)
 
 
@@ -1045,7 +1056,14 @@ def _fnf_hint(customer, pos_profile=None) -> dict | None:
 
 
 def _validate_coupon(
-	coupon_code, customer=None, company=None, items=None, resolve_best=True, pos_profile=None, taxes=None
+	coupon_code,
+	customer=None,
+	company=None,
+	items=None,
+	resolve_best=True,
+	pos_profile=None,
+	taxes=None,
+	target_doctype=None,
 ) -> dict:
 	if not customer:
 		return {"valid": False, "message": _("Customer is required")}
@@ -1061,6 +1079,7 @@ def _validate_coupon(
 		apply_coupon_to_items,
 		check_coupon_code,
 	)
+	from posnext_promotions.promotions import ff_non_invoice
 	from posnext_promotions.promotions.best_discount_coupon import resolve_coupon_best_discount
 
 	if isinstance(items, str):
@@ -1084,14 +1103,14 @@ def _validate_coupon(
 	}
 
 	if items is None:
-		hint = _fnf_hint(customer, pos_profile)
+		hint = _fnf_hint(customer, pos_profile) if ff_non_invoice.ff_applies_to(target_doctype) else None
 		if hint:
 			response["friends_and_family"] = hint
 		return response
 
 	if resolve_best:
 		apply_result = resolve_coupon_best_discount(
-			coupon, items, customer=customer, pos_profile=pos_profile, taxes=taxes
+			coupon, items, customer=customer, pos_profile=pos_profile, taxes=taxes, doctype=target_doctype
 		)
 	else:
 		apply_result = apply_coupon_to_items(coupon, items)
@@ -1134,7 +1153,11 @@ def _validate_coupon(
 @frappe.whitelist()
 @ff_money.in_cart_currency
 def calculate_coupon_discount(
-	coupon_code: str, invoice_data, customer: str | None = None, company: str | None = None
+	coupon_code: str,
+	invoice_data,
+	customer: str | None = None,
+	company: str | None = None,
+	target_doctype: str | None = None,
 ):
 	"""The coupon's order discount, decided by the same resolver as ``validate_coupon``.
 
@@ -1145,7 +1168,8 @@ def calculate_coupon_discount(
 	response sets ``suppress_friends_and_family`` so the POS drops the F&F line stamps
 	(the invoice validate hook enforces the same rule server-side). ``line_updates``
 	and ``granularity`` say where the coupon won. ``invoice_data.taxes`` (optional)
-	tells which taxes are exclusive for a "Grand Total" coupon.
+	tells which taxes are exclusive for a "Grand Total" coupon. ``target_doctype``
+	(default ``invoice_data.doctype``): on a Sales Order / Quotation F&F is no rival.
 	"""
 	import json
 
@@ -1159,8 +1183,11 @@ def calculate_coupon_discount(
 	company = company or invoice.get("company")
 	customer = customer or invoice.get("customer")
 	pos_profile = invoice.get("pos_profile")
+	invoice.doctype = target_doctype or invoice.get("doctype")
 
-	validation = _validate_coupon(coupon_code, customer, company, pos_profile=pos_profile)
+	validation = _validate_coupon(
+		coupon_code, customer, company, pos_profile=pos_profile, target_doctype=invoice.doctype
+	)
 	if not validation.get("valid"):
 		return validation
 	coupon_dict = validation.get("coupon") or {}

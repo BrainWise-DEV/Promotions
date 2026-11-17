@@ -21,8 +21,9 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import flt
 
-from posnext_promotions.api.coupon_engine import apply_coupon_discount
+from posnext_promotions.api.coupon_engine import apply_coupon_discount, get_coupon_eligible_items
 from posnext_promotions.api.offers import calculate_coupon_discount, validate_coupon
+from posnext_promotions.overrides.scoped_coupon import validate_scoped_coupon_lines
 from posnext_promotions.posnext_promotions.doctype.friends_and_family_settings.test_ff_paid_freeze import (
 	PaidInvoiceFixture,
 )
@@ -35,7 +36,14 @@ from posnext_promotions.promotions.friends_and_family_log import (
 	LOG_PAID_DISAGREEMENT,
 	log_invoice_submit,
 )
-from posnext_promotions.test_promotions import ITEM_A, ITEM_B, _cart_payload, _line, _make_pos_coupon
+from posnext_promotions.test_promotions import (
+	ITEM_A,
+	ITEM_B,
+	_cart_payload,
+	_ensure_group_tree,
+	_line,
+	_make_pos_coupon,
+)
 
 BRAND = "_PNXT_FFCI_BRAND"
 
@@ -114,6 +122,92 @@ class TestFFCouponIntegrity(PaidInvoiceFixture, FrappeTestCase):
 		for response in (self._validate("FFCI-BRAND20", lines), self._calculate("FFCI-BRAND20", lines)):
 			self.assertFalse(response["valid"])
 			self.assertEqual(flt(response["coupon_value"]), 20)
+
+	# ---- scope comes from the Item master (Ruling 78) ------------------------
+
+	def _master(self, item_code, **values):
+		frappe.db.set_value("Item", item_code, values)
+		getattr(frappe.local, "request_cache", {}).clear()
+
+	def test_coupon_scope_reads_item_master_not_the_line(self):
+		_group_parent, group = _ensure_group_tree()
+		self._master(ITEM_A, brand=BRAND)
+		self._master(ITEM_B, brand=None)
+		# The client claims the opposite of the Item master on every line.
+		lines = [
+			dict(_line(self.ctx, ITEM_A, qty=1, price_list_rate=100), brand=None),
+			dict(_line(self.ctx, ITEM_B, qty=1, price_list_rate=900), brand=BRAND, item_group=group),
+		]
+		by_brand = self._coupon(
+			"FFCI-M-BR", discount_percentage=10, apply_scope="Brand", applicable_brand=BRAND
+		)
+		excluding = self._coupon("FFCI-M-EX", discount_percentage=10, excluded_brands=[{"brand": BRAND}])
+		by_group = self._coupon(
+			"FFCI-M-GR", discount_percentage=10, apply_scope="Item Group", applicable_item_group=group
+		)
+
+		self.assertEqual(flt(apply_coupon_discount(by_brand, cart_total=1000, items=lines)["discount"]), 10)
+		self.assertEqual([i["item_code"] for i in get_coupon_eligible_items(by_brand, lines)], [ITEM_A])
+		self.assertEqual([i["item_code"] for i in get_coupon_eligible_items(excluding, lines)], [ITEM_B])
+		self.assertEqual(get_coupon_eligible_items(by_group, lines), [])
+		self.assertEqual(flt(apply_coupon_discount(by_group, cart_total=1000, items=lines)["discount"]), 0)
+
+	def test_invoice_coupon_scope_check_reads_item_master(self):
+		self._master(ITEM_A, brand=BRAND)
+		self._master(ITEM_B, brand=None)
+		self._coupon("FFCI-M-INV", discount_percentage=10, apply_scope="Brand", applicable_brand=BRAND)
+
+		def doc(item_code, brand):
+			row = frappe._dict(
+				idx=1,
+				item_code=item_code,
+				qty=1,
+				brand=brand,
+				is_free_item=0,
+				posnext_coupon_code="FFCI-M-INV",
+				discount_percentage=10,
+				discount_amount=0,
+			)
+			return frappe._dict(items=[row], coupon_code="FFCI-M-INV")
+
+		validate_scoped_coupon_lines(doc(ITEM_A, None))  # covered by its Item's brand
+		with self.assertRaises(frappe.ValidationError):
+			validate_scoped_coupon_lines(doc(ITEM_B, BRAND))  # the row's brand is not trusted
+
+	# ---- Sales Order / Quotation (Ruling 75) ---------------------------------
+
+	def test_fnf_is_no_rival_on_sales_order_or_quotation(self):
+		self._coupon("FFCI-SO15", discount_percentage=15)
+		lines = self._lines((ITEM_A, 1, 50, None))
+		# On an invoice F&F 30 % beats the 15 % coupon.
+		self.assertFalse(self._validate("FFCI-SO15", lines)["valid"])
+		self.assertFalse(self._calculate("FFCI-SO15", lines)["valid"])
+		self.assertIn("friends_and_family", validate_coupon("FFCI-SO15", self.ctx.customer, self.ctx.company))
+		for doctype in ("Sales Order", "Quotation"):
+			with self.subTest(doctype=doctype):
+				validated = validate_coupon(
+					"FFCI-SO15",
+					customer=self.ctx.customer,
+					company=self.ctx.company,
+					items=json.dumps(lines),
+					pos_profile=self.ctx.pos_profile,
+					target_doctype=doctype,
+				)
+				self.assertTrue(validated["valid"])
+				self.assertEqual(flt(validated["total_discount"]), 7.5)
+
+				data = dict(_cart_payload(self.ctx, lines), doctype=doctype)
+				calculated = calculate_coupon_discount(
+					"FFCI-SO15", json.dumps(data), customer=self.ctx.customer, company=self.ctx.company
+				)
+				self.assertTrue(calculated["valid"])
+				self.assertEqual(flt(calculated["discount"]), 7.5)
+				self.assertFalse(calculated.get("suppress_friends_and_family"))
+
+				hint = validate_coupon(
+					"FFCI-SO15", self.ctx.customer, self.ctx.company, target_doctype=doctype
+				)
+				self.assertNotIn("friends_and_family", hint)
 
 	# ---- one resolver -------------------------------------------------------
 
