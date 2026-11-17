@@ -1,0 +1,283 @@
+{
+ "actions": [],
+ "allow_rename": 0,
+ "creation": "2026-10-05 14:00:00.000000",
+ "doctype": "DocType",
+ "document_type": "Setup",
+ "engine": "InnoDB",
+ "field_order": [
+  "general_section",
+  "enabled",
+  "column_break_general",
+  "discount_percentage",
+  "allow_free_gift_with_ff",
+  "dates_section",
+  "start_date",
+  "column_break_dates",
+  "end_date",
+  "caps_section",
+  "max_discount_per_order",
+  "column_break_caps",
+  "max_discount_per_customer_month",
+  "eligibility_section",
+  "eligibility_basis",
+  "column_break_eligibility",
+  "eligible_customer_groups",
+  "approved_domains_section",
+  "approved_domains",
+  "scope_section",
+  "discount_scope",
+  "brands_section",
+  "applicable_brands",
+  "item_groups_section",
+  "applicable_item_groups",
+  "items_section",
+  "applicable_items",
+  "exclusions_section",
+  "excluded_items",
+  "excluded_item_groups",
+  "excluded_brands"
+ ],
+ "fields": [
+  {
+   "fieldname": "general_section",
+   "fieldtype": "Section Break",
+   "label": "General"
+  },
+  {
+   "default": "0",
+   "description": "When disabled, Friends & Family discount is not applied.",
+   "fieldname": "enabled",
+   "fieldtype": "Check",
+   "label": "Enable Program"
+  },
+  {
+   "fieldname": "column_break_general",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "30",
+   "description": "Configurable. Default: 30%",
+   "fieldname": "discount_percentage",
+   "fieldtype": "Percent",
+   "label": "Discount Percentage",
+   "non_negative": 1,
+   "reqd": 1
+  },
+  {
+   "default": "0",
+   "description": "Global for Free Item, GWP, Gift Pool, Cart Total Gift and Brand Gift. Unchecked (default): a gift whose trigger item received Friends & Family is not given, and a cart-total gift is removed when F&F applies. Checked: the gift and F&F both apply. Buy X Get Y and Item Level Discount (Routine) items never receive F&F.",
+   "fieldname": "allow_free_gift_with_ff",
+   "fieldtype": "Check",
+   "label": "Allow Free Gift with F&F"
+  },
+  {
+   "fieldname": "dates_section",
+   "fieldtype": "Section Break",
+   "label": "Program Dates"
+  },
+  {
+   "fieldname": "start_date",
+   "fieldtype": "Date",
+   "label": "Start Date"
+  },
+  {
+   "fieldname": "column_break_dates",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "end_date",
+   "fieldtype": "Date",
+   "label": "End Date"
+  },
+  {
+   "fieldname": "caps_section",
+   "fieldtype": "Section Break",
+   "label": "Discount Caps",
+   "description": "Limit program cost. Leave 0 for no cap. When a cap is hit the Friends & Family discount is reduced (spread proportionally over the covered items) or not applied, with a message to the cashier."
+  },
+  {
+   "fieldname": "max_discount_per_order",
+   "fieldtype": "Currency",
+   "label": "Max Discount per Order",
+   "non_negative": 1,
+   "default": "0",
+   "description": "Maximum total Friends & Family discount on one invoice. 0 = no cap."
+  },
+  {
+   "fieldname": "column_break_caps",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "max_discount_per_customer_month",
+   "fieldtype": "Currency",
+   "label": "Max Discount per Customer per Month",
+   "non_negative": 1,
+   "default": "0",
+   "description": "Maximum cumulative Friends & Family discount one customer can receive in a calendar month (submitted invoices, net of returns). 0 = no cap."
+  },
+  {
+   "description": "Legacy. Eligibility is approved email domain + verified email only; these fields are hidden and ignored.",
+   "fieldname": "eligibility_section",
+   "fieldtype": "Section Break",
+   "hidden": 1,
+   "label": "Customer Eligibility"
+  },
+  {
+   "default": "Customer Group or Flag",
+   "fieldname": "eligibility_basis",
+   "fieldtype": "Select",
+   "hidden": 1,
+   "label": "Eligible When",
+   "options": "Customer Group or Flag\nCustomer Group\nCustomer Flag",
+   "reqd": 0
+  },
+  {
+   "fieldname": "column_break_eligibility",
+   "fieldtype": "Column Break",
+   "hidden": 1
+  },
+  {
+   "depends_on": "eval:doc.eligibility_basis!=\"Customer Flag\"",
+   "description": "Legacy. Ignored — eligibility uses Approved Domains only.",
+   "fieldname": "eligible_customer_groups",
+   "fieldtype": "Table",
+   "hidden": 1,
+   "label": "Eligible Customer Groups",
+   "options": "Friends and Family Customer Group"
+  },
+  {
+   "fieldname": "approved_domains_section",
+   "fieldtype": "Section Break",
+   "label": "Approved Domains",
+   "description": "Required while the program is enabled. A customer gets Friends & Family only with an OTP-verified email on one of these domains. Exact match only: sub-domains are NOT included automatically and must be added as separate rows (e.g. add both miraaya.com and mail.miraaya.com). With no enabled domain nobody gets Friends & Family."
+  },
+  {
+   "fieldname": "approved_domains",
+   "fieldtype": "Table",
+   "label": "Approved Domains",
+   "options": "Friends and Family Approved Domain"
+  },
+  {
+   "fieldname": "scope_section",
+   "fieldtype": "Section Break",
+   "label": "Discount Scope"
+  },
+  {
+   "default": "Entire Cart",
+   "fieldname": "discount_scope",
+   "fieldtype": "Select",
+   "label": "Discount Scope",
+   "options": "Entire Cart\nBrand\nItem Group\nItem Code",
+   "reqd": 1,
+   "description": "Which cart lines receive F&F before exclusions. Exclusions always win."
+  },
+  {
+   "depends_on": "eval:doc.discount_scope==\"Brand\"",
+   "description": "F&F applies only to items of these brands.",
+   "fieldname": "brands_section",
+   "fieldtype": "Section Break",
+   "label": "Applicable Brands"
+  },
+  {
+   "depends_on": "eval:doc.discount_scope==\"Brand\"",
+   "fieldname": "applicable_brands",
+   "fieldtype": "Table",
+   "label": "Applicable Brands",
+   "options": "Friends and Family Brand"
+  },
+  {
+   "depends_on": "eval:doc.discount_scope==\"Item Group\"",
+   "description": "F&F applies only to items in these item groups, including their child groups.",
+   "fieldname": "item_groups_section",
+   "fieldtype": "Section Break",
+   "label": "Applicable Item Groups"
+  },
+  {
+   "depends_on": "eval:doc.discount_scope==\"Item Group\"",
+   "fieldname": "applicable_item_groups",
+   "fieldtype": "Table",
+   "label": "Applicable Item Groups",
+   "options": "Friends and Family Item Group"
+  },
+  {
+   "depends_on": "eval:doc.discount_scope==\"Item Code\"",
+   "description": "F&F applies only to these item codes.",
+   "fieldname": "items_section",
+   "fieldtype": "Section Break",
+   "label": "Applicable Items"
+  },
+  {
+   "depends_on": "eval:doc.discount_scope==\"Item Code\"",
+   "fieldname": "applicable_items",
+   "fieldtype": "Table",
+   "label": "Applicable Items",
+   "options": "Friends and Family Item"
+  },
+  {
+   "description": "Excluded items and item groups never receive F&F, regardless of scope. Excluded brands apply when scope is Entire Cart.",
+   "fieldname": "exclusions_section",
+   "fieldtype": "Section Break",
+   "label": "Exclusions"
+  },
+  {
+   "description": "These items never receive Friends & Family (e.g. gift cards), regardless of scope.",
+   "fieldname": "excluded_items",
+   "fieldtype": "Table",
+   "label": "Excluded Items",
+   "options": "Friends and Family Excluded Item"
+  },
+  {
+   "description": "Items in these groups (including child groups) never receive Friends & Family, regardless of scope.",
+   "fieldname": "excluded_item_groups",
+   "fieldtype": "Table",
+   "label": "Excluded Item Groups",
+   "options": "Friends and Family Excluded Item Group"
+  },
+  {
+   "depends_on": "eval:doc.discount_scope==\"Entire Cart\"",
+   "fieldname": "excluded_brands",
+   "fieldtype": "Table",
+   "label": "Excluded Brands",
+   "options": "Friends and Family Excluded Brand",
+   "description": "Brands listed here stay at standard price when scope is Entire Cart."
+  }
+ ],
+ "issingle": 1,
+ "links": [],
+ "modified": "2026-11-16 14:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "POSNext Promotions",
+ "name": "Friends and Family Settings",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "create": 1,
+   "delete": 0,
+   "email": 1,
+   "print": 1,
+   "read": 1,
+   "role": "Sales Manager",
+   "share": 1,
+   "write": 1
+  },
+  {
+   "read": 1,
+   "role": "Sales User"
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}

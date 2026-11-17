@@ -1,7 +1,7 @@
 app_name = "posnext_promotions"
 app_title = "POSNext Promotions"
 app_publisher = "BrainWise"
-app_description = "Standalone promotions engine, GWP, coupons extras, and POS authorization gate for ERPNext"
+app_description = "Standalone promotions engine, GWP, and coupons extras for ERPNext"
 app_email = "support@brainwise.me"
 app_license = "agpl-3.0"
 
@@ -43,10 +43,14 @@ override_doctype_class = {
 doctype_js = {
 	"Pricing Rule": "public/js/pricing_rule.js",
 	"Promotional Scheme": "public/js/promotional_scheme.js",
-	"User": "public/js/user.js",
 }
 
+# PN-131: the F&F audit log references invoices / customers but must never
+# block deleting them (it is an audit trail, not a dependency).
+ignore_links_on_delete = ["Friends and Family Log"]
+
 doc_events = {
+	"POS Coupon": {"validate": "posnext_promotions.overrides.scoped_coupon.validate_coupon_scope"},
 	"Promotional Scheme": {
 		"before_validate": [
 			"posnext_promotions.promotions.schedule.normalize_schedule_fields",
@@ -67,16 +71,34 @@ doc_events = {
 	"Sales Invoice": {
 		"validate": [
 			"posnext_promotions.overrides.sales_invoice_free_bundle.combine_packed_qty_for_free_product_bundles",
+			"posnext_promotions.overrides.scoped_coupon.validate_scoped_coupon_lines",
 			"posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts",
+			"posnext_promotions.promotions.friends_and_family_apply.apply_friends_and_family_on_invoice",
 		],
-		"before_submit": "posnext_promotions.authorization.gate.enforce_document",
-		"on_submit": "posnext_promotions.api.one_time_usage.record_one_time_offer_usage",
-		"on_cancel": "posnext_promotions.api.one_time_usage.release_one_time_offer_usage",
+		"on_submit": [
+			"posnext_promotions.api.one_time_usage.record_one_time_offer_usage",
+			"posnext_promotions.promotions.friends_and_family_log.log_invoice_submit",
+		],
+		"on_cancel": [
+			"posnext_promotions.api.one_time_usage.release_one_time_offer_usage",
+			"posnext_promotions.promotions.friends_and_family_log.log_invoice_cancel",
+		],
 	},
 	"Sales Order": {"validate": "posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts"},
 	"Quotation": {"validate": "posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts"},
 	"Delivery Note": {"validate": "posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts"},
-	"POS Invoice": {"validate": "posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts"},
+	"POS Invoice": {
+		"validate": [
+			"posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts",
+			"posnext_promotions.promotions.friends_and_family_apply.apply_friends_and_family_on_invoice",
+		],
+		"on_submit": "posnext_promotions.promotions.friends_and_family_log.log_invoice_submit",
+		"on_cancel": "posnext_promotions.promotions.friends_and_family_log.log_invoice_cancel",
+	},
+	"Customer": {
+		"validate": "posnext_promotions.promotions.friends_and_family_eligibility.guard_flag_changes",
+		"on_update": "posnext_promotions.promotions.friends_and_family_log.log_customer_eligibility_change",
+	},
 }
 
 # Daily cleanup stays on pos_next develop so it does not run twice when both apps

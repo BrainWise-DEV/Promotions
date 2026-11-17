@@ -1,6 +1,6 @@
 # Copyright (c) 2026, POS Next and contributors
 
-"""Tests for recursive product discounts (same-item included free + item-group aggregate)."""
+"""Tests for recursive product discounts (same-item free on top + item-group aggregate)."""
 
 import json
 import unittest
@@ -9,7 +9,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import flt
 
-from posnext_promotions.api.invoices import apply_offers
+from posnext_promotions.api.apply_offers import apply_offers
 from posnext_promotions.api.product_free import (
 	compute_additional_recursive_free_qty,
 	compute_included_recursive_free_qty,
@@ -82,7 +82,7 @@ class TestProductFreeHelpers(FrappeTestCase):
 			compute_product_recursive_free_qty(
 				6, 1, 2, same_item=True, is_recursive=True, min_qty=2
 			),
-			2,
+			3,
 		)
 		self.assertEqual(
 			compute_product_recursive_free_qty(
@@ -90,11 +90,12 @@ class TestProductFreeHelpers(FrappeTestCase):
 			),
 			1,
 		)
+		# Same-item gift is on top: 2 paid -> 1 free (3 units total).
 		self.assertEqual(
 			compute_product_recursive_free_qty(
 				2, 1, 2, same_item=True, is_recursive=True, min_qty=2
 			),
-			0,
+			1,
 		)
 		self.assertEqual(
 			compute_product_recursive_free_qty(
@@ -120,10 +121,10 @@ class TestRecursiveSameItemFree(FrappeTestCase):
 		_cleanup_recursive_test_rules()
 		_restore_product_rules(getattr(self, "_disabled_rules", []))
 
-	def test_same_item_recursive_uses_included_free_qty(self):
-		"""Buy 2 get 1 free from qty: need 3 for 1 free; qty 6 → 2 free."""
+	def test_same_item_recursive_adds_free_on_top(self):
+		"""Buy 2 get 1 free on top: 2 paid -> +1 free row; 6 paid -> +3."""
 		rule = _make_rule(
-			f"{_RECURSIVE_TEST_PREFIX}SameIncluded",
+			f"{_RECURSIVE_TEST_PREFIX}SameOnTop",
 			apply_on="Item Code",
 			items=[{"item_code": ITEM_A}],
 			price_or_product_discount="Product",
@@ -141,41 +142,31 @@ class TestRecursiveSameItemFree(FrappeTestCase):
 		)
 		ctx = _ctx()
 
-		# qty 2: eligible by min_qty but no free yet — must not stay Applied
-		resp2 = apply_offers(
-			invoice_data=json.dumps(_cart_payload(ctx, [_line(ctx, ITEM_A, qty=2)])),
+		# qty 1: below min_qty -> no free, not Applied
+		resp1 = apply_offers(
+			invoice_data=json.dumps(_cart_payload(ctx, [_line(ctx, ITEM_A, qty=1)])),
 			selected_offers=json.dumps([rule]),
 		)
-		item2 = resp2["items"][0]
-		self.assertEqual(flt(item2.get("free_qty") or 0), 0)
-		self.assertEqual(flt(item2.get("discount_amount") or 0), 0)
-		self.assertNotIn(rule, resp2.get("applied_pricing_rules") or [])
-		self.assertEqual(resp2.get("free_items"), [])
+		self.assertEqual(resp1.get("free_items"), [])
+		self.assertNotIn(rule, resp1.get("applied_pricing_rules") or [])
 
-		# qty 3: 1 free (pay 2)
-		resp3 = apply_offers(
-			invoice_data=json.dumps(_cart_payload(ctx, [_line(ctx, ITEM_A, qty=3)])),
-			selected_offers=json.dumps([rule]),
-		)
-		item3 = resp3["items"][0]
-		self.assertEqual(item3.get("discount_source"), "free_item")
-		self.assertEqual(flt(item3.get("free_qty")), 1)
-		self.assertAlmostEqual(flt(item3.get("discount_amount")), 50, places=2)
-		self.assertEqual(flt(item3.get("discount_percentage") or 0), 0)
-		self.assertIn(rule, resp3.get("applied_pricing_rules") or [])
-
-		resp6 = apply_offers(
-			invoice_data=json.dumps(_cart_payload(ctx, [_line(ctx, ITEM_A, qty=6)])),
-			selected_offers=json.dumps([rule]),
-		)
-		item6 = resp6["items"][0]
-		self.assertEqual(item6.get("discount_source"), "free_item")
-		self.assertEqual(flt(item6.get("free_qty")), 2)
-		self.assertAlmostEqual(flt(item6.get("discount_amount")), 100, places=2)
-		self.assertEqual(resp6.get("free_items"), [])
+		for paid, expected_free in ((2, 1), (3, 1), (6, 3)):
+			resp = apply_offers(
+				invoice_data=json.dumps(_cart_payload(ctx, [_line(ctx, ITEM_A, qty=paid)])),
+				selected_offers=json.dumps([rule]),
+			)
+			item = resp["items"][0]
+			self.assertEqual(flt(item.get("qty")), paid)
+			self.assertEqual(flt(item.get("free_qty") or 0), 0)
+			self.assertEqual(flt(item.get("discount_amount") or 0), 0)
+			free_rows = resp.get("free_items") or []
+			self.assertEqual(len(free_rows), 1, paid)
+			self.assertEqual(free_rows[0]["item_code"], ITEM_A)
+			self.assertEqual(flt(free_rows[0]["qty"]), expected_free, paid)
+			self.assertIn(rule, resp.get("applied_pricing_rules") or [])
 
 	def test_item_group_same_item_per_sku(self):
-		"""Same-item on Item Group: each SKU that meets cycle gets its own free."""
+		"""Same-item on Item Group: each SKU that meets min_qty gets its own free row."""
 		item_group = _resolve_item_group()
 		frappe.db.set_value("Item", ITEM_A, "item_group", item_group)
 		frappe.db.set_value("Item", ITEM_B, "item_group", item_group)
@@ -205,24 +196,22 @@ class TestRecursiveSameItemFree(FrappeTestCase):
 			),
 			selected_offers=json.dumps([rule]),
 		)
-		by_code = {it["item_code"]: it for it in resp["items"]}
-		self.assertEqual(flt(by_code[ITEM_A].get("free_qty")), 1)
-		self.assertEqual(by_code[ITEM_A].get("discount_source"), "free_item")
-		self.assertEqual(flt(by_code[ITEM_B].get("free_qty")), 1)
-		self.assertEqual(by_code[ITEM_B].get("discount_source"), "free_item")
-		self.assertEqual(resp.get("free_items"), [])
+		free_by_code = {r["item_code"]: flt(r["qty"]) for r in resp.get("free_items") or []}
+		self.assertEqual(free_by_code, {ITEM_A: 1, ITEM_B: 1})
+		for it in resp["items"]:
+			self.assertEqual(flt(it.get("discount_amount") or 0), 0)
 
-		# 1 + 2: neither line completes a cycle of 3 → no free, not Applied
+		# 1 + 2: only ITEM_B reaches min_qty -> 1 free ITEM_B on top
 		resp2 = apply_offers(
 			invoice_data=json.dumps(
 				_cart_payload(ctx, [_line(ctx, ITEM_A, qty=1), _line(ctx, ITEM_B, qty=2)])
 			),
 			selected_offers=json.dumps([rule]),
 		)
+		free_by_code2 = {r["item_code"]: flt(r["qty"]) for r in resp2.get("free_items") or []}
+		self.assertEqual(free_by_code2, {ITEM_B: 1})
 		for it in resp2["items"]:
-			self.assertEqual(flt(it.get("free_qty") or 0), 0)
 			self.assertEqual(flt(it.get("discount_amount") or 0), 0)
-		self.assertNotIn(rule, resp2.get("applied_pricing_rules") or [])
 
 	def test_item_group_recursive_qty_two_not_applied(self):
 		"""1+1 total 2: no free yet and must not show as Applied."""

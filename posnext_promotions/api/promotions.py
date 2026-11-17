@@ -7,6 +7,10 @@ import frappe
 from frappe import _
 from frappe.utils import cint, cstr, flt, getdate, nowdate
 
+from posnext_promotions.api.coupon_engine import (
+	PROMOTION_CONFLICT_OPTIONS,
+	PROMOTION_CONFLICT_SKIP,
+)
 from posnext_promotions.api.gwp import GWP_BASIS_MAX
 
 
@@ -360,6 +364,9 @@ def create_promotion(data):
 		)
 		if data.get("promotion_type") and hasattr(scheme, "promotion_type"):
 			scheme.promotion_type = data.get("promotion_type")
+		# Always compete with F&F via best-discount (UI field is hidden, default 1).
+		if hasattr(scheme, "apply_with_ff"):
+			scheme.apply_with_ff = 1
 
 		# Set applicable for
 		if data.get("applicable_for"):
@@ -493,6 +500,9 @@ def update_promotion(scheme_name, data):
 			scheme.disable = cint(data["disable"])
 		if "promotion_type" in data and hasattr(scheme, "promotion_type"):
 			scheme.promotion_type = data.get("promotion_type") or ""
+		# Always compete with F&F via best-discount (UI field is hidden, default 1).
+		if hasattr(scheme, "apply_with_ff"):
+			scheme.apply_with_ff = 1
 
 		if "gift_pool_items" in data and hasattr(scheme, "gift_pool_items"):
 			scheme.set("gift_pool_items", [])
@@ -767,6 +777,26 @@ def get_coupons(company=None, include_disabled=False, coupon_type=None):
 	return coupons
 
 
+COUPON_SCOPE_TABLES = (
+	("applicable_items", "item_code"),
+	("applicable_item_groups", "item_group"),
+	("applicable_brands", "brand"),
+	("excluded_brands", "brand"),
+)
+
+
+def _set_coupon_scope_tables(coupon, data):
+	"""Replace each scope child table present in ``data`` with its submitted values."""
+	for table, column in COUPON_SCOPE_TABLES:
+		if table not in data:
+			continue
+		coupon.set(table, [])
+		for entry in data.get(table) or []:
+			value = entry.get(column) if isinstance(entry, dict) else entry
+			if value:
+				coupon.append(table, {column: value})
+
+
 @frappe.whitelist()
 def get_coupon_details(coupon_name):
 	"""Get detailed information about a specific coupon."""
@@ -867,17 +897,15 @@ def create_coupon(data):
 				"maximum_use": cint(data.get("maximum_use", 0)) or None,
 				"one_use": cint(data.get("one_use", 0)),
 				"maximum_use_per_customer": cint(data.get("maximum_use_per_customer", 0)) or 0,
+				"promotion_conflict": _promotion_conflict_for_new_coupon(data),
 				"exclude_already_discounted_items": cint(
-					data.get("exclude_already_discounted_items", 1)
+					_promotion_conflict_for_new_coupon(data) == PROMOTION_CONFLICT_SKIP
 				),
 				"campaign": data.get("campaign"),
 			}
 		)
 
-		for brand in data.get("excluded_brands") or []:
-			brand_name = brand.get("brand") if isinstance(brand, dict) else brand
-			if brand_name:
-				coupon.append("excluded_brands", {"brand": brand_name})
+		_set_coupon_scope_tables(coupon, data)
 
 		coupon.insert()
 
@@ -892,6 +920,16 @@ def create_coupon(data):
 		frappe.db.rollback()
 		frappe.log_error(title=_("Coupon Creation Failed"), message=frappe.get_traceback())
 		frappe.throw(_("Failed to create coupon: {0}").format(str(e)))
+
+
+def _promotion_conflict_for_new_coupon(data) -> str:
+	"""The choice sent with the coupon, else the POS Profile's default, else skip the line."""
+	if data.get("promotion_conflict") in PROMOTION_CONFLICT_OPTIONS:
+		return data["promotion_conflict"]
+	default = data.get("pos_profile") and frappe.db.get_value(
+		"POS Settings", {"pos_profile": data["pos_profile"]}, "default_coupon_promotion_conflict"
+	)
+	return default if default in PROMOTION_CONFLICT_OPTIONS else PROMOTION_CONFLICT_SKIP
 
 
 @frappe.whitelist()
@@ -934,12 +972,7 @@ def update_coupon(coupon_name, data):
 			coupon.applicable_brand = data["applicable_brand"]
 		if "applicable_item_group" in data:
 			coupon.applicable_item_group = data["applicable_item_group"]
-		if "excluded_brands" in data:
-			coupon.set("excluded_brands", [])
-			for brand in data.get("excluded_brands") or []:
-				brand_name = brand.get("brand") if isinstance(brand, dict) else brand
-				if brand_name:
-					coupon.append("excluded_brands", {"brand": brand_name})
+		_set_coupon_scope_tables(coupon, data)
 
 		# Update validity and usage fields
 		if "valid_from" in data:
@@ -954,6 +987,9 @@ def update_coupon(coupon_name, data):
 			coupon.maximum_use_per_customer = cint(data["maximum_use_per_customer"]) or 0
 		if "exclude_already_discounted_items" in data:
 			coupon.exclude_already_discounted_items = cint(data["exclude_already_discounted_items"])
+		if data.get("promotion_conflict") in PROMOTION_CONFLICT_OPTIONS:
+			coupon.promotion_conflict = data["promotion_conflict"]
+			coupon.exclude_already_discounted_items = cint(coupon.promotion_conflict == PROMOTION_CONFLICT_SKIP)
 		if "disabled" in data:
 			coupon.disabled = cint(data["disabled"])
 		if "description" in data:

@@ -751,7 +751,7 @@ class TestPromotions(FrappeTestCase):
 		self.assertAlmostEqual(flt(final.items[0].rate), 30, places=2)
 
 	def test_free_same_item(self):
-		"""Buy 2 get 1 free where free = bought item (bundled on the paid line)."""
+		"""Buy 2 get 1 free where free = bought item: gift is a free row on top."""
 		rule = _make_rule(
 			"_PNXT_TEST_FreeSame",
 			apply_on="Item Code",
@@ -766,20 +766,25 @@ class TestPromotions(FrappeTestCase):
 		)
 		payload = _cart_payload(self.ctx, [_line(self.ctx, ITEM_A, qty=2)])
 		resp = _apply_offers_and_stamp(payload, [rule])
-		self.assertEqual(resp.get("free_items"), [])
-		self.assertEqual(flt(resp["items"][0].get("free_qty")), 1)
+		free_rows = resp.get("free_items") or []
+		self.assertEqual(len(free_rows), 1)
+		self.assertEqual(free_rows[0]["item_code"], ITEM_A)
+		self.assertAlmostEqual(flt(free_rows[0]["qty"]), 1, places=2)
+		# The paid line is not discounted: the gift is not folded into it.
+		self.assertEqual(flt(resp["items"][0].get("free_qty") or 0), 0)
+		self.assertEqual(flt(resp["items"][0].get("discount_amount") or 0), 0)
 
-		# ITEM_A is 50/unit. Cart qty=2, 1 of which is free (carved out of the 2, not
-		# an extra 3rd unit) -> 1 unit actually paid for = 50, not 100.
-		final = _submit_invoice(self.ctx, payload, paid_amount=50)
+		# ITEM_A is 50/unit. 2 paid units + 1 free unit on top -> pay 100.
+		final = _submit_invoice(self.ctx, payload, paid_amount=100)
 
 		self.assertEqual(final.status, "Paid")
-		self.assertAlmostEqual(flt(final.grand_total), 50, places=2)
+		self.assertAlmostEqual(flt(final.grand_total), 100, places=2)
 
 		paid_lines = [it for it in final.items if not it.is_free_item]
 		free_lines = [it for it in final.items if it.is_free_item]
 		self.assertEqual(len(paid_lines), 1)
-		self.assertAlmostEqual(flt(paid_lines[0].qty), 1, places=2)
+		self.assertAlmostEqual(flt(paid_lines[0].qty), 2, places=2)
+		self.assertAlmostEqual(flt(paid_lines[0].rate), 50, places=2)
 		self.assertEqual(len(free_lines), 1)
 		self.assertEqual(free_lines[0].item_code, ITEM_A)
 		self.assertAlmostEqual(flt(free_lines[0].qty), 1, places=2)
@@ -810,8 +815,8 @@ class TestPromotions(FrappeTestCase):
 		self.assertEqual(len(free_lines), 1)
 		self.assertEqual(free_lines[0].item_code, ITEM_C)
 
-	def test_gwp_same_item_requires_extra_scan(self):
-		"""Buy 2 get 1 free of the same SKU: 2 scans do not grant; 3 scans add a free row."""
+	def test_gwp_same_item_paid_qty_qualifies(self):
+		"""Buy 2 get 1 free of the same SKU: paid qty (excl. free rows) >= min_qty grants the free row on top."""
 		import json
 
 		rule = _make_rule(
@@ -827,14 +832,30 @@ class TestPromotions(FrappeTestCase):
 			free_item_rate=0,
 			promotion_type="GWP",
 		)
-		two_scans = _cart_payload(self.ctx, [_line(self.ctx, ITEM_A, qty=2)])
-		resp_two = apply_offers(
-			invoice_data=json.dumps(two_scans),
-			selected_offers=json.dumps([rule]),
-		)
-		self.assertEqual(resp_two.get("free_items") or [], [])
-		self.assertEqual(flt(resp_two["items"][0].get("gwp_free_qty") or 0), 0)
-		self.assertNotIn(rule, resp_two.get("applied_pricing_rules") or [])
+		one_scan = _cart_payload(self.ctx, [_line(self.ctx, ITEM_A, qty=1)])
+		resp_one = apply_offers(invoice_data=json.dumps(one_scan), selected_offers=json.dumps([rule]))
+		self.assertEqual(resp_one.get("free_items") or [], [])
+		self.assertNotIn(rule, resp_one.get("applied_pricing_rules") or [])
+
+		def _free_qty(resp):
+			return sum(flt(f.get("qty")) for f in resp.get("free_items") or [])
+
+		for paid in (2, 3, 4):
+			resp = apply_offers(
+				invoice_data=json.dumps(_cart_payload(self.ctx, [_line(self.ctx, ITEM_A, qty=paid)])),
+				selected_offers=json.dumps([rule]),
+			)
+			self.assertEqual(_free_qty(resp), 1, paid)
+			self.assertIn(rule, resp.get("applied_pricing_rules") or [])
+
+		# Echoed free row must not count toward min_qty (no double counting).
+		free_echo = dict(_line(self.ctx, ITEM_A, qty=1), rate=0, price_list_rate=0, is_free_item=1)
+		echo2 = _cart_payload(self.ctx, [_line(self.ctx, ITEM_A, qty=2), dict(free_echo)])
+		resp_echo2 = apply_offers(invoice_data=json.dumps(echo2), selected_offers=json.dumps([rule]))
+		self.assertEqual(_free_qty(resp_echo2), 1)
+		echo1 = _cart_payload(self.ctx, [_line(self.ctx, ITEM_A, qty=1), dict(free_echo)])
+		resp_echo1 = apply_offers(invoice_data=json.dumps(echo1), selected_offers=json.dumps([rule]))
+		self.assertEqual(_free_qty(resp_echo1), 0)
 
 		three_scans = _cart_payload(self.ctx, [_line(self.ctx, ITEM_A, qty=3)])
 		resp_three = _apply_offers_and_stamp(three_scans, [rule])
@@ -1959,10 +1980,16 @@ class TestPromotionMatrix14214(FrappeTestCase):
 				self._line_14214(companion, qty=3),
 			],
 		)
-		resp = apply_offers(
-			invoice_data=json.dumps(payload),
-			selected_offers=json.dumps([item_rule, gwp_rule]),
-		)
+		# The gift sits on top of the 3 paid units, so 4 must be in stock.
+		# The test warehouse has none for this real item; stub stock so the
+		# test checks stacking, not site inventory.
+		from unittest.mock import patch
+
+		with patch("posnext_promotions.api.apply_offers._get_available_stock", return_value=10):
+			resp = apply_offers(
+				invoice_data=json.dumps(payload),
+				selected_offers=json.dumps([item_rule, gwp_rule]),
+			)
 		self.assertTrue(resp["items"][0].get("is_already_discounted"))
 		companion_line = next(it for it in resp["items"] if it.get("item_code") == companion)
 		self.assertEqual(flt(companion_line.get("gwp_free_qty") or 0), 0)

@@ -22,6 +22,9 @@ def _coupon(**kwargs):
 		"apply_scope": "All Eligible Items",
 		"applicable_brand": None,
 		"applicable_item_group": None,
+		"applicable_items": [],
+		"applicable_item_groups": [],
+		"applicable_brands": [],
 		"excluded_brands": [],
 		"min_amount": None,
 		"max_amount": None,
@@ -87,6 +90,7 @@ class TestPOSCoupon(unittest.TestCase):
 		self.assertEqual(_get_per_customer_use_limit(_coupon(one_use=0, maximum_use_per_customer=0)), 0)
 
 	def test_eligible_items_exclude_discounted_free_and_excluded_brand(self):
+		"""Exclude manual discounts, free items, excluded brands — not other promo types."""
 		coupon = _coupon(
 			excluded_brands=[{"brand": "BrandX"}],
 		)
@@ -133,11 +137,22 @@ class TestPOSCoupon(unittest.TestCase):
 				"price_list_rate": 100,
 				"rate": 100,
 				"pricing_rules": ["PR-1"],
+				"discount_source": "gwp",
+			},
+			{
+				"item_code": "F",
+				"brand": "BrandA",
+				"item_group": "Group1",
+				"qty": 1,
+				"price_list_rate": 100,
+				"rate": 90,
+				"discount_percentage": 10,
+				"discount_source": "auto_discount",
 			},
 		]
 
 		eligible = get_coupon_eligible_items(coupon, items)
-		self.assertEqual([i["item_code"] for i in eligible], ["A"])
+		self.assertEqual([i["item_code"] for i in eligible], ["A", "E"])
 
 	def test_matrix_coupon_excludes_excluded_brand(self):
 		"""Excluded brand × Coupon = excluded per Promotion Interaction Matrix."""
@@ -163,6 +178,44 @@ class TestPOSCoupon(unittest.TestCase):
 
 		eligible = get_coupon_eligible_items(coupon, items)
 		self.assertEqual([i["item_code"] for i in eligible], ["Eligible"])
+
+	def test_scope_item_code_item_groups_and_brands_tables(self):
+		items = [
+			{"item_code": "A", "brand": "Nike", "item_group": "Shoes", "qty": 1, "price_list_rate": 10, "rate": 10},
+			{"item_code": "B", "brand": "Adidas", "item_group": "Caps", "qty": 1, "price_list_rate": 10, "rate": 10},
+			{"item_code": "C", "brand": "Puma", "item_group": "Bags", "qty": 1, "price_list_rate": 10, "rate": 10},
+		]
+
+		def codes(coupon):
+			return [i["item_code"] for i in get_coupon_eligible_items(coupon, items)]
+
+		by_item = _coupon(apply_scope="Item Code", applicable_items=[{"item_code": "A"}, {"item_code": "C"}])
+		by_group = _coupon(
+			apply_scope="Item Group", applicable_item_groups=[{"item_group": "Shoes"}, {"item_group": "Caps"}]
+		)
+		by_brand = _coupon(apply_scope="Brand", applicable_brands=[{"brand": "Adidas"}, {"brand": "Puma"}])
+		empty = _coupon(apply_scope="Item Code")
+
+		self.assertEqual(codes(by_item), ["A", "C"])
+		self.assertEqual(codes(by_group), ["A", "B"])
+		self.assertEqual(codes(by_brand), ["B", "C"])
+		self.assertEqual(codes(empty), [])
+
+	def test_item_group_scope_includes_child_groups(self):
+		bounds = {"All Item Groups": [1, 10], "Shoes": [2, 3], "Caps": [4, 5]}
+		lft = {k: v[0] for k, v in bounds.items()}
+
+		def get_value(doctype, name, field):
+			return bounds.get(name) if isinstance(field, list) else lft.get(name)
+
+		db = Mock()
+		db.get_value.side_effect = get_value
+		root = _coupon(apply_scope="Item Group", applicable_item_groups=[{"item_group": "All Item Groups"}])
+		shoes = _coupon(apply_scope="Item Group", applicable_item_groups=[{"item_group": "Shoes"}])
+		item = {"item_code": "A", "item_group": "Caps", "qty": 1, "price_list_rate": 10, "rate": 10}
+		with patch("posnext_promotions.api.coupon_engine.frappe.db", new=db):
+			self.assertEqual(len(get_coupon_eligible_items(root, [item])), 1)
+			self.assertEqual(len(get_coupon_eligible_items(shoes, [item])), 0)
 
 	def test_scope_brand_and_item_group(self):
 		brand_coupon = _coupon(apply_scope="Brand", applicable_brand="Nike")
@@ -378,6 +431,187 @@ class TestPOSCoupon(unittest.TestCase):
 		self.assertFalse(result["valid"])
 		self.assertIn("Minimum eligible amount", result["message"])
 
+	def test_matrix_excludes_already_discounted_even_when_flag_off(self):
+		"""Manual / item-level discount blocks coupon even when exclude flag is off."""
+		coupon = _coupon(
+			discount_percentage=10,
+			exclude_already_discounted_items=0,
+		)
+		items = [
+			{
+				"item_code": "A",
+				"brand": "B1",
+				"item_group": "G1",
+				"qty": 1,
+				"price_list_rate": 100,
+				"rate": 80,
+				"discount_percentage": 20,
+			}
+		]
+		result = apply_coupon_to_items(coupon, items)
+		self.assertFalse(result["valid"])
+		self.assertEqual(result["line_updates"], [])
+		self.assertIn("auto discount or item level", result["message"].lower())
+
+	def test_matrix_allows_coupon_on_non_auto_item_level_promo(self):
+		"""GWP / other promo types stamped with pricing_rules stay coupon-eligible."""
+		coupon = _coupon(discount_percentage=20, exclude_already_discounted_items=0)
+		items = [
+			{
+				"item_code": "SLA-PAID",
+				"brand": "SLA",
+				"item_group": "G1",
+				"qty": 1,
+				"price_list_rate": 16000,
+				"rate": 16000,
+				"pricing_rules": "PRLE-0215",
+				"discount_source": "gwp",
+				"is_already_discounted": 1,
+			},
+			{
+				"item_code": "SLA-FREE",
+				"brand": "SLA",
+				"item_group": "G1",
+				"qty": 1,
+				"price_list_rate": 0,
+				"rate": 0,
+				"is_free_item": 1,
+				"pricing_rules": "PRLE-0215",
+			},
+		]
+		result = apply_coupon_to_items(coupon, items)
+		self.assertTrue(result["valid"])
+		self.assertEqual(len(result["line_updates"]), 1)
+		self.assertEqual(result["line_updates"][0]["item_code"], "SLA-PAID")
+		self.assertAlmostEqual(result["total_discount"], 3200.0, places=4)
+		eligible_codes = [i["item_code"] for i in get_coupon_eligible_items(coupon, items)]
+		self.assertEqual(eligible_codes, ["SLA-PAID"])
+
+	def test_matrix_excludes_auto_discount_line(self):
+		"""Auto Discount lines never receive a coupon."""
+		coupon = _coupon(discount_percentage=10, exclude_already_discounted_items=0)
+		items = [
+			{
+				"item_code": "A",
+				"brand": "B1",
+				"item_group": "G1",
+				"qty": 1,
+				"price_list_rate": 100,
+				"rate": 90,
+				"discount_percentage": 10,
+				"discount_source": "auto_discount",
+				"is_already_discounted": 0,
+			}
+		]
+		result = apply_coupon_to_items(coupon, items)
+		self.assertFalse(result["valid"])
+		self.assertEqual(get_coupon_eligible_items(coupon, items), [])
+
+	def test_matrix_excludes_item_level_discount_line(self):
+		"""Item Level Discount lines never receive a coupon."""
+		coupon = _coupon(discount_percentage=10, exclude_already_discounted_items=0)
+		items = [
+			{
+				"item_code": "A",
+				"brand": "B1",
+				"item_group": "G1",
+				"qty": 1,
+				"price_list_rate": 100,
+				"rate": 80,
+				"discount_percentage": 20,
+				"discount_source": "item_level_promotion",
+				"is_already_discounted": 1,
+			}
+		]
+		result = apply_coupon_to_items(coupon, items)
+		self.assertFalse(result["valid"])
+		self.assertEqual(get_coupon_eligible_items(coupon, items), [])
+
+	def test_percentage_on_normal_eligible_item(self):
+		"""Matrix: normal eligible item receives coupon % on list price."""
+		coupon = _coupon(discount_percentage=10, exclude_already_discounted_items=0)
+		items = [
+			{
+				"item_code": "A",
+				"brand": "B1",
+				"item_group": "G1",
+				"qty": 1,
+				"price_list_rate": 100,
+				"rate": 100,
+			}
+		]
+		result = apply_coupon_to_items(coupon, items)
+		self.assertTrue(result["valid"])
+		self.assertAlmostEqual(result["total_discount"], 10.0, places=4)
+		self.assertAlmostEqual(result["line_updates"][0]["discount_percentage"], 10.0, places=4)
+		self.assertAlmostEqual(result["line_updates"][0]["rate"], 90.0, places=4)
+		self.assertEqual(result["line_updates"][0]["pre_coupon_discount_fraction"], 0)
+
 
 if __name__ == "__main__":
 	unittest.main()
+
+
+def _promo_line(code="PHONE", base=1000, pct=10, **extra):
+	"""A line already discounted by an untyped Promotional Scheme rule."""
+	return {
+		"item_code": code,
+		"brand": "B1",
+		"item_group": "G1",
+		"qty": 1,
+		"price_list_rate": base,
+		"rate": base * (1 - pct / 100),
+		"discount_percentage": pct,
+		"discount_amount": base * pct / 100,
+		"pricing_rules": "PRLE-UNTYPED",
+		"discount_source": "pricing_rule",
+		"is_already_discounted": 0,
+		**extra,
+	}
+
+
+def _plain_line(code="CABLE", base=100):
+	return {"item_code": code, "brand": "B1", "item_group": "G1", "qty": 1, "price_list_rate": base, "rate": base}
+
+
+class TestCouponPromotionConflict(unittest.TestCase):
+	"""What a coupon does on a line that already carries a promotion."""
+
+	def test_skip_leaves_a_promoted_line_alone(self):
+		coupon = _coupon(discount_percentage=10, promotion_conflict="Skip the line")
+		result = apply_coupon_to_items(coupon, [_promo_line(), _plain_line()])
+		self.assertEqual([u["item_code"] for u in result["line_updates"]], ["CABLE"])
+		self.assertAlmostEqual(result["total_discount"], 10.0)
+
+	def test_blank_setting_skips(self):
+		result = apply_coupon_to_items(_coupon(discount_percentage=10), [_promo_line()])
+		self.assertFalse(result["valid"])
+		self.assertEqual(result["line_updates"], [])
+
+	def test_add_on_top_keeps_the_promotion_and_discounts_what_is_left(self):
+		coupon = _coupon(discount_percentage=10, promotion_conflict="Add on top")
+		[update] = apply_coupon_to_items(coupon, [_promo_line()])["line_updates"]
+		# 10% promo leaves 900; the coupon takes 10% of that: 90
+		self.assertAlmostEqual(update["coupon_only_discount"], 90.0)
+		self.assertAlmostEqual(update["discount_amount"], 190.0)
+		self.assertAlmostEqual(update["rate"], 810.0)
+		self.assertTrue(update["stacked"])
+
+	def test_better_replaces_a_smaller_promotion(self):
+		coupon = _coupon(discount_percentage=20, promotion_conflict="Better of the two")
+		[update] = apply_coupon_to_items(coupon, [_promo_line(pct=10)])["line_updates"]
+		self.assertAlmostEqual(update["discount_amount"], 200.0)
+		self.assertFalse(update.get("stacked"))
+
+	def test_better_keeps_a_larger_promotion(self):
+		coupon = _coupon(discount_percentage=10, promotion_conflict="Better of the two")
+		result = apply_coupon_to_items(coupon, [_promo_line(pct=30), _plain_line()])
+		self.assertEqual([u["item_code"] for u in result["line_updates"]], ["CABLE"])
+		self.assertEqual(result["kept_promotion_items"], ["PHONE"])
+
+	def test_better_rechecks_after_the_cap(self):
+		# 15% of 1000 = 150 beats the 100 promo, but the 80 cap brings it under: promo stays
+		coupon = _coupon(discount_percentage=15, max_amount=80, promotion_conflict="Better of the two")
+		result = apply_coupon_to_items(coupon, [_promo_line(pct=10)])
+		self.assertFalse(result["valid"])
+		self.assertEqual(result["kept_promotion_items"], ["PHONE"])

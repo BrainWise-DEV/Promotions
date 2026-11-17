@@ -23,6 +23,25 @@ from posnext_promotions.promotions.engine import (
 	rule_promotion_type,
 	run_line_discount_passes,
 )
+
+from posnext_promotions.promotions import best_discount as bd
+from posnext_promotions.promotions.friends_and_family_apply import (
+	DISCOUNT_SOURCE_FRIENDS_AND_FAMILY,
+	REASON_ORDER_DISCOUNT_BETTER,
+	REASON_PROTECTED,
+	_clear_fnf_audit_fields,
+	_is_fnf_stamped,
+	_strip_line_discount,
+	apply_friends_and_family_to_items,
+	summarize_line_payloads,
+)
+from posnext_promotions.promotions.friends_and_family_caps import FIELD_FNF_REPLACED
+from posnext_promotions.promotions.friends_and_family_gifts import (
+	allow_free_gift_with_ff,
+	fnf_stamped_indices,
+	mark_fnf_ineligible_lines,
+	suppress_incompatible_gifts,
+)
 from posnext_promotions.promotions.schedule import (
 	filter_rules_by_schedule,
 	get_inactive_rules,
@@ -148,23 +167,6 @@ def _stamp_gwp_line_discount(item_doc, line_free_qty, price_list_rate) -> None:
 	item_doc.rate = flt(price_list_rate - (line_discount / purchased_qty))
 
 
-def _stamp_bundled_same_item_free_discount(item_doc, line_free_qty, price_list_rate) -> None:
-	"""Apply same-item free gift on the purchased line (1 of N units free, no extra row)."""
-	line_free_qty = _floor_free_item_qty(line_free_qty)
-	purchased_qty = flt(item_doc.get("qty") or item_doc.get("quantity") or 0)
-	price_list_rate = flt(price_list_rate)
-	line_discount = calculate_gwp_discount_amount(line_free_qty, price_list_rate)
-	if line_discount <= 0 or purchased_qty <= 0:
-		return
-
-	item_doc.discount_amount = line_discount
-	item_doc.discount_percentage = 0
-	item_doc.gwp_free_qty = 0
-	item_doc.free_qty = line_free_qty
-	item_doc.discount_source = DISCOUNT_SOURCE_FREE_ITEM
-	item_doc.rate = flt(price_list_rate - (line_discount / purchased_qty))
-
-
 def _make_free_item_doc(item_code, qty, rule_name, full_rule, promotional_scheme=None, **extra):
 	"""Build a free-item payload for ``free_items_map``."""
 	item_data = frappe.get_cached_value(
@@ -199,13 +201,13 @@ def _recompute_recursive_product_free_items(prepared_items, free_items_map, rule
 	   is rejected). Item Code other-item scopes evaluate each line alone and
 	   sum free gifts.
 
-	3. Same-item free qty uses the included cycle
-	   (recurse_for + free_qty; qty 3 → 1 free / pay 2). Bundled on the paid
-	   line as amount discount + free badge — no percentage.
+	3. Same-item free qty is added on top of the paid qty
+	   (paid // recurse_for * free_qty; buy 2 get 1 → 2 paid + 1 free row),
+	   matching ERPNext same_item semantics and the same-SKU GWP path.
 
 	4. When free qty is 0, strip the rule from lines / applied_rules so the UI
 	   does not show "Applied" without a discount (e.g. qty 2 with min_qty 2
-	   but cycle needs 3).
+	   but recurse_for needs more).
 	"""
 	if not compute_product_recursive_free_qty or not should_aggregate_product_quantities:
 		return
@@ -343,51 +345,12 @@ def _recompute_recursive_product_free_items(prepared_items, free_items_map, rule
 		if not line_gave_free and applied_rules is not None:
 			applied_rules.discard(rule_name)
 
-def _apply_bundled_same_item_free_discounts(prepared_items, free_items_map, rule_map) -> None:
-	"""Bundle non-GWP same-item free gifts onto the paid line instead of a separate row."""
-	if not calculate_gwp_discount_amount:
-		return
-
-	for key in list(free_items_map.keys()):
-		item_code, rule_name = key
-		if rule_name not in rule_map:
-			continue
-		if rule_promotion_type(rule_map[rule_name]) in (PROMOTION_TYPE_GWP, PROMOTION_TYPE_GIFT_POOL):
-			continue
-
-		full_rule = frappe.get_cached_doc("Pricing Rule", rule_name)
-		if full_rule.price_or_product_discount != "Product" or not full_rule.same_item:
-			continue
-
-		free_item_doc = free_items_map.pop(key)
-		free_qty = _floor_free_item_qty(free_item_doc.get("qty"))
-		if free_qty <= 0:
-			continue
-
-		for item_doc in prepared_items:
-			if item_doc.get("is_free_item"):
-				continue
-			if item_doc.get("item_code") != item_code:
-				continue
-			if not _item_matches_gwp_rule(item_doc, full_rule) and rule_name not in _item_pricing_rule_names(
-				item_doc
-			):
-				continue
-
-			price_list_rate = flt(
-				item_doc.get("price_list_rate") or item_doc.get("rate") or 0
-			)
-			_stamp_bundled_same_item_free_discount(item_doc, free_qty, price_list_rate)
-			append_pricing_rule(item_doc, rule_name)
-			break
-
-
 def _apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_rules=None) -> None:
 	"""Apply GWP: same-SKU gifts as a free row; mixed SKUs as line discounts.
 
-	Same item (one SKU in the cart): free units must be extra scanned items,
-	not carved from min_qty. Buy 2 get 1 free requires 3 scans — 2 paid + 1
-	free row with a free-item badge.
+	Same item (one SKU in the cart): paid qty (excluding echoed free rows)
+	must reach min_qty; free units are added on top as a separate free row.
+	Buy 2 get 1 free: 2 paid scans -> +1 free row.
 
 	Multi-item / item-group with mixed SKUs: total qty must fall between
 	min_qty and max_qty; free_qty is discounted on cheapest (Max Price basis)
@@ -410,7 +373,9 @@ def _apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_
 				free_items_map.pop(key, None)
 
 		scheme_item_count = len(full_rule.get("items") or [])
-		aggregate = should_aggregate_gwp_quantities(full_rule.apply_on, scheme_item_count)
+		aggregate = should_aggregate_gwp_quantities(
+			full_rule.apply_on, scheme_item_count, cint(full_rule.get("mixed_conditions"))
+		)
 		paid_qty_basis = full_rule.get("gwp_paid_qty_basis") or GWP_BASIS_MAX
 		slab_free_qty = flt(full_rule.free_qty or 0)
 		promotional_scheme = rule_map[rule_name].get("promotional_scheme")
@@ -431,12 +396,19 @@ def _apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_
 		same_item_split = len(item_codes) == 1 and bool(get_gwp_same_item_free_qty)
 
 		if same_item_split:
-			line_qtys = [
-				flt(item_doc.get("qty") or item_doc.get("quantity") or 0) for item_doc in matching_lines
-			]
-			total_qty = sum(line_qtys)
+			# Only paid units qualify; echoed free rows (is_free_item) never count
+			# toward min_qty — the gift is added on top (ERPNext same_item style).
+			paid_qty = sum(
+				flt(item_doc.get("qty") or item_doc.get("quantity") or 0) for item_doc in paid_lines
+			)
 			total_free = get_gwp_same_item_free_qty(
-				slab_free_qty, total_qty, full_rule.min_qty, full_rule.max_qty
+				slab_free_qty,
+				paid_qty,
+				full_rule.min_qty,
+				full_rule.max_qty,
+				is_recursive=cint(full_rule.get("is_recursive")),
+				recurse_for=full_rule.get("recurse_for"),
+				apply_recursion_over=full_rule.get("apply_recursion_over"),
 			)
 			if total_free <= 0:
 				for item_doc in paid_lines:
@@ -796,10 +768,6 @@ def _filter_out_of_stock_free_items(
 			leftover[stock_key] = available - paid_demand.get(stock_key, 0)
 
 		if leftover[stock_key] < requested:
-			# Same-SKU GWP free units are carved from already-scanned paid qty,
-			# so they do not need extra warehouse stock beyond the paid demand.
-			if cint(free_doc.get("gwp_same_item_row")) and paid_demand.get(stock_key, 0) >= requested:
-				continue
 			free_items_map.pop(key, None)
 			skipped.append(
 				{
@@ -1080,6 +1048,226 @@ def _evaluate_transaction_offers(
 	}
 
 
+def _friends_and_family_response_block(ff_result) -> dict:
+	return {
+		"eligible": ff_result.get("eligible"),
+		"discount_percentage": ff_result.get("discount_percentage"),
+		"applied_count": ff_result.get("applied_count"),
+		"message": ff_result.get("message"),
+		"reason": ff_result.get("reason"),
+		"items": ff_result.get("items"),
+		# PN-129: per-order / monthly caps — limits, usage, remaining, EN/AR message.
+		"caps": ff_result.get("caps"),
+		"cap_hit": ff_result.get("cap_hit"),
+	}
+
+
+def _friends_and_family_only_response(items, prepared_items, customer, invoice) -> dict:
+	"""No promotion applies to the cart — Friends & Family still must.
+
+	Without this the early "no pricing rules" returns skipped F&F entirely, so
+	the POS cart never showed it until the invoice was saved.
+	"""
+	ff_result = apply_friends_and_family_to_items(
+		prepared_items,
+		customer=customer,
+		posting_date=invoice.get("posting_date") or nowdate(),
+		pos_profile=invoice.get("pos_profile"),
+	)
+	if not ff_result.get("eligible"):
+		# Keep the cart as sent, minus any stale F&F stamp (e.g. customer
+		# switched to an ineligible one / program ended): those lines come back
+		# at list price with no F&F metadata. Tell the POS why F&F is off.
+		cleaned = [
+			dict(prepared) if _is_fnf_stamped(original) else original
+			for original, prepared in zip(items, prepared_items, strict=False)
+		]
+		return {"items": cleaned, "friends_and_family": _friends_and_family_response_block(ff_result)}
+	return {
+		"items": [dict(item) for item in prepared_items],
+		"free_items": [],
+		"skipped_free_items": [],
+		"applied_pricing_rules": [],
+		"additional_discount_percentage": 0,
+		"discount_amount": 0,
+		"apply_discount_on": None,
+		"friends_and_family": _friends_and_family_response_block(ff_result),
+		"best_discount": ff_result.get("best_discount"),
+	}
+
+
+def _fold_line_discounts(pricing_items, index_map, prepared_items) -> None:
+	"""Fold item-level discounts back into `pricing_items` for the transaction engine.
+
+	`pricing_items` was built pre-discount (rate == list rate, discount fields
+	zeroed) to feed the per-item engine; leaving it that way makes the
+	transaction engine see the *gross* cart total, which both lets min_amt-gated
+	rules fire on a cart that never reached the threshold and sizes their
+	percentage off the undiscounted base.
+
+	Prefer `discount_percentage` when set. Same-item free gifts stamp an
+	absolute `discount_amount` with percentage 0 — convert that to a net rate so
+	transaction min_amt rules still see the post-discount total.
+	"""
+	for pricing_item, item_index in zip(pricing_items, index_map, strict=False):
+		prepared_item = prepared_items[item_index]
+		list_rate = flt(prepared_item.get("price_list_rate")) or flt(pricing_item.price_list_rate)
+		discount_pct = flt(prepared_item.get("discount_percentage") or 0)
+		line_qty = flt(prepared_item.get("qty") or prepared_item.get("quantity") or pricing_item.qty or 0)
+		discount_amt = flt(prepared_item.get("discount_amount") or 0)
+
+		if discount_pct:
+			net_rate = list_rate * (1 - discount_pct / 100.0) if list_rate else flt(pricing_item.rate)
+		elif discount_amt and line_qty:
+			net_rate = max(0, list_rate - (discount_amt / line_qty))
+		else:
+			net_rate = list_rate if list_rate else flt(pricing_item.rate)
+
+		pricing_item.price_list_rate = list_rate
+		pricing_item.base_price_list_rate = list_rate
+		pricing_item.rate = net_rate
+		pricing_item.base_rate = net_rate
+		pricing_item.discount_percentage = discount_pct
+
+
+def _run_transaction_offers(
+	pricing_items,
+	invoice,
+	profile,
+	customer,
+	customer_group,
+	territory,
+	posting_date,
+	currency,
+	price_list,
+	rule_map,
+	selected_offer_names,
+):
+	result = _evaluate_transaction_offers(
+		invoice,
+		profile,
+		pricing_items,
+		customer,
+		customer_group,
+		territory,
+		posting_date,
+		currency,
+		price_list,
+		rule_map,
+		selected_offer_names,
+	)
+	return filter_auto_discount_from_header(result, rule_map, selected_offer_names)
+
+
+def _txn_header_value(txn_result, pricing_items) -> float:
+	"""Money value of a transaction-scope header discount (0 when none fired)."""
+	if not txn_result:
+		return 0.0
+	amount = flt(txn_result.get("discount_amount") or 0)
+	pct = flt(txn_result.get("additional_discount_percentage") or 0)
+	if pct:
+		net_total = sum(flt(p.qty) * flt(p.rate) for p in pricing_items or [])
+		amount = max(amount, net_total * pct / 100.0)
+	return amount
+
+
+def _txn_header_rule_names(txn_result, rule_map) -> set:
+	return {
+		name
+		for name in (txn_result or {}).get("applied_rules") or set()
+		if name in rule_map and rule_map[name].get("price_or_product_discount") == "Price"
+	}
+
+
+def _strip_txn_header(txn_result, rule_map) -> dict:
+	"""F&F won the order-level comparison: drop the header discount (no stacking)."""
+	header_rules = _txn_header_rule_names(txn_result, rule_map)
+	return {
+		**txn_result,
+		"applied_rules": set(txn_result.get("applied_rules") or set()) - header_rules,
+		"additional_discount_percentage": 0,
+		"discount_amount": 0,
+		"apply_discount_on": None,
+	}
+
+
+def _paid_lines(items):
+	return [i for i in items or [] if not i.get("is_free_item")]
+
+
+def _decide_fnf_vs_order_promotion(prepared_items, pre_fnf_items, txn_without_fnf, b_pricing_items, ff_result):
+	"""Total savings: (F&F lines, no header) vs (no F&F, header promotion). Tie → F&F."""
+	a_total = sum(bd.line_discount_value(i) for i in _paid_lines(prepared_items))
+	b_lines = sum(bd.line_discount_value(i) for i in _paid_lines(pre_fnf_items))
+	b_header = _txn_header_value(txn_without_fnf, b_pricing_items)
+	decision = bd.decide(
+		[
+			bd.Candidate(
+				source=bd.SOURCE_FRIENDS_AND_FAMILY,
+				amount=a_total,
+				percentage=flt(ff_result.get("discount_percentage")) or None,
+			),
+			bd.Candidate(
+				source=bd.SOURCE_ORDER_PROMOTION,
+				amount=b_lines + b_header,
+				percentage=flt(txn_without_fnf.get("additional_discount_percentage")) or None,
+			),
+		],
+		granularity=bd.GRANULARITY_ORDER,
+	)
+	return decision.to_payload(), decision.fnf_wins
+
+
+def _mark_fnf_lost_to_order(ff_result) -> None:
+	ff_result["applied_count"] = 0
+	ff_result["reason"] = REASON_ORDER_DISCOUNT_BETTER
+	ff_result["suppressed_pricing_rules"] = []
+	if ff_result.get("caps"):
+		ff_result["caps"]["fnf_applied_total"] = 0.0
+	for line in ff_result.get("items") or []:
+		if line.get("applies"):
+			line.update({"applies": False, "reason": REASON_ORDER_DISCOUNT_BETTER, "discount_percentage": 0.0})
+
+
+def _reconcile_fnf_after_free_passes(ff_result, prepared_items, order_decision=None) -> None:
+	"""Sync the F&F report with the final lines and attach the best-discount summary."""
+	for line in ff_result.get("items") or []:
+		idx = line.get("idx")
+		if not line.get("applies") or idx is None or idx >= len(prepared_items):
+			continue
+		if prepared_items[idx].get("discount_source") != DISCOUNT_SOURCE_FRIENDS_AND_FAMILY:
+			line.update(
+				{"applies": False, "reason": REASON_PROTECTED, "discount_percentage": 0.0, "best_discount": None}
+			)
+			ff_result["applied_count"] = max(0, cint(ff_result.get("applied_count")) - 1)
+
+	summary = summarize_line_payloads(ff_result.get("items") or [])
+	summary["caps"] = ff_result.get("caps")
+	if order_decision:
+		summary["order"] = order_decision
+		summary["granularity"] = bd.GRANULARITY_ORDER
+		summary["winner"] = order_decision["winner"]
+		for key in ("message", "message_en", "message_ar"):
+			summary[key] = order_decision[key]
+	ff_result["best_discount"] = summary
+
+
+def _prune_suppressed_rules(applied_rules, ff_result, prepared_items, free_items_map) -> None:
+	"""Drop Pricing Rules whose only effect was a line discount F&F replaced."""
+	suppressed = set(ff_result.get("suppressed_pricing_rules") or [])
+	if not suppressed:
+		return
+	still_used = set()
+	for item in prepared_items:
+		raw = item.get("pricing_rules")
+		if isinstance(raw, list | tuple | set):
+			still_used.update(cstr(r) for r in raw)
+		elif raw:
+			still_used.update(r.strip() for r in cstr(raw).strip("[]").replace('"', "").split(",") if r.strip())
+	still_used.update(rule for (_code, rule) in free_items_map)
+	applied_rules.difference_update(suppressed - still_used)
+
+
 @frappe.whitelist()
 def apply_offers(invoice_data, selected_offers=None):
 	"""Calculate and apply promotional offers using ERPNext Pricing Rules.
@@ -1137,6 +1325,17 @@ def apply_offers(invoice_data, selected_offers=None):
 		prepared_items = [frappe._dict(row) for row in items]
 
 		for idx, item in enumerate(prepared_items):
+			# A previous Friends & Family stamp is engine output, not a cashier
+			# discount: take the line back to list price *before* it is priced, so
+			# F&F is re-decided below (otherwise switching to an ineligible
+			# customer would keep the old F&F rate / % as "manual").
+			is_fnf_stamp = _is_fnf_stamped(item)
+			if is_fnf_stamp:
+				_strip_line_discount(item)
+			else:
+				_clear_fnf_audit_fields(item)
+				item.pop(FIELD_FNF_REPLACED, None)
+
 			item_code = item.get("item_code")
 			qty = flt(item.get("qty") or item.get("quantity") or 0)
 
@@ -1200,7 +1399,7 @@ def apply_offers(invoice_data, selected_offers=None):
 			# current quantity can no longer satisfy the rule.
 			# Preserve manual cashier discounts across offer re-evaluation.
 			is_manual = item.get("discount_source") == DISCOUNT_SOURCE_MANUAL
-			if not is_manual and not item.get("pricing_rules"):
+			if not is_manual and not is_fnf_stamp and not item.get("pricing_rules"):
 				is_manual = flt(item.get("discount_percentage")) > 0 or flt(item.get("discount_amount")) > 0
 				if is_manual:
 					item.discount_source = DISCOUNT_SOURCE_MANUAL
@@ -1281,7 +1480,7 @@ def apply_offers(invoice_data, selected_offers=None):
 		pricing_results = erpnext_apply_pricing_rule(pricing_args, doc=pricing_args) or []
 
 		if not pricing_results and not selected_offer_names:
-			return {"items": items}
+			return _friends_and_family_only_response(items, prepared_items, customer, invoice)
 
 		raw_rule_names = set()
 		for result in pricing_results:
@@ -1408,7 +1607,7 @@ def apply_offers(invoice_data, selected_offers=None):
 		rule_map = filter_rules_by_schedule(rule_map, when=schedule_moment)
 
 		if not rule_map:
-			return {"items": items}
+			return _friends_and_family_only_response(items, prepared_items, customer, invoice)
 
 		applied_rules = set()
 		# Deduplicate free items using a dict keyed by (item_code, pricing_rule).
@@ -1550,51 +1749,48 @@ def apply_offers(invoice_data, selected_offers=None):
 		# Surface Min/Max rules in the response so the frontend tracks them as applied.
 		if erpnext_get_applied_pricing_rules:
 			for prepared_item in prepared_items:
+				# Free-gift rows carry the pricing_rules the *previous* response
+				# stamped on them; they are echoed back by the cart, not decided by
+				# this pass. Counting them reported a gift rule (e.g. a min_amt
+				# "spend X get Y" Transaction rule) as applied while free_items was
+				# empty, leaving a stale APPLIED offer in the POS and feeding the
+				# apply/remove loop. Free-item rules are surfaced by the free-item
+				# paths above when they genuinely fire.
+				if prepared_item.get("is_free_item"):
+					continue
 				if not prepared_item.get("pricing_rules"):
 					continue
 				for pr_name in erpnext_get_applied_pricing_rules(prepared_item.get("pricing_rules")):
 					if pr_name in rule_map:
 						applied_rules.add(pr_name)
 
+		# Friends & Family (PN-126 / PN-128): best single discount per line — F&F vs
+		# whatever promotion / manual discount the line carries, compared in money,
+		# tie → F&F, never stacked. Percentage always from Settings.
+		# Snapshot the lines first: scenario "no F&F" for the order-level check.
+		# Miraaya: Buy X Get Y / Routine (Item Level Discount) lines are not
+		# eligible for F&F. Flag them *before* F&F runs — BXGY free units are only
+		# valued further down, so the paid line would otherwise look undiscounted.
+		mark_fnf_ineligible_lines(prepared_items, rule_map)
+		pre_fnf_items = [frappe._dict(dict(item)) for item in prepared_items]
+		ff_result = apply_friends_and_family_to_items(
+			prepared_items,
+			customer=customer,
+			posting_date=invoice.get("posting_date") or nowdate(),
+			pos_profile=invoice.get("pos_profile"),
+		)
+
 		# Fold the item-level discounts decided above back into `pricing_items`
-		# before the transaction-scoped engine runs. `pricing_items` was built
-		# pre-discount (rate == list rate, discount fields zeroed) to feed the
-		# per-item engine; leaving it that way makes the transaction engine see
-		# the *gross* cart total, which both lets min_amt-gated rules fire on a
-		# cart that never reached the threshold and sizes their percentage off
-		# the undiscounted base.
-		#
-		# Prefer `discount_percentage` when set. Same-item free gifts stamp an
-		# absolute `discount_amount` with percentage 0 — convert that to a net
-		# rate so transaction min_amt rules still see the post-discount total.
-		for pricing_item, item_index in zip(pricing_items, index_map, strict=False):
-			prepared_item = prepared_items[item_index]
-			list_rate = flt(prepared_item.get("price_list_rate")) or flt(pricing_item.price_list_rate)
-			discount_pct = flt(prepared_item.get("discount_percentage") or 0)
-			line_qty = flt(prepared_item.get("qty") or prepared_item.get("quantity") or pricing_item.qty or 0)
-			discount_amt = flt(prepared_item.get("discount_amount") or 0)
-
-			if discount_pct:
-				net_rate = list_rate * (1 - discount_pct / 100.0) if list_rate else flt(pricing_item.rate)
-			elif discount_amt and line_qty:
-				net_rate = max(0, list_rate - (discount_amt / line_qty))
-			else:
-				net_rate = list_rate if list_rate else flt(pricing_item.rate)
-
-			pricing_item.price_list_rate = list_rate
-			pricing_item.base_price_list_rate = list_rate
-			pricing_item.rate = net_rate
-			pricing_item.base_rate = net_rate
-			pricing_item.discount_percentage = discount_pct
+		# before the transaction-scoped engine runs (see _fold_line_discounts).
+		_fold_line_discounts(pricing_items, index_map, prepared_items)
 
 		# Evaluate apply_on="Transaction" rules through ERPNext's separate
 		# transaction-level engine. The per-item engine above does not see
 		# them, so without this step "Entire Transaction" promotional schemes
 		# (free product based on cart total) would never apply.
-		txn_result = _evaluate_transaction_offers(
+		txn_args = (
 			invoice,
 			profile,
-			pricing_items,
 			customer,
 			customer_group,
 			territory,
@@ -1604,7 +1800,28 @@ def apply_offers(invoice_data, selected_offers=None):
 			rule_map,
 			selected_offer_names,
 		)
-		txn_result = filter_auto_discount_from_header(txn_result, rule_map, selected_offer_names)
+		txn_result = _run_transaction_offers(pricing_items, *txn_args)
+
+		# PN-128 order level: F&F on lines vs a transaction-scope header discount.
+		order_decision = None
+		if ff_result.get("applied_count") and _txn_header_value(txn_result, pricing_items):
+			b_pricing_items = [frappe._dict(dict(row)) for row in pricing_items]
+			_fold_line_discounts(b_pricing_items, index_map, pre_fnf_items)
+			txn_without_fnf = _run_transaction_offers(b_pricing_items, *txn_args)
+			order_decision, keep_fnf = _decide_fnf_vs_order_promotion(
+				prepared_items, pre_fnf_items, txn_without_fnf, b_pricing_items, ff_result
+			)
+			if keep_fnf:
+				txn_result = _strip_txn_header(txn_result, rule_map)
+			else:
+				prepared_items[:] = pre_fnf_items
+				pricing_items = b_pricing_items
+				txn_result = txn_without_fnf
+				_mark_fnf_lost_to_order(ff_result)
+
+		# Paid lines that hold F&F before the gift passes (Allow Free Gift with F&F).
+		fnf_line_indices = fnf_stamped_indices(prepared_items)
+
 		# Per-item results win on collisions because they already carry full
 		# discount metadata from the per-item engine result.
 		for key, free_item_doc in txn_result.get("free_items", {}).items():
@@ -1613,11 +1830,11 @@ def apply_offers(invoice_data, selected_offers=None):
 		applied_rules.update(txn_result.get("applied_rules", set()))
 
 		# Recursive product free must run after per-item + txn free rows are
-		# collected, then bundle same-item gifts / apply GWP line discounts.
+		# collected, then apply GWP line discounts. Same-item Product frees
+		# stay as separate free rows (gift on top of paid qty, like ERPNext).
 		_recompute_recursive_product_free_items(
 			prepared_items, free_items_map, rule_map, applied_rules
 		)
-		_apply_bundled_same_item_free_discounts(prepared_items, free_items_map, rule_map)
 		_apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_rules)
 		_apply_gift_pool_free_items(
 			prepared_items,
@@ -1627,6 +1844,32 @@ def apply_offers(invoice_data, selected_offers=None):
 			warehouse=profile.warehouse,
 			pos_profile=invoice.get("pos_profile"),
 		)
+
+		# Miraaya F&F gift rules (Allow Free Gift with F&F, default off): a Free
+		# Item / GWP / Gift Pool / Brand gift whose trigger line got F&F, or a
+		# cart-total gift on a cart with F&F, is dropped when the setting is off.
+		# BXGY is never dropped here — its lines carry no F&F.
+		gift_suppressed = suppress_incompatible_gifts(
+			fnf_indices=fnf_line_indices,
+			allow_free_gift=allow_free_gift_with_ff(),
+			prepared_items=prepared_items,
+			free_items_map=free_items_map,
+			rule_map=rule_map,
+			applied_rules=applied_rules,
+		)
+		if gift_suppressed:
+			# A GWP stamp may have overwritten F&F on a paid line; reclaim F&F.
+			ff_result = apply_friends_and_family_to_items(
+				prepared_items,
+				customer=customer,
+				posting_date=invoice.get("posting_date") or nowdate(),
+				pos_profile=invoice.get("pos_profile"),
+			)
+
+		# Free-unit / GWP passes run after F&F and may have re-stamped a line with a
+		# gift discount; F&F does not compete with gift mechanics, so report it.
+		_reconcile_fnf_after_free_passes(ff_result, prepared_items, order_decision)
+		_prune_suppressed_rules(applied_rules, ff_result, prepared_items, free_items_map)
 
 		if mark_item_discount_flags:
 			# Same neutralised view the pipeline used. With the raw map an
@@ -1661,6 +1904,9 @@ def apply_offers(invoice_data, selected_offers=None):
 			"additional_discount_percentage": flt(txn_result.get("additional_discount_percentage") or 0),
 			"discount_amount": flt(txn_result.get("discount_amount") or 0),
 			"apply_discount_on": txn_result.get("apply_discount_on"),
+			"friends_and_family": _friends_and_family_response_block(ff_result),
+			# PN-128: which discount won per line / for the order, and why.
+			"best_discount": ff_result.get("best_discount"),
 		}
 	except Exception as e:
 		frappe.log_error(frappe.get_traceback(), "Apply Offers Error")
