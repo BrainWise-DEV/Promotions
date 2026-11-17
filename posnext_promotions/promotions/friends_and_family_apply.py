@@ -347,7 +347,7 @@ def _restored_copy(item):
 	"""Non-mutating view of ``item`` with its replaced discount put back."""
 	if not item.get(FIELD_FNF_REPLACED):
 		return item
-	copy = frappe._dict(item.as_dict() if hasattr(item, "as_dict") else dict(item))
+	copy = frappe._dict(item.as_dict() if callable(getattr(item, "as_dict", None)) else dict(item))
 	_restore_replaced_discount(copy)
 	return copy
 
@@ -926,7 +926,7 @@ def _scenario_b_lines(items, snapshots, fnf_like) -> list:
 	for item, snap, was_fnf in zip(items, snapshots, fnf_like, strict=False):
 		if item.get("is_free_item"):
 			continue
-		line = frappe._dict(item.as_dict() if hasattr(item, "as_dict") else dict(item))
+		line = frappe._dict(item.as_dict() if callable(getattr(item, "as_dict", None)) else dict(item))
 		line.update(snap or {})
 		if was_fnf or _is_fnf_stamped(line):
 			line.discount_source = None
