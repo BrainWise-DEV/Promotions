@@ -1,12 +1,15 @@
 # Copyright (c) 2026, BrainWise and contributors
 # For license information, please see license.txt
 
-"""Miraaya F&F rules end to end through ``apply_offers`` (Malak 9 Nov / meeting 16 Nov).
+"""Miraaya F&F rules end to end through ``apply_offers`` (Malak 9 Nov / meetings 16–17 Nov).
 
-* Buy X Get Y and Routine (Item Level Discount) lines get no F&F; other lines do.
-  Regression: B1G1 used to switch to F&F as qty grew (qty 4 report).
-* Allow Free Gift with F&F (default off): a free gift whose trigger line got F&F
-  is dropped when off and kept when on.
+* Allow Free Gift with F&F off (default): Buy X Get Y lines keep the promo and
+  never get F&F. Regression: B1G1 used to switch to F&F as qty grew (qty 4).
+* Allow Free Gift with F&F on: a BXGY line whose effective promo % is strictly
+  less than the F&F % drops the promo and takes F&F on the paid qty; otherwise
+  the promo stays. Routine (Item Level Discount) never gets F&F, on or off.
+* Free gifts whose trigger line got F&F are dropped when the setting is off and
+  kept when it is on.
 """
 
 from __future__ import annotations
@@ -160,6 +163,92 @@ class TestFriendsAndFamilySchemeRules(FrappeTestCase):
 		self.assertAlmostEqual(flt(line.get("discount_percentage")), 10, places=2)
 		self.assertEqual(self._ff_line(resp, ITEM_A).get("reason"), REASON_SCHEME_NOT_ELIGIBLE)
 		self.assertIn(rule, resp["applied_pricing_rules"])
+		self.assertEqual(self._item(resp, ITEM_B).get("discount_source"), FNF)
+
+	def test_routine_stays_without_fnf_when_setting_on(self):
+		self._settings(allow_free_gift_with_ff=1)
+		rule = self._routine("_PNXT_FF_ROUTINE_ON", 10)
+		resp = self._apply([(ITEM_A, 1), (ITEM_B, 1)], [rule])
+		line = self._item(resp, ITEM_A)
+		self.assertNotEqual(line.get("discount_source"), FNF)
+		self.assertAlmostEqual(flt(line.get("discount_percentage")), 10, places=2)
+		self.assertEqual(self._ff_line(resp, ITEM_A).get("reason"), REASON_SCHEME_NOT_ELIGIBLE)
+		self.assertIn(rule, resp["applied_pricing_rules"])
+		self.assertEqual(self._item(resp, ITEM_B).get("discount_source"), FNF)
+
+	def _price_buy_one(self, title, **extra):
+		"""Price Discount 100% off 1 unit at min_qty (PRLE-0230-style 'buy one')."""
+		fields = dict(
+			apply_on="Item Code",
+			items=[{"item_code": ITEM_A}],
+			price_or_product_discount="Price",
+			rate_or_discount="Discount Percentage",
+			discount_percentage=100,
+			apply_discount_on_price="Min",
+			min_or_max_discount_qty_limit=1,
+			min_qty=2,
+			same_item=0,
+		)
+		fields.update(extra)
+		rule = _make_rule(title, **fields)
+		if frappe.get_meta("Pricing Rule").has_field("promotion_type"):
+			# Even when labelled like a Routine scheme, this is BXGY.
+			frappe.db.set_value("Pricing Rule", rule, "promotion_type", gifts.PROMOTION_TYPE_ITEM_LEVEL)
+		frappe.clear_document_cache("Pricing Rule", rule)
+		gifts.clear_rule_cache()
+		return rule
+
+	def test_price_buy_one_keeps_promo_when_setting_off(self):
+		rule = self._price_buy_one("_PNXT_FF_BUYONE_OFF")
+		for qty, expected_pct in ((2, 50.0), (4, 25.0)):
+			resp = self._apply([(ITEM_A, qty), (ITEM_B, 1)], [rule])
+			self._assert_bxgy_keeps_line(resp, qty, min_qty=2)
+			self.assertAlmostEqual(flt(self._item(resp, ITEM_A).get("discount_percentage")), expected_pct, places=2)
+			self.assertEqual(self._item(resp, ITEM_B).get("discount_source"), FNF)
+
+	def test_price_buy_one_keeps_promo_when_effective_pct_beats_fnf(self):
+		# qty 2 → 50% > 30%: promo stays.
+		self._settings(allow_free_gift_with_ff=1)
+		rule = self._price_buy_one("_PNXT_FF_BUYONE_QTY2")
+		resp = self._apply([(ITEM_A, 2), (ITEM_B, 1)], [rule])
+		self._assert_bxgy_keeps_line(resp, 2, min_qty=2)
+		self.assertAlmostEqual(flt(self._item(resp, ITEM_A).get("discount_percentage")), 50.0, places=2)
+		self.assertIn(rule, resp["applied_pricing_rules"])
+		self.assertEqual(self._item(resp, ITEM_B).get("discount_source"), FNF)
+
+	def test_price_buy_one_switches_to_fnf_when_effective_pct_is_below(self):
+		# qty 4 → 25% < 30%: drop the promo, F&F 30% on all 4 units.
+		self._settings(allow_free_gift_with_ff=1)
+		rule = self._price_buy_one("_PNXT_FF_BUYONE_QTY4")
+		resp = self._apply([(ITEM_A, 4), (ITEM_B, 1)], [rule])
+		line = self._item(resp, ITEM_A)
+		self.assertEqual(line.get("discount_source"), FNF)
+		self.assertAlmostEqual(flt(line.get("discount_percentage")), 30.0, places=2)
+		self.assertTrue(self._ff_line(resp, ITEM_A).get("applies"))
+		self.assertNotIn(rule, line.get("pricing_rules") or "")
+		self.assertNotIn(rule, resp["applied_pricing_rules"])
+		self.assertEqual(self._item(resp, ITEM_B).get("discount_source"), FNF)
+
+	def test_product_bxgy_on_keeps_promo_when_effective_pct_beats_fnf(self):
+		# 2 paid + 1 free row → 33.3% > 30%.
+		self._settings(allow_free_gift_with_ff=1)
+		rule = self._bxgy("_PNXT_FF_BXGY_ON_KEEP", min_qty=2, is_recursive=1, recurse_for=2, apply_recursion_over=0)
+		resp = self._apply([(ITEM_A, 2), (ITEM_B, 1)], [rule])
+		self._assert_bxgy_keeps_line(resp, 2, min_qty=2)
+		self.assertEqual(self._free_qty(resp, ITEM_A), 1)
+		self.assertEqual(self._item(resp, ITEM_B).get("discount_source"), FNF)
+
+	def test_product_bxgy_on_switches_to_fnf_when_effective_pct_is_below(self):
+		# Capped B1G1, qty 4 + 1 free row → 20% < 30%: drop the free row, F&F on 4.
+		self._settings(allow_free_gift_with_ff=1)
+		rule = self._bxgy("_PNXT_FF_BXGY_ON_SWAP", max_qty=3)
+		resp = self._apply([(ITEM_A, 4), (ITEM_B, 1)], [rule])
+		line = self._item(resp, ITEM_A)
+		self.assertEqual(line.get("discount_source"), FNF)
+		self.assertAlmostEqual(flt(line.get("discount_percentage")), 30.0, places=2)
+		self.assertEqual(self._free_qty(resp, ITEM_A), 0)
+		self.assertTrue(self._ff_line(resp, ITEM_A).get("applies"))
+		self.assertNotIn(rule, resp["applied_pricing_rules"])
 		self.assertEqual(self._item(resp, ITEM_B).get("discount_source"), FNF)
 
 	def _free_gift_rule(self):

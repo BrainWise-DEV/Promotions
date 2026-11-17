@@ -40,6 +40,8 @@ from posnext_promotions.promotions.friends_and_family_gifts import (
 	allow_free_gift_with_ff,
 	fnf_stamped_indices,
 	mark_fnf_ineligible_lines,
+	restore_bxgy_when_fnf_does_not_beat,
+	strip_weaker_bxgy_promos,
 	suppress_incompatible_gifts,
 )
 from posnext_promotions.promotions.schedule import (
@@ -1768,9 +1770,10 @@ def apply_offers(invoice_data, selected_offers=None):
 		# whatever promotion / manual discount the line carries, compared in money,
 		# tie → F&F, never stacked. Percentage always from Settings.
 		# Snapshot the lines first: scenario "no F&F" for the order-level check.
-		# Miraaya: Buy X Get Y / Routine (Item Level Discount) lines are not
-		# eligible for F&F. Flag them *before* F&F runs — BXGY free units are only
-		# valued further down, so the paid line would otherwise look undiscounted.
+		# Flag Buy X Get Y / Routine lines *before* F&F runs — BXGY free units
+		# are only valued further down, so a Product BXGY paid line would otherwise
+		# look undiscounted. Routine always stays ineligible. BXGY is compared
+		# with F&F after the gift passes when Allow Free Gift with F&F is on.
 		mark_fnf_ineligible_lines(prepared_items, rule_map)
 		pre_fnf_items = [frappe._dict(dict(item)) for item in prepared_items]
 		ff_result = apply_friends_and_family_to_items(
@@ -1848,7 +1851,8 @@ def apply_offers(invoice_data, selected_offers=None):
 		# Miraaya F&F gift rules (Allow Free Gift with F&F, default off): a Free
 		# Item / GWP / Gift Pool / Brand gift whose trigger line got F&F, or a
 		# cart-total gift on a cart with F&F, is dropped when the setting is off.
-		# BXGY is never dropped here — its lines carry no F&F.
+		# BXGY free rows are not dropped here; the best-discount pass below may
+		# replace a weaker BXGY promo when the setting is on.
 		gift_suppressed = suppress_incompatible_gifts(
 			fnf_indices=fnf_line_indices,
 			allow_free_gift=allow_free_gift_with_ff(),
@@ -1865,6 +1869,35 @@ def apply_offers(invoice_data, selected_offers=None):
 				posting_date=invoice.get("posting_date") or nowdate(),
 				pos_profile=invoice.get("pos_profile"),
 			)
+
+		# Allow Free Gift with F&F ON: if a BXGY line's effective promo % is
+		# strictly less than the F&F %, drop the promo (free row / unit
+		# discount) and apply F&F to the paid qty. Routine is never considered.
+		# If F&F cannot stamp the line (exclusion / cap exhausted), the promo
+		# is put back.
+		if allow_free_gift_with_ff():
+			bxgy_snapshots = strip_weaker_bxgy_promos(
+				prepared_items=prepared_items,
+				free_items_map=free_items_map,
+				rule_map=rule_map,
+				applied_rules=applied_rules,
+				fnf_percentage=flt((ff_result or {}).get("discount_percentage")),
+			)
+			if bxgy_snapshots:
+				ff_kwargs = dict(
+					customer=customer,
+					posting_date=invoice.get("posting_date") or nowdate(),
+					pos_profile=invoice.get("pos_profile"),
+				)
+				ff_result = apply_friends_and_family_to_items(prepared_items, **ff_kwargs)
+				if restore_bxgy_when_fnf_does_not_beat(
+					bxgy_snapshots,
+					prepared_items,
+					free_items_map,
+					applied_rules,
+					ff_result,
+				):
+					ff_result = apply_friends_and_family_to_items(prepared_items, **ff_kwargs)
 
 		# Free-unit / GWP passes run after F&F and may have re-stamped a line with a
 		# gift discount; F&F does not compete with gift mechanics, so report it.

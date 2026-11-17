@@ -571,8 +571,8 @@ def _evaluate_line(
 		return _result(False, 0, REASON_NOT_DISCOUNTABLE, rate=flt(item.get("rate") or 0))
 
 	if line_blocked_by_scheme(item):
-		# Miraaya: Buy X Get Y and Routine (Item Level Discount) lines get no F&F;
-		# they keep their promotion. Other lines are unaffected.
+		# Routine always, and BXGY until the post-gift pass may clear the flag
+		# when Allow Free Gift with F&F is on and F&F is the better discount.
 		return _result(False, 0, REASON_SCHEME_NOT_ELIGIBLE, rate=flt(item.get("rate") or price_list_rate))
 
 	competitor = _competing_candidate(item, program, amount_basis)

@@ -134,6 +134,49 @@ class TestFriendsAndFamilyGiftClassification(FrappeTestCase):
 				)
 			)
 		)
+		# Price "buy one" (100% off 1 unit via Min + qty limit) is BXGY, even if
+		# the scheme is labelled Item Level Discount.
+		self.assertTrue(
+			gifts.is_price_bxgy_rule(
+				_rule(
+					promotion_type="Item Level Discount",
+					price_or_product_discount="Price",
+					apply_on="Item Code",
+					apply_discount_on_price="Min",
+					min_or_max_discount_qty_limit=1,
+					rate_or_discount="Discount Percentage",
+					discount_percentage=100,
+				)
+			)
+		)
+		self.assertEqual(
+			gifts.scheme_blocking_kind(
+				_rule(
+					promotion_type="Item Level Discount",
+					price_or_product_discount="Price",
+					apply_on="Item Code",
+					apply_discount_on_price="Min",
+					min_or_max_discount_qty_limit=1,
+					rate_or_discount="Discount Percentage",
+					discount_percentage=100,
+				)
+			),
+			gifts.SCHEME_KIND_BXGY,
+		)
+		# A flat / Min percentage that is not 100% off limited units stays Routine.
+		self.assertFalse(
+			gifts.is_price_bxgy_rule(
+				_rule(
+					promotion_type="Item Level Discount",
+					price_or_product_discount="Price",
+					apply_on="Item Code",
+					apply_discount_on_price="Min",
+					min_or_max_discount_qty_limit=1,
+					rate_or_discount="Discount Percentage",
+					discount_percentage=50,
+				)
+			)
+		)
 
 	def _rule_map(self):
 		return {
@@ -235,6 +278,92 @@ class TestFriendsAndFamilyGiftClassification(FrappeTestCase):
 		self.assertEqual(lines[0].get(gifts.FIELD_FNF_BLOCKED_BY), "")
 		self.assertEqual(lines[3].get(gifts.FIELD_FNF_BLOCKED_BY), "PR-BXGY")
 		self.assertEqual(gifts.line_blocked_by_scheme(lines[3]), ["PR-BXGY"])
+
+	def test_effective_percent_price_buy_one_and_product_free_row(self):
+		# Price "buy one": 100% off 1 unit — qty 2 = 50%, qty 4 = 25%.
+		line = frappe._dict(item_code="SKU", qty=2, price_list_rate=100, discount_percentage=50, discount_amount=50)
+		_promo, _gross, pct = gifts.bxgy_promo_breakdown(line)
+		self.assertAlmostEqual(pct, 50.0, places=4)
+		line.qty = 4
+		line.discount_percentage = 25
+		line.discount_amount = 25  # per-unit fallback still yields 25%
+		self.assertAlmostEqual(gifts.bxgy_effective_discount_percent(line), 25.0, places=4)
+		# Product same-item: 2 paid + 1 free row → 33.333..., 4 paid + 1 free → 20%.
+		paid = frappe._dict(item_code="SKU", qty=2, price_list_rate=100, discount_percentage=0, discount_amount=0)
+		free = [frappe._dict(item_code="SKU", qty=1, price_list_rate=0)]
+		self.assertAlmostEqual(gifts.bxgy_effective_discount_percent(paid, free), 100.0 / 3.0, places=4)
+		paid.qty = 4
+		self.assertAlmostEqual(gifts.bxgy_effective_discount_percent(paid, free), 20.0, places=4)
+
+	def test_strip_weaker_bxgy_respects_checkbox_and_threshold(self):
+		rule_map = {
+			"PR-BXGY": _rule(
+				name="PR-BXGY",
+				price_or_product_discount="Price",
+				apply_on="Item Code",
+				apply_discount_on_price="Min",
+				min_or_max_discount_qty_limit=1,
+				rate_or_discount="Discount Percentage",
+				discount_percentage=100,
+			)
+		}
+		# qty 4 at 25% — weaker than 30%. Off: leave the line alone.
+		weak = frappe._dict(
+			item_code="SKU",
+			qty=4,
+			price_list_rate=100,
+			discount_percentage=25,
+			discount_amount=25,
+			pricing_rules="PR-BXGY",
+			fnf_blocked_by_scheme="PR-BXGY",
+		)
+		free_map = {}
+		applied = {"PR-BXGY"}
+		snaps = gifts.strip_weaker_bxgy_promos(
+			prepared_items=[weak],
+			free_items_map=free_map,
+			rule_map=rule_map,
+			applied_rules=applied,
+			fnf_percentage=30,
+			allow_free_gift=False,
+		)
+		self.assertEqual(snaps, [])
+		self.assertEqual(weak.get("pricing_rules"), "PR-BXGY")
+		self.assertEqual(applied, {"PR-BXGY"})
+
+		# On + weaker promo: strip. On + 50% (qty 2): keep.
+		strong = frappe._dict(
+			item_code="SKU",
+			qty=2,
+			price_list_rate=100,
+			discount_percentage=50,
+			discount_amount=50,
+			pricing_rules="PR-BXGY",
+			fnf_blocked_by_scheme="PR-BXGY",
+		)
+		snaps = gifts.strip_weaker_bxgy_promos(
+			prepared_items=[weak, strong],
+			free_items_map=free_map,
+			rule_map=rule_map,
+			applied_rules=applied,
+			fnf_percentage=30,
+			allow_free_gift=True,
+		)
+		self.assertEqual([s["idx"] for s in snaps], [0])
+		self.assertFalse(weak.get("pricing_rules"))
+		self.assertEqual(weak.get(gifts.FIELD_FNF_BLOCKED_BY), "")
+		self.assertEqual(flt(weak.get("discount_percentage")), 0)
+		self.assertEqual(strong.get("pricing_rules"), "PR-BXGY")
+		self.assertEqual(applied, {"PR-BXGY"})  # still used by the strong line
+
+		# Restore when F&F did not stamp the stripped line.
+		ff_result = {"items": [{"idx": 0, "applies": False, "discount_amount": 0}]}
+		self.assertTrue(
+			gifts.restore_bxgy_when_fnf_does_not_beat(snaps, [weak, strong], free_map, applied, ff_result)
+		)
+		self.assertEqual(weak.get("pricing_rules"), "PR-BXGY")
+		self.assertAlmostEqual(flt(weak.get("discount_percentage")), 25.0, places=4)
+		self.assertIn("PR-BXGY", applied)
 
 
 class TestFriendsAndFamilyGiftSettings(FrappeTestCase):
