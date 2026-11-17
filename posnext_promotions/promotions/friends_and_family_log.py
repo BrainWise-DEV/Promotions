@@ -81,6 +81,8 @@ LOG_SETTINGS_CHANGED = "Settings Changed"
 # Paid invoices (Task 6c): the rows disagree with the entitlement; kept as paid.
 LOG_OFFLINE_DISAGREEMENT = "Offline Disagreement"
 LOG_PAID_DISAGREEMENT = "Paid Disagreement"
+# Sales Order / Quotation lines whose F&F the server removed (ff_non_invoice).
+LOG_NON_INVOICE_STRIPPED = "Non Invoice Stripped"
 
 FNF = "friends_and_family"
 
@@ -124,11 +126,11 @@ def write_log(log_type: str, **values):
 def _safe(fn):
 	"""Audit logging must never block a sale or an admin save."""
 
-	def wrapper(doc, method=None):
+	def wrapper(doc, *args):
 		if frappe.flags.in_install or frappe.flags.in_migrate or frappe.flags.in_patch:
 			return None
 		try:
-			return fn(doc, method)
+			return fn(doc, *args)
 		except Exception:
 			frappe.log_error(title=f"Friends and Family Log: {fn.__name__}")
 			if frappe.flags.in_test:
@@ -138,6 +140,20 @@ def _safe(fn):
 	wrapper.__name__ = fn.__name__
 	wrapper.__doc__ = fn.__doc__
 	return wrapper
+
+
+@_safe
+def log_non_invoice_stripped(doc, lines: int) -> None:
+	"""One row per Sales Order / Quotation whose F&F lines were stripped."""
+	write_log(
+		LOG_NON_INVOICE_STRIPPED,
+		reference_doctype=doc.doctype,
+		reference_name=doc.name,
+		customer=doc.get("customer") or doc.get("party_name"),
+		company=doc.get("company"),
+		message=_("Friends & Family removed from {0} lines.").format(lines),
+		details={"lines": lines},
+	)
 
 
 # ---- invoices -------------------------------------------------------------

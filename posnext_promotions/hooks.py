@@ -86,8 +86,18 @@ doc_events = {
 			"posnext_promotions.promotions.friends_and_family_log.log_invoice_cancel",
 		],
 	},
-	"Sales Order": {"validate": "posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts"},
-	"Quotation": {"validate": "posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts"},
+	"Sales Order": {
+		"validate": [
+			"posnext_promotions.promotions.ff_non_invoice.strip_ff",
+			"posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts",
+		]
+	},
+	"Quotation": {
+		"validate": [
+			"posnext_promotions.promotions.ff_non_invoice.strip_ff",
+			"posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts",
+		]
+	},
 	"Delivery Note": {"validate": "posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts"},
 	"POS Invoice": {
 		"validate": [
