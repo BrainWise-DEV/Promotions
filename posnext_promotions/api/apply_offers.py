@@ -1074,19 +1074,47 @@ def _friends_and_family_response_block(ff_result) -> dict:
 	}
 
 
-def _one_time_rule_used(record, customer, default_customer) -> bool:
-	"""One-time-per-customer rule that may not apply: anonymous sale, or already redeemed.
+def _redeemed_one_time_rules(customer) -> set:
+	"""One-time rules ``customer`` already redeemed, fetched once per cart: a usage row
+	(autoname ``{customer}:{pricing_rule}``, so read by fields) or a stamp on one of
+	their other submitted, non-return Sales Invoices (as pos_next decides)."""
+	if not customer:
+		return set()
+	redeemed = set(
+		frappe.get_all("One Time Customer Offer Usage", filters={"customer": customer}, pluck="pricing_rule")
+	)
+	stamps = frappe.get_all(
+		"Sales Invoice",
+		filters={
+			"customer": customer,
+			"docstatus": 1,
+			"is_return": 0,
+			"pos_applied_one_time_rules": ["is", "set"],
+		},
+		pluck="pos_applied_one_time_rules",
+	)
+	for stamp in stamps:
+		try:
+			redeemed.update(json.loads(stamp or "[]"))
+		except (ValueError, TypeError):
+			continue
+	return redeemed
 
-	Looked up by fields: the usage autoname is ``{customer}:{pricing_rule}``, so a
-	hand-built name check never matched (same filter as ``ff_compatibility``).
+
+def _one_time_rule_used(record, customer, default_customer, doctype="Sales Invoice", redeemed=()) -> bool:
+	"""One-time-per-customer rule that may not apply (Ruling 114a / 115).
+
+	Never on a cart that is not a Sales Invoice (redemption only counts on invoices,
+	as pos_next), or an anonymous sale; and not once this customer redeemed it
+	(``redeemed`` = ``_redeemed_one_time_rules``, fetched once per call).
 	"""
 	if not cint(record.get("one_time_per_customer")):
 		return False
+	if doctype != "Sales Invoice":
+		return True
 	if not customer or customer == default_customer:
 		return True
-	return bool(
-		frappe.db.exists("One Time Customer Offer Usage", {"customer": customer, "pricing_rule": record.name})
-	)
+	return record.name in redeemed
 
 
 def _compat_doc(invoice, customer) -> frappe._dict:
@@ -1557,6 +1585,13 @@ def apply_offers(invoice_data, selected_offers=None):
 		# Walk-in / default customer can't be tracked one-time, so one-time
 		# rules never apply to anonymous sales (see the loop below).
 		default_customer = profile.get("customer")
+		cart_doctype = invoice.get("doctype") or "Sales Invoice"
+		# One fetch per call; skipped when no one-time rule can apply anyway.
+		redeemed_rules = (
+			_redeemed_one_time_rules(customer)
+			if cart_doctype == "Sales Invoice" and customer and customer != default_customer
+			else set()
+		)
 
 		rule_map = {}
 		if raw_rule_names:
@@ -1582,7 +1617,7 @@ def apply_offers(invoice_data, selected_offers=None):
 				# customers who have already redeemed this rule. Dropping the rule
 				# here keeps its discount out of the per-item loop below (which only
 				# applies rules present in rule_map), mirroring the coupon skip above.
-				if _one_time_rule_used(record, customer, default_customer):
+				if _one_time_rule_used(record, customer, default_customer, cart_doctype, redeemed_rules):
 					continue
 
 				# Include both promotional scheme rules and standalone pricing rules
@@ -1607,12 +1642,15 @@ def apply_offers(invoice_data, selected_offers=None):
 					"name",
 					"promotional_scheme",
 					"coupon_code_based",
+					"one_time_per_customer",
 					"promotional_scheme_id",
 					"price_or_product_discount",
 					"promotion_type",
 				],
 			)
 			for record in txn_rule_records:
+				if _one_time_rule_used(record, customer, default_customer, cart_doctype, redeemed_rules):
+					continue
 				rule_map.setdefault(record.name, record)
 
 		if selected_offer_names:
@@ -1637,7 +1675,7 @@ def apply_offers(invoice_data, selected_offers=None):
 					if record.coupon_code_based:
 						continue
 					# A selected offer is still one-time: same gate as above.
-					if _one_time_rule_used(record, customer, default_customer):
+					if _one_time_rule_used(record, customer, default_customer, cart_doctype, redeemed_rules):
 						continue
 					rule_map[record.name] = record
 
