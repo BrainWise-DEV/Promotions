@@ -133,14 +133,24 @@ def _rule_scope_matches(item, rule_name) -> bool:
 
 
 def line_blocked_by_scheme(item) -> list[str]:
-	"""Rule names that make this line ineligible for F&F (BXGY / Routine)."""
+	"""Rule names that make this line ineligible for F&F (BXGY / Routine).
+
+	The verdict :func:`ff_compatibility.block_ineligible_lines` signed for the line as
+	it is now. Otherwise (never judged, changed since, or a client-sent
+	``fnf_blocked_by_scheme``) the full judge runs again on a copy, without a doc:
+	the line's tags *and* every untagged BXGY whose scope covers it, any company,
+	valid today — never narrower than the doc judge (Rulings 119, 121, 122).
+	"""
+	from posnext_promotions.promotions import ff_compatibility
+
 	if cint(item.get("is_free_item")):
 		return []
-	names = _split_rule_names(item.get(FIELD_FNF_BLOCKED_BY))
-	for rule_name in _item_rule_names(item):
-		if rule_name not in names and scheme_blocking_kind(rule_name):
-			names.append(rule_name)
-	return names
+	verdict = ff_compatibility.judged_verdict(item)
+	if verdict is not None:
+		return verdict
+	copy = frappe._dict(item.as_dict() if callable(getattr(item, "as_dict", None)) else dict(item))
+	ff_compatibility.block_ineligible_lines([copy])
+	return _split_rule_names(copy.get(FIELD_FNF_BLOCKED_BY))
 
 
 def mark_fnf_ineligible_lines(prepared_items, rule_map) -> set[int]:

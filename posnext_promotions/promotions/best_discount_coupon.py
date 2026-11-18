@@ -73,10 +73,18 @@ def _capped_fnf_candidates(items, customer, posting_date, pos_profile=None) -> d
 	The coupon then competes with that (possibly cap-reduced) F&F saving. A capped
 	line is shown by its money value: its % is neither the program's nor meaningful.
 	"""
+	from posnext_promotions.api.apply_offers import _compat_doc
+	from posnext_promotions.promotions import ff_compatibility
+
 	ctx = restore_context(customer, posting_date, pos_profile)
+	neutral = [_neutral_copy(i, ctx) for i in items]
+	# Judged after the restore, as the cart and the invoice judge (spec §7, Rulings 121, 122).
+	ff_compatibility.block_ineligible_lines(
+		neutral, doc=_compat_doc({"pos_profile": pos_profile, "posting_date": posting_date}, customer)
+	)
 	plan = compute_friends_and_family_discounts(
 		customer=customer,
-		items=[_neutral_copy(i, ctx) for i in items],
+		items=neutral,
 		posting_date=posting_date,
 		pos_profile=pos_profile,
 	)

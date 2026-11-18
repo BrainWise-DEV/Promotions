@@ -10,13 +10,18 @@ rules differently: the invoice never looked at gifts. Both now go through:
   or invoice rows (paid rows and ``is_free_item`` rows). Lines are keyed by
   ``row_key`` (row ``name``, else ``idx``, else the row object), never list position.
 * :func:`block_ineligible_lines` — Buy X Get Y / Routine lines get
-  ``fnf_blocked_by_scheme`` before F&F runs.
+  ``fnf_blocked_by_scheme`` before F&F runs, only by rules the server finds
+  eligible on the line (:func:`rule_eligible_on_line`, Ruling 119).
 * :func:`enforce_gift_policy` — with *Allow Free Gift with F&F* off, drop gifts whose
   trigger line got F&F (a cart-total gift goes when F&F applied anywhere).
 """
 
 from __future__ import annotations
 
+import functools
+import hashlib
+import hmac
+import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -275,7 +280,7 @@ def rule_applies_to_doc(rule, doc, profile: dict | None = None) -> bool:
 	return _rule_applies_to_doc(rule, doc, profile)
 
 
-def blocking_rule_map(doc) -> dict:
+def blocking_rule_map(doc=None) -> dict:
 	"""The one rule source for BXGY / Routine blocking, shared by cart and invoice (Ruling 19).
 
 	Every blocking-kind rule that is enabled, selling, valid at the doc's posting
@@ -283,14 +288,18 @@ def blocking_rule_map(doc) -> dict:
 	client selected the offer. An untagged line can still sit under a BXGY rule
 	(above ``max_qty`` ERPNext tags nothing), so the cart blocks it by scope + ``min_qty``
 	and the invoice must agree.
+
+	Without a doc (or a company): every such rule valid today, any company — the
+	no-doc judge fails closed, never narrower than the doc judge (Ruling 122).
 	"""
-	if doc is None or not doc.get("company"):
-		return {}
-	profile = _profile_values(doc.get("pos_profile"))
+	profile = _profile_values(doc.get("pos_profile")) if doc is not None else {}
 	if cint(profile.get("ignore_pricing_rule")):
 		return {}
+	company = (doc.get("company") or profile.get("company")) if doc is not None else None
 	fields = rule_fields()
-	base = {"disable": 0, "selling": 1, "company": doc.get("company"), "coupon_code_based": 0}
+	base = {"disable": 0, "selling": 1, "coupon_code_based": 0}
+	if company:
+		base["company"] = company
 	# NOTE (cost): up to three Pricing Rule queries per cart apply / invoice validate.
 	# ponytail: cache per company + day — Phase 1 Task 6f.
 	rows = frappe.get_all(
@@ -312,10 +321,190 @@ def blocking_rule_map(doc) -> dict:
 			},
 			fields=fields,
 		)
-	names = dict.fromkeys(
-		row.name for row in rows if rule_applies_to_doc(row, doc, profile) and gifts.scheme_blocking_kind(row.name)
-	)
+
+	def applies(row) -> bool:
+		if doc is None:
+			return rule_valid_on(row, nowdate())
+		return rule_applies_to_doc(row, doc, profile)
+
+	names = dict.fromkeys(row.name for row in rows if applies(row) and gifts.scheme_blocking_kind(row.name))
 	return {name: gifts._rule_values(name) for name in names}
+
+
+# Rules ERPNext qualifies on the whole cart or the customer's history (mixed_conditions
+# sums the rule's lines, is_cumulative adds past invoices, apply_rule_on_other prices
+# another item). One line cannot judge them, so their tag keeps blocking (Ruling 121).
+CART_WIDE_FIELDS = ("mixed_conditions", "is_cumulative", "apply_rule_on_other")
+
+_APPLY_ON_TABLE = {
+	"Item Code": ("items", "item_code"),
+	"Item Group": ("item_groups", "item_group"),
+	"Brand": ("brands", "brand"),
+}
+
+
+def _uom_factor(item_code, uom) -> float:
+	from erpnext.stock.get_item_details import get_conversion_factor
+
+	return flt(get_conversion_factor(item_code, uom).get("conversion_factor")) or 1.0
+
+
+def _line_factor(item) -> float:
+	"""Stock units per line unit: the Item's factor for the line UOM, never below the one sent."""
+	sent = flt(item.get("conversion_factor")) or 1.0
+	uom, item_code = cstr(item.get("uom")), cstr(item.get("item_code"))
+	if not uom or not item_code:
+		return sent
+	return max(sent, _uom_factor(item_code, uom))
+
+
+def _rule_uoms(item, rule_name) -> set[str]:
+	"""UOMs of the rule rows that cover this line ("" = any UOM); ``{""}`` when unknown."""
+	try:
+		rule_doc = frappe.get_cached_doc("Pricing Rule", rule_name)
+	except frappe.DoesNotExistError:
+		return {""}
+	table, field = _APPLY_ON_TABLE.get(cstr(rule_doc.get("apply_on")), (None, None))
+	if not table:
+		return {""}
+	value = cstr(item.get(field))
+	return {cstr(row.get("uom")) for row in rule_doc.get(table) or [] if cstr(row.get(field)) == value} or {""}
+
+
+def line_meets_rule(item, rule, rule_uoms=None) -> bool:
+	"""ERPNext's per-line thresholds (``filter_pricing_rules_for_qty_amount``).
+
+	Stock qty (qty × the line's UOM factor) ≥ ``min_qty`` × the factor of the rule
+	row's UOM, and qty × price list rate (else rate) ≥ ``min_amt`` × that factor
+	(× 1 when the rule row's UOM is the line's). A rule row with a UOM covers only
+	lines in that UOM, as in ERPNext's rule lookup. ``rule_uoms``: :func:`_rule_uoms`.
+
+	No ``max_qty`` / ``max_amt``: above them ERPNext tags nothing, yet the line is
+	still the scheme's (capped B1G1 at qty 4 stays blocked).
+	"""
+	qty = gifts._line_qty(item)
+	if qty <= 0:
+		return False
+	uoms = rule_uoms or {""}
+	line_uom = cstr(item.get("uom"))
+	stock_qty = qty * _line_factor(item)
+	amount = qty * flt(item.get("price_list_rate") or item.get("rate"))
+	if "" in uoms:
+		qty_factor = amt_factor = 1.0
+	elif not line_uom:
+		# No line UOM (ERPNext then matches every row): the smallest rule factor, so it blocks.
+		qty_factor = amt_factor = min(_uom_factor(item.get("item_code"), uom) for uom in uoms)
+	elif line_uom in uoms:
+		qty_factor, amt_factor = _line_factor(item), 1.0
+	else:
+		return False
+	return stock_qty >= flt(rule.get("min_qty")) * qty_factor and amount >= flt(rule.get("min_amt")) * amt_factor
+
+
+def _eligibility_fields() -> list[str]:
+	return [*rule_fields(), "min_qty", "min_amt", *CART_WIDE_FIELDS]
+
+
+def _eligibility_row(rule_name, rule_map=None):
+	row = frappe.get_cached_value("Pricing Rule", rule_name, _eligibility_fields(), as_dict=True)
+	return row or (rule_map or {}).get(rule_name)
+
+
+def is_cart_wide(rule) -> bool:
+	return any(cstr(rule.get(field)) not in ("", "0") for field in CART_WIDE_FIELDS)
+
+
+def rule_eligible_on_line(item, rule_name, doc=None, profile=None, rule_map=None) -> bool:
+	"""``rule_name`` applies to this line as it is now (Ruling 119).
+
+	A rule name on the line is a client tag, not a fact: it may be stale (the
+	qty dropped below ``min_qty``, the rule expired, a held draft). With ``doc``:
+	:func:`rule_applies_to_doc` (enabled, dates / times, company, profile,
+	customer tree, one-time). Without one: enabled and valid today. Either way the
+	line meets the rule's thresholds (:func:`line_meets_rule`) and is in its scope.
+	``rule_map`` supplies the row of a rule that is not in the database (unit tests).
+	"""
+	rule = _eligibility_row(rule_name, rule_map)
+	if not rule:
+		return False
+	if doc is not None:
+		if not rule_applies_to_doc(rule, doc, profile):
+			return False
+	elif cint(rule.get("disable")) or not rule_valid_on(rule, nowdate()):
+		return False
+	return line_meets_rule(item, rule, _rule_uoms(item, rule_name)) and gifts._rule_scope_matches(
+		item, rule_name
+	)
+
+
+def tag_blocks(item, rule_name, doc=None, profile=None, rule_map=None) -> bool:
+	"""A BXGY / Routine rule tagged on the line blocks F&F (Rulings 119, 121).
+
+	A cart-wide / history rule (:data:`CART_WIDE_FIELDS`) blocks on the tag alone:
+	fail closed, no F&F. Any other rule only while :func:`rule_eligible_on_line`.
+	"""
+	rule = _eligibility_row(rule_name, rule_map)
+	if rule and is_cart_wide(rule):
+		return True
+	return rule_eligible_on_line(item, rule_name, doc, profile, rule_map)
+
+
+# ---- The judge's verdict --------------------------------------------------
+# ``fnf_blocked_by_scheme`` is a plain line field the client can send. The judge
+# signs its verdict with a per-process key, bound to the line's item, qty, UOM and
+# rules; :func:`judged_verdict` trusts only that. Anything else is judged again.
+
+FIELD_JUDGED = "_fnf_scheme_judged"
+_JUDGE_KEY = secrets.token_bytes(32)
+
+
+def _verdict_mac(item, verdict: str) -> str:
+	message = "|".join(
+		(
+			cstr(item.get("item_code")),
+			f"{gifts._line_qty(item):.6f}",
+			cstr(item.get("uom")),
+			f"{flt(item.get('conversion_factor')):.6f}",
+			",".join(sorted(gifts._item_rule_names(item))),
+			cstr(verdict),
+		)
+	)
+	return hmac.new(_JUDGE_KEY, message.encode(), hashlib.sha256).hexdigest()
+
+
+def _set_verdict(item, names: list[str]) -> None:
+	verdict = ",".join(names)
+	gifts._set(item, gifts.FIELD_FNF_BLOCKED_BY, verdict)
+	gifts._set(item, FIELD_JUDGED, _verdict_mac(item, verdict))
+
+
+def strip_verdict_marks(rows) -> None:
+	"""Drop the judge's signature from rows going back to a client (Ruling 122)."""
+	for row in rows or []:
+		if isinstance(row, dict):
+			row.pop(FIELD_JUDGED, None)
+
+
+def without_verdict_marks(fn):
+	"""Decorator: strip :data:`FIELD_JUDGED` from a response's ``items`` / ``free_items``."""
+
+	@functools.wraps(fn)
+	def wrapper(*args, **kwargs):
+		result = fn(*args, **kwargs)
+		if isinstance(result, dict):
+			strip_verdict_marks(result.get("items"))
+			strip_verdict_marks(result.get("free_items"))
+		return result
+
+	return wrapper
+
+
+def judged_verdict(item) -> list[str] | None:
+	"""The judge's rule names for this line, or None when it was not judged as it is now."""
+	verdict, mac = item.get(gifts.FIELD_FNF_BLOCKED_BY), item.get(FIELD_JUDGED)
+	if verdict is None or not mac or not hmac.compare_digest(cstr(mac), _verdict_mac(item, cstr(verdict))):
+		return None
+	return gifts._split_rule_names(verdict)
 
 
 def _load_rule_map(items, doc=None) -> dict:
@@ -335,12 +524,21 @@ def _load_rule_map(items, doc=None) -> dict:
 def block_ineligible_lines(items, rule_map=None, *, doc=None) -> set[int]:
 	"""Flag paid lines under a BXGY / Routine scheme (``fnf_blocked_by_scheme``) before F&F.
 
-	BXGY free units are valued *after* F&F, so a paid line can look undiscounted at
-	that point. A line is flagged when a BXGY rule's scope covers it and its qty
-	reaches the rule's ``min_qty``, whether or not free units were stamped yet.
-	Routine (item-level) lines carry the rule in ``pricing_rules`` already.
+	The one judge for the cart (``apply_offers``, the F&F-only call) and invoice
+	validate (spec §7). A line is blocked only by a rule the server finds eligible
+	on it now (:func:`rule_eligible_on_line`, Ruling 119):
+
+	* a BXGY / Routine rule tagged in ``pricing_rules`` (:func:`tag_blocks`) — a
+	  stale tag (qty below ``min_qty``, expired, another customer's) does not block;
+	  a cart-wide / history rule's tag always does (Ruling 121);
+	* an untagged BXGY rule whose scope covers the line (above ``max_qty`` ERPNext
+	  tags nothing). BXGY free units are valued *after* F&F, so a paid line can
+	  look undiscounted at that point.
+
 	Settings ``unclassified_promotion_policy`` = "Block F&F on line": a line carrying a
 	rule the classifier cannot place is blocked too ("Compete": it competes as before).
+	The flag overwrites whatever the client sent and is signed (:func:`judged_verdict`),
+	so :func:`gifts.line_blocked_by_scheme` trusts only the server's verdict.
 
 	``rule_map=None`` (cart and invoice): rules named on the rows plus
 	:func:`blocking_rule_map` for ``doc``. Returns the list positions flagged.
@@ -348,6 +546,7 @@ def block_ineligible_lines(items, rule_map=None, *, doc=None) -> set[int]:
 	if rule_map is None:
 		rule_map = _load_rule_map(items, doc)
 	rule_map = rule_map or {}
+	profile = _profile_values(doc.get("pos_profile")) if doc is not None else None
 	bxgy_rules = [
 		name for name, row in rule_map.items() if gifts.scheme_blocking_kind(row or name) == gifts.SCHEME_KIND_BXGY
 	]
@@ -355,25 +554,21 @@ def block_ineligible_lines(items, rule_map=None, *, doc=None) -> set[int]:
 	flagged: set[int] = set()
 	for position, item in enumerate(items or []):
 		if cint(item.get("is_free_item")):
-			gifts._set(item, gifts.FIELD_FNF_BLOCKED_BY, "")
+			_set_verdict(item, [])
 			continue
-		names: list[str] = [
-			rule_name
-			for rule_name in gifts._item_rule_names(item)
-			if gifts.scheme_blocking_kind(rule_map.get(rule_name) or rule_name)
-			or (block_unclassified and _is_unclassified(rule_map.get(rule_name) or rule_name))
-		]
-		qty = gifts._line_qty(item)
-		for rule_name in bxgy_rules:
-			if rule_name in names:
-				continue
-			row = gifts._rule_values(rule_map.get(rule_name) or rule_name) or {}
-			min_qty = flt(row.get("min_qty"))
-			if qty <= 0 or (min_qty and qty < min_qty):
-				continue
-			if gifts._rule_scope_matches(item, rule_name):
+		tagged = gifts._item_rule_names(item)
+		names: list[str] = []
+		for rule_name in tagged:
+			rule = rule_map.get(rule_name) or rule_name
+			if gifts.scheme_blocking_kind(rule):
+				if tag_blocks(item, rule_name, doc, profile, rule_map):
+					names.append(rule_name)
+			elif block_unclassified and _is_unclassified(rule):
 				names.append(rule_name)
-		gifts._set(item, gifts.FIELD_FNF_BLOCKED_BY, ",".join(names))
+		for rule_name in bxgy_rules:
+			if rule_name not in tagged and rule_eligible_on_line(item, rule_name, doc, profile, rule_map):
+				names.append(rule_name)
+		_set_verdict(item, names)
 		if names:
 			flagged.add(position)
 	return flagged

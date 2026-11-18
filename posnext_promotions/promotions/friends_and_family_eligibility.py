@@ -287,8 +287,19 @@ def _log_verification_change(customer: str, verified: bool, email_domain: str | 
 
 
 def benefit_provider() -> dict:
-	"""``pos_next_customer_benefit_providers`` hook: lets POS Next ask who is an F&F member."""
-	return {"is_member": is_customer_ff_member, "on_verification_change": _log_verification_change}
+	"""``pos_next_customer_benefit_providers`` hook: lets POS Next ask who is an F&F member,
+	and what F&F rate the server gives each row of an invoice (``fnf_line_rates``)."""
+	return {
+		"is_member": is_customer_ff_member,
+		"on_verification_change": _log_verification_change,
+		"fnf_line_rates": _fnf_line_rates,
+	}
+
+
+def _fnf_line_rates(doc) -> dict:
+	from posnext_promotions.promotions.friends_and_family_apply import fnf_line_rates
+
+	return fnf_line_rates(doc)
 
 
 def is_customer_eligible(customer: str | None, on_date=None, pos_profile: str | None = None) -> bool:

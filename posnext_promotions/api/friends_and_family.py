@@ -9,12 +9,13 @@ import json
 
 import frappe
 from frappe import _
-from frappe.utils import cstr
+from frappe.utils import cstr, nowdate
 
 from posnext_promotions.promotions.friends_and_family import get_active_program, profile_allows_ff
 from posnext_promotions.promotions.friends_and_family_apply import (
 	apply_friends_and_family_to_items,
 	compute_friends_and_family_discounts,
+	enrich_items_with_catalog,
 )
 from posnext_promotions.promotions.friends_and_family_eligibility import (
 	get_customer_eligibility,
@@ -167,6 +168,20 @@ def apply_friends_and_family_discount(
 	lines = [frappe._dict(row) if not isinstance(row, frappe._dict) else row for row in parsed]
 
 	from frappe.utils import cint
+
+	from posnext_promotions.api.apply_offers import _compat_doc
+	from posnext_promotions.promotions.friends_and_family_apply import judge_restored, restore_context
+
+	# Ruling 119: the server judges BXGY / Routine itself, as apply_offers and invoice
+	# validate do; a rule the client left on a line blocks only while it is eligible.
+	# Scope fields first: a rule's scope may be an Item Group or Brand. Judged as
+	# restored (Ruling 122): pricing puts a replaced discount back before F&F runs.
+	enrich_items_with_catalog(lines)
+	judge_restored(
+		lines,
+		_compat_doc({"pos_profile": pos_profile, "posting_date": posting_date}, customer),
+		restore_context(customer, posting_date or nowdate(), pos_profile),
+	)
 
 	if cint(mutate):
 		return apply_friends_and_family_to_items(

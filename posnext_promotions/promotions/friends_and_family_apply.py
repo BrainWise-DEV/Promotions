@@ -44,7 +44,7 @@ from dataclasses import dataclass, replace
 
 import frappe
 from frappe import _
-from frappe.utils import cint, cstr, flt, nowdate
+from frappe.utils import cint, cstr, flt, get_datetime, getdate, nowdate
 
 from posnext_promotions.promotions import best_discount as bd
 from posnext_promotions.promotions.friends_and_family import (
@@ -371,6 +371,23 @@ def _restored_copy(item, doc):
 	copy = frappe._dict(item.as_dict() if callable(getattr(item, "as_dict", None)) else dict(item))
 	_restore_replaced_discount(copy, doc)
 	return copy
+
+
+def judge_restored(items, doc, ctx) -> None:
+	"""BXGY / Routine judge on each line as F&F will price it (Ruling 122).
+
+	F&F pricing first puts back a line's signed replaced discount
+	(:func:`_restored_copy` / :func:`_restore_replaced_discount` with ``ctx``), which
+	rewrites ``pricing_rules``. So the judge sees that restored view, and its signed
+	verdict is copied onto the line: after the same restore it still matches.
+	``doc``: the doc :func:`ff_compatibility.block_ineligible_lines` judges against.
+	"""
+	views = [_restored_copy(item, ctx) for item in items]
+	ff_compatibility.block_ineligible_lines(views, doc=doc)
+	for item, view in zip(items, views, strict=True):
+		if view is not item:
+			for key in (gifts.FIELD_FNF_BLOCKED_BY, ff_compatibility.FIELD_JUDGED):
+				_set_item_attr(item, key, view.get(key))
 
 
 def _clear_friends_and_family_stamp(item) -> None:
@@ -1367,6 +1384,114 @@ def _row_copy(item) -> frappe._dict:
 	return frappe._dict(item.as_dict() if callable(getattr(item, "as_dict", None)) else dict(item))
 
 
+def _stored_creation(doc):
+	"""``creation`` as stored in the database for ``doc.name``; None for an unsaved doc.
+
+	Never the in-memory value: before ``insert()`` it is whatever the client sent.
+	"""
+	name = cstr(doc.get("name"))
+	if not name:
+		return None
+	creation = frappe.db.get_value(cstr(doc.get("doctype")) or "POS Invoice", name, "creation")
+	return get_datetime(creation) if creation else None
+
+
+def _on_server_day(doc, on, at=None) -> frappe._dict:
+	"""The doc as :func:`ff_compatibility.rule_applies_to_doc` reads it, dated ``on`` at ``at``.
+
+	``posting_date`` / ``posting_time`` are client-writable; ``on`` is a server day.
+	``at`` None: judged at now (``schedule.resolve_moment``).
+	"""
+	view = frappe._dict(
+		{
+			key: doc.get(key)
+			for key in (
+				"company",
+				"customer",
+				"customer_group",
+				"territory",
+				"pos_profile",
+				"selling_price_list",
+				"coupon_code",
+			)
+		}
+	)
+	view.posting_date = on
+	view.posting_time = cstr(at.time()) if at else None
+	return view
+
+
+def fnf_line_rates(doc) -> dict:
+	"""POS Next benefit-provider ``fnf_line_rates``: {row name: per-unit rate} F&F gives
+	each paid row of a POS invoice, on the row's ``price_list_rate`` (Ruling 120).
+
+	POS Next counts a row's F&F discount as explained only down to this rate, never
+	from the row's mark. Judged on server data only, read-only, on copies of the rows:
+	* the customer's eligibility, the program and its scope, now and at the invoice's
+	  ``creation`` as stored in the database (an unsaved doc: now only), never the
+	  caller's ``posting_date`` or in-memory ``creation``; the lower rate wins;
+	* the uncapped entitlement, since a cap breach is the ledger's (as in
+	  :func:`_freeze_paid_invoice`), and a scheme's line gets none
+	  (``block_ineligible_lines``) — left out if a scheme owns it now, or owned it
+	  at the stored creation *and* the invoice carries that scheme (its free row or
+	  its tag on the line) (Rulings 125, 127);
+	* ``offline_id`` and the offline / paid flags play no part.
+	A row F&F gives nothing is left out. A document that is not a POS invoice
+	(the program is a POS benefit), a return or a consolidated invoice gives {}.
+	"""
+	if cint(doc.get("is_return")) or cint(doc.get("is_consolidated")):
+		return {}
+	if not (cstr(doc.get("doctype")) == "POS Invoice" or cint(doc.get("is_pos"))):
+		return {}
+	items = list(doc.get("items") or [])
+	if not any(item.get("name") and not cint(item.get("is_free_item")) for item in items):
+		return {}
+	copies = enrich_items_with_catalog([_row_copy(i) for i in items])
+	# Server moments only (Ruling 125): now, and the stored creation (an unsaved doc: now only).
+	moments = [(nowdate(), None)]
+	stored = _stored_creation(doc)
+	if stored:
+		moments.append((cstr(getdate(stored)), stored))
+	# Schemes the invoice carries: a free row's rules (Ruling 127).
+	free_rules = {
+		name for item in items if cint(item.get("is_free_item")) for name in gifts._item_rule_names(item)
+	}
+	rates, blocked = {}, set()
+	for on, at in moments:
+		# The snapshot restore depends on the day: judge as restored for each moment, and
+		# BXGY / Routine validity at that moment too, never the caller's posting_date.
+		judge_restored(
+			copies, _on_server_day(doc, on, at), restore_context(doc.get("customer"), on, doc.get("pos_profile"))
+		)
+		result = compute_friends_and_family_discounts(
+			customer=doc.get("customer"),
+			items=copies,
+			posting_date=on,
+			amount_basis=bd.AMOUNT_BASIS_UNIT,
+			exclude_invoice=doc.get("name") or None,
+			pos_profile=doc.get("pos_profile"),
+			conversion_rate=flt(doc.get("conversion_rate")) or 1.0,
+			company=doc.get("company"),
+			ignore_caps=True,
+		)
+		for item, copy, line in zip(items, copies, result.get("items") or [], strict=False):
+			name, qty, price = item.get("name"), _line_qty(item), _line_price_list_rate(item)
+			if name and line.get("reason") == REASON_SCHEME_NOT_ELIGIBLE:
+				# Now always decides. The stored moment blocks only a scheme this invoice
+				# carries — its free row, or its tag on the line (Ruling 127): a draft held
+				# past a window end keeps F&F; a forged or old creation never unblocks.
+				owners = set(gifts._split_rule_names(copy.get(gifts.FIELD_FNF_BLOCKED_BY)))
+				carried = free_rules | set(gifts._item_rule_names(item)) | set(gifts._item_rule_names(copy))
+				if at is None or owners & carried:
+					blocked.add(name)
+			uncapped = flt(line.get("fnf_uncapped_amount"))
+			if not name or cint(item.get("is_free_item")) or uncapped <= 0 or qty <= 0 or price <= 0:
+				continue
+			rate = max(0.0, price - uncapped / qty)
+			rates[name] = min(rates.get(name, rate), rate)
+	return {name: rate for name, rate in rates.items() if name not in blocked}
+
+
 def _line_tolerance(item, unit: float) -> float:
 	"""One currency unit per unit sold: saved rows hold a per-unit rate rounded to the currency."""
 	return unit * max(1.0, abs(_line_qty(item)))
@@ -1515,7 +1640,8 @@ def _freeze_paid_invoice(doc, items) -> None:
 	offline = ff_paid.is_offline(doc)
 	# Copies only: a paid invoice keeps its rows; scope comes from Item.
 	copies = enrich_items_with_catalog([_row_copy(i) for i in items])
-	ff_compatibility.block_ineligible_lines(copies, doc=doc)
+	posting_date = doc.get("posting_date") or nowdate()
+	judge_restored(copies, doc, restore_context(doc.get("customer"), posting_date, doc.get("pos_profile")))
 	kwargs = {
 		"customer": doc.get("customer"),
 		"items": copies,
@@ -1759,6 +1885,8 @@ def apply_friends_and_family_on_invoice(doc, method=None):
 	rerun = _enforce_invoice_gift_policy(doc, items)
 	if rerun:
 		items = doc.get("items")
+		# The dropped gift rewrote pricing_rules: re-judge with the doc (Ruling 124).
+		judge_restored(items, doc, restore_context(doc.get("customer"), posting_date, pos_profile))
 		ff_payload = apply_friends_and_family_to_items(
 			items,
 			customer=doc.get("customer"),

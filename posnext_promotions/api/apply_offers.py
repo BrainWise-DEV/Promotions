@@ -33,12 +33,13 @@ from posnext_promotions.promotions.friends_and_family_apply import (
 	_is_fnf_stamped,
 	_strip_line_discount,
 	apply_friends_and_family_to_items,
+	judge_restored,
+	restore_context,
 	summarize_line_payloads,
 )
 from posnext_promotions.promotions.friends_and_family_caps import FIELD_FNF_REPLACED
-from posnext_promotions.promotions import ff_config, ff_money, ff_scope
+from posnext_promotions.promotions import ff_compatibility, ff_config, ff_money, ff_scope
 from posnext_promotions.promotions.ff_compatibility import (
-	block_ineligible_lines,
 	enforce_gift_policy,
 	row_key_list,
 )
@@ -1140,7 +1141,11 @@ def _friends_and_family_only_response(items, prepared_items, customer, invoice) 
 	the POS cart never showed it until the invoice was saved.
 	"""
 	# A BXGY rule blocks its lines even when no offer was selected (Ruling 19).
-	block_ineligible_lines(prepared_items, doc=_compat_doc(invoice, customer))
+	judge_restored(
+		prepared_items,
+		_compat_doc(invoice, customer),
+		restore_context(customer, invoice.get("posting_date") or nowdate(), invoice.get("pos_profile")),
+	)
 	ff_result = apply_friends_and_family_to_items(
 		prepared_items,
 		customer=customer,
@@ -1342,6 +1347,7 @@ def _prune_suppressed_rules(applied_rules, ff_result, prepared_items, free_items
 
 
 @frappe.whitelist()
+@ff_compatibility.without_verdict_marks
 @ff_money.in_cart_currency
 def apply_offers(invoice_data, selected_offers=None):
 	"""Calculate and apply promotional offers using ERPNext Pricing Rules.
@@ -1854,7 +1860,11 @@ def apply_offers(invoice_data, selected_offers=None):
 		# valued further down, so the paid line would otherwise look undiscounted.
 		# One rule source with invoice validate (Ruling 19): rules tagged on the lines plus
 		# every applicable blocking rule, not only the offers the client selected.
-		block_ineligible_lines(prepared_items, doc=_compat_doc(invoice, customer))
+		judge_restored(
+			prepared_items,
+			_compat_doc(invoice, customer),
+			restore_context(customer, invoice.get("posting_date") or nowdate(), invoice.get("pos_profile")),
+		)
 		pre_fnf_items = [frappe._dict(dict(item)) for item in prepared_items]
 		ff_result = apply_friends_and_family_to_items(
 			prepared_items,
@@ -1943,7 +1953,13 @@ def apply_offers(invoice_data, selected_offers=None):
 			applied_rules=applied_rules,
 		)
 		if gift_suppressed:
-			# A GWP stamp may have overwritten F&F on a paid line; reclaim F&F.
+			# A GWP stamp may have overwritten F&F on a paid line; reclaim F&F. The dropped
+			# gift rewrote pricing_rules: re-judge with the doc first (Ruling 124).
+			judge_restored(
+				prepared_items,
+				_compat_doc(invoice, customer),
+				restore_context(customer, invoice.get("posting_date") or nowdate(), invoice.get("pos_profile")),
+			)
 			ff_result = apply_friends_and_family_to_items(
 				prepared_items,
 				customer=customer,
