@@ -114,6 +114,14 @@ def coupon_share(row, coupon):
 	what the promotion left, see ``coupon_engine.apply_coupon_to_items``). "Skip the
 	line" never prices discounted lines and "Better of the two" replaces the promotion,
 	so on those lines the whole discount is the coupon's.
+
+	The share is ``posnext_coupon_discount`` when the POS stored it. When that field is
+	empty, the fallback subtracts only the percentage of Pricing Rules still named on
+	the row (see ``_promotion_percentage``). A cashier's discount has no Pricing Rule,
+	so the fallback cannot see it and the whole line discount is checked against the
+	coupon. Invoices saved before this field existed, and offline invoices from an
+	older POS build, have no stored share: a cashier discount plus an "Add on top"
+	coupon on those is still refused. That strict default is intentional.
 	"""
 	base, total = _line_discount(row)
 	if base <= 0:
@@ -132,7 +140,12 @@ def coupon_share(row, coupon):
 
 
 def _promotion_percentage(row) -> float:
-	"""Percentage of the Pricing Rules still named on the row, when it can be read (0 otherwise)."""
+	"""Percentage of the Pricing Rules still named on the row, when it can be read (0 otherwise).
+
+	Only rules whose ``rate_or_discount`` is "Discount Percentage" are read. An
+	amount-type offer under the coupon is invisible to the ``coupon_share`` fallback,
+	the same as a cashier's discount, and that part of the line is checked as the coupon's.
+	"""
 	from posnext_promotions.api.promotion_exclusions import _parse_pricing_rules
 
 	names = _parse_pricing_rules(row.get("pricing_rules"))
