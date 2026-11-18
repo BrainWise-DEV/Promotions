@@ -36,11 +36,21 @@ def with_item_master_scope(items) -> list:
 	return rows
 
 
-def _line_existing_discount(item) -> float:
-	"""Discount a line already carries before the coupon (the payload sends pre-coupon values)."""
+def _line_existing_discount(item, amount_basis: str = "line") -> float:
+	"""Discount a line already carries before the coupon (the payload sends pre-coupon values).
+
+	``amount_basis="unit"`` is a saved invoice row (Ruling 96): its ``discount_amount`` is
+	per unit and the client wrote it, so the line is valued from what it charges against
+	the server-set ``price_list_rate`` (:func:`best_discount.line_discount_value`), never
+	from that field. Cart payloads (``"line"``) keep their line totals.
+	"""
 	if cint(item.get("is_free_item") or 0):
 		return 0.0
 	base = _item_base_amount(item)
+	if amount_basis == "unit":
+		from posnext_promotions.promotions import best_discount as bd
+
+		return min(max(bd.line_discount_value(item, bd.AMOUNT_BASIS_UNIT), 0.0), base)
 	amount = flt(item.get("discount_amount") or 0)
 	if amount <= 0 and flt(item.get("discount_percentage") or 0) > 0:
 		amount = base * flt(item.get("discount_percentage")) / 100.0
@@ -142,7 +152,7 @@ def _get_customer_coupon_usage_count(customer, coupon_code):
 	return used_count
 
 
-def get_coupon_eligible_items(coupon, items):
+def get_coupon_eligible_items(coupon, items, amount_basis: str = "line"):
 	"""
 	Return cart items that pass the Promotion Interaction Matrix for coupons.
 
@@ -188,7 +198,7 @@ def get_coupon_eligible_items(coupon, items):
 		item = raw if isinstance(raw, dict) else dict(raw)
 		if cint(item.get("is_free_item") or 0):
 			continue
-		existing_discount = _line_existing_discount(item)
+		existing_discount = _line_existing_discount(item, amount_basis)
 		if mode != PROMOTION_CONFLICT_SKIP:
 			# The coupon's setting, not the matrix, decides lines that already carry a discount
 			allowed = (
@@ -354,7 +364,7 @@ def _coupon_rejection_message(coupon, items) -> str:
 	return _("No eligible items for this coupon")
 
 
-def apply_coupon_to_items(coupon, items):
+def apply_coupon_to_items(coupon, items, amount_basis: str = "line"):
 	"""
 	Calculate per-line coupon discounts for matrix-eligible items only.
 
@@ -362,9 +372,12 @@ def apply_coupon_to_items(coupon, items):
 	reach this path (see get_coupon_eligible_items). Other promotional types
 	remain eligible.
 
+	``amount_basis``: ``"line"`` for cart payloads, ``"unit"`` for saved invoice rows
+	(see :func:`_line_existing_discount`).
+
 	Returns dict with valid, message, eligible_item_codes, line_updates, total_discount.
 	"""
-	eligible = get_coupon_eligible_items(coupon, items)
+	eligible = get_coupon_eligible_items(coupon, items, amount_basis)
 	if not eligible:
 		return {
 			"valid": False,
@@ -470,6 +483,8 @@ def apply_coupon_to_items(coupon, items):
 			"amount": flt(new_rate * qty, 6),
 			"coupon_code": coupon.coupon_code,
 			"coupon_only_discount": flt(part, 6),
+			# The line's own discount before the coupon (a "Better of the two" order coupon tops it up).
+			"existing_discount": flt(existing, 6),
 			"pre_coupon_discount_fraction": flt(existing / base, 6) if stacked and base else 0,
 		}
 		if stacked:

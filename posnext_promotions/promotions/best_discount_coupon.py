@@ -129,14 +129,33 @@ def _coupon_percentage(coupon) -> float | None:
 	return flt(coupon.get("discount_percentage")) if cstr(coupon.get("discount_type")) == "Percentage" else None
 
 
-def _coupon_amounts(coupon, rows, tax_rate: float) -> list[float]:
+def _tops_up_line_discounts(coupon) -> bool:
+	"""An order-level "Better of the two" coupon: a line keeps its own discount and the
+	coupon only tops it up to the coupon's amount, so the two are never combined (Ruling 93)."""
+	from posnext_promotions.api.coupon_engine import PROMOTION_CONFLICT_BETTER, get_promotion_conflict_mode
+
+	return not is_line_level_coupon(coupon) and get_promotion_conflict_mode(coupon) == PROMOTION_CONFLICT_BETTER
+
+
+def _coupon_amounts(coupon, rows, tax_rate: float, top_up: bool = True) -> list[float]:
 	"""Coupon money per row. A "Grand Total" % coupon also saves the exclusive tax on it.
 
-	``max_amount`` caps the total after the tax, as :func:`apply_coupon_discount` does.
+	An order-level "Better of the two" coupon gives each line only what it adds to the
+	line's own discount: ``max(0, coupon amount on the line - the line's discount)``
+	(``top_up``; without it, the coupon's whole share, the saving its scenario gives).
+	The one value rule for ``calculate_coupon_discount``, the unpaid header cap and the
+	paid check. ``max_amount`` caps the total after the tax, as :func:`apply_coupon_discount` does.
 	"""
 	pct = _coupon_percentage(coupon)
 	scale = 1.0 + tax_rate if pct is not None else 1.0
 	amounts = [_coupon_line_amount(update, item) * scale for update, item in rows]
+	if top_up and _tops_up_line_discounts(coupon):
+		amounts = [
+			max(0.0, amount - flt(update.get("existing_discount")) * (1.0 + tax_rate))
+			if not update.get("stacked")
+			else amount
+			for amount, (update, _item) in zip(amounts, rows, strict=True)
+		]
 	cap = flt(coupon.get("max_amount"))
 	total = sum(amounts)
 	if pct is not None and cap and total > cap:
@@ -160,12 +179,16 @@ def _line_updates(result: dict, items) -> list:
 	]
 
 
-def coupon_value_on(coupon, lines, tax_rate: float = 0.0) -> float:
-	"""The coupon's money on ``lines`` — the one value rule for the cart and the invoice."""
+def coupon_value_on(coupon, lines, tax_rate: float = 0.0, amount_basis: str = bd.AMOUNT_BASIS_LINE) -> float:
+	"""The coupon's money on ``lines`` — the one value rule for the cart and the invoice.
+
+	``amount_basis``: :data:`best_discount.AMOUNT_BASIS_UNIT` for saved invoice rows, whose
+	own discount is then read from what they charge, never from ``discount_amount``.
+	"""
 	from posnext_promotions.api.coupon_engine import apply_coupon_to_items
 
 	lines = [frappe._dict(dict(line)) for line in lines or []]
-	result = apply_coupon_to_items(coupon, lines)
+	result = apply_coupon_to_items(coupon, lines, amount_basis)
 	if not result.get("valid"):
 		return 0.0
 	rate = tax_rate if cstr(coupon.get("apply_on")) == "Grand Total" else 0.0
@@ -259,6 +282,8 @@ def decide_coupon_vs_fnf(cart, coupon, customer=None, pos_profile=None) -> Coupo
 	updates = _line_updates(result, items)
 	amounts = _coupon_amounts(coupon, updates, tax_rate)
 	decision.coupon_value = sum(amounts)
+	# What the coupon's scenario saves: a topped-up line also keeps its own discount.
+	scenario_value = sum(_coupon_amounts(coupon, updates, tax_rate, top_up=False))
 	pct = _coupon_percentage(coupon)
 	rows = [
 		(
@@ -309,7 +334,7 @@ def decide_coupon_vs_fnf(cart, coupon, customer=None, pos_profile=None) -> Coupo
 			else None
 		)
 		decision.order_decision = bd.decide(
-			[rival, bd.Candidate(source=bd.SOURCE_COUPON, amount=decision.coupon_value, percentage=pct, code=code)],
+			[rival, bd.Candidate(source=bd.SOURCE_COUPON, amount=scenario_value, percentage=pct, code=code)],
 			granularity=bd.GRANULARITY_ORDER,
 		)
 		if decision.order_decision.winner_source == bd.SOURCE_COUPON:

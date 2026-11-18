@@ -1037,11 +1037,12 @@ def _pos_coupon_value(
 		return None
 	row = frappe.get_cached_doc("POS Coupon", name)
 	pct = flt(row.discount_percentage) if cstr(row.discount_type) == "Percentage" else None
-	if lines:
-		# Same value rule as validate_coupon / calculate_coupon_discount (cart = invoice).
+	if lines is not None:
+		# Same value rule as validate_coupon / calculate_coupon_discount (cart = invoice);
+		# the lines are saved rows, so their own discount is read from their rate (Ruling 96).
 		from posnext_promotions.promotions.best_discount_coupon import coupon_value_on
 
-		value = coupon_value_on(row, lines, tax_rate)
+		value = coupon_value_on(row, lines, tax_rate, amount_basis=bd.AMOUNT_BASIS_UNIT)
 	else:
 		base = base_grand if cstr(row.apply_on) == "Grand Total" else base_net
 		value = flt(base) * pct / 100.0 if pct is not None else flt(row.discount_amount)
@@ -1427,29 +1428,45 @@ def _disagreement(
 	return entry
 
 
-def _paid_header_disagreement(doc, items, carried_total: float, unit: float) -> dict | None:
-	"""Header discount on a paid invoice: never stacked on F&F, never above the coupon's value.
+def _paid_coupon_value(doc, items, fnf_ids=frozenset()) -> float | None:
+	"""What the invoice's POS Coupon may give as a header on a paid invoice (None if not one):
+	its scoped value (``coupon_value_on``) on the paid lines that carry no F&F.
 
-	The coupon check runs whether or not F&F applies (as the unpaid cap does).
+	A line that got F&F gets no coupon (6d, Ruling 98), so those lines (``fnf_ids``, the
+	``id()`` of each row carrying F&F) are left out; with none left the coupon gives 0.
+	"""
+	rows = [i for i in items if not i.get("is_free_item") and id(i) not in fnf_ids]
+	b_line_values = [bd.line_discount_value(i, bd.AMOUNT_BASIS_UNIT) for i in rows]
+	base_net, base_grand, tax_rate = _scenario_b_bases(doc, rows, b_line_values)
+	lines = _scenario_b_lines(rows, [_snapshot_line(i) for i in rows], [False] * len(rows))
+	coupon = _pos_coupon_value(doc.get("coupon_code"), base_net, base_grand, lines=lines, tax_rate=tax_rate)
+	return None if coupon is None else coupon[0]
+
+
+def _paid_header_disagreement(
+	doc, items, carried_total: float, unit: float, fnf_ids=frozenset()
+) -> dict | None:
+	"""Header discount on a paid invoice: never above the coupon's value, never stacked on F&F.
+
+	Above its POS Coupon's value on the lines without F&F it is a header disagreement
+	whether or not F&F applies (Rulings 92, 98: it blocks online). A header next to F&F
+	lines within that value, or with no POS Coupon, is the stacked case: logged.
 	"""
 	header_amt = _header_discount_value(doc)
 	header_pct = flt(doc.get("additional_discount_percentage") or 0)
 	if header_amt <= 0 and header_pct <= 0:
 		return None
-	if carried_total > 0:
-		return _disagreement(ff_paid.HEADER_DISCOUNT, carried=carried_total, header=bd.money(header_amt), stacked=1)
-	if not cstr(doc.get("coupon_code")).strip():
-		return None
-	snapshots = [_snapshot_line(i) for i in items]
-	b_line_values = [bd.line_discount_value(i, bd.AMOUNT_BASIS_UNIT) for i in items]
-	coupon = _order_candidate_without_fnf(doc, items, b_line_values, snapshots, [False] * len(items))
-	if header_amt > flt(coupon.amount) + unit:
+	code = cstr(doc.get("coupon_code")).strip().upper()
+	coupon_value = _paid_coupon_value(doc, items, fnf_ids) if code else None
+	if coupon_value is not None and header_amt > coupon_value + unit:
 		return _disagreement(
 			ff_paid.HEADER_DISCOUNT,
 			header=bd.money(header_amt),
-			coupon_code=coupon.code,
-			coupon_value=bd.money(coupon.amount),
+			coupon_code=code,
+			coupon_value=bd.money(coupon_value),
 		)
+	if carried_total > 0:
+		return _disagreement(ff_paid.HEADER_DISCOUNT, carried=carried_total, header=bd.money(header_amt), stacked=1)
 	return None
 
 
@@ -1486,6 +1503,9 @@ def _freeze_paid_invoice(doc, items) -> None:
 
 	* Offline (the customer has left): never throws; each disagreement goes to
 	  ``doc.flags`` and is logged at submit (``Offline Disagreement``).
+	* A stored paid draft pos_next re-saves within the header it held
+	  (``flags.pos_paid_draft``): its header discount never throws, it is logged at
+	  submit (``Paid Disagreement``); its rows are judged as online.
 	* Online: more F&F than the uncapped entitlement, F&F on a line a scheme owns,
 	  or a header discount that is stacked / above its coupon → throw, naming the
 	  row. F&F above the capped entitlement is a cap breach: logged, and the
@@ -1544,17 +1564,27 @@ def _freeze_paid_invoice(doc, items) -> None:
 			if carried < c_amt - tolerance:
 				found.append(_disagreement(ff_paid.MISSING_FNF, item, carried, u_amt, c_amt))
 
-	header = _paid_header_disagreement(doc, items, carried_total, unit)
+	fnf_ids = {id(line[0]) for line in lines if line[1] > 0}
+	header = _paid_header_disagreement(doc, items, carried_total, unit, fnf_ids)
 	if header:
 		found.append(header)
-	found.extend(_paid_gift_disagreements(items, {id(line[0]) for line in lines if line[1] > 0}))
+	found.extend(_paid_gift_disagreements(items, fnf_ids))
 
 	if not offline:
 		for entry in found:
 			entry["reason"] = ff_paid.online_reason(entry["reason"])
 		# A header stacked on F&F rows is logged, not thrown: the cart may have sent
-		# both, and the unpaid path used to resolve that silently.
-		blocking = [e for e in found if e["reason"] in ff_paid.ONLINE_BLOCKING and not e.get("stacked")]
+		# both, and the unpaid path used to resolve that silently. So is the header of a
+		# stored paid draft pos_next re-saves within the header it held (Rulings 97, 99: the
+		# POS app sets the flag only then); that draft's rows are still judged.
+		paid_draft = ff_paid.is_paid_draft(doc)
+		blocking = [
+			e
+			for e in found
+			if e["reason"] in ff_paid.ONLINE_BLOCKING
+			and not e.get("stacked")
+			and not (paid_draft and e["reason"] == ff_paid.HEADER_DISCOUNT)
+		]
 		if blocking:
 			frappe.throw(
 				"<br>".join(_paid_throw_message(entry) for entry in blocking)

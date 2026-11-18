@@ -438,6 +438,137 @@ class TestFFCouponIntegrity(PaidInvoiceFixture, FrappeTestCase):
 		)
 		self.assertEqual(self._logs(doc, LOG_PAID_DISAGREEMENT), [])
 
+	def _scoped_fnf_invoice(self, header, **kwargs):
+		"""Probe R1: a 10% order coupon scoped to ITEM_A (worth 5 at list price); ITEM_A on
+		an F&F line at 35, ITEM_B at 80 out of scope."""
+		self._excluded(ITEM_B)
+		self._coupon(
+			"FFCI-SCOPED10",
+			max_amount=1000,
+			apply_scope="Item Code",
+			applicable_items=[{"item_code": ITEM_A}],
+			exclude_already_discounted_items=0,
+		)
+		rows = [self._row(ITEM_A, pct=30, marked=True), self._row(ITEM_B)]
+		return self._invoice(rows, coupon_code="FFCI-SCOPED10", discount_amount=header, **kwargs)
+
+	def test_paid_online_scoped_coupon_header_next_to_fnf_above_value_throws(self):
+		"""Ruling 92: next to F&F lines, a header above the coupon's scoped value blocks online."""
+		doc = self._scoped_fnf_invoice(11)
+		with self.assertRaises(frappe.ValidationError) as caught:
+			apply_friends_and_family_on_invoice(doc)
+		self.assertIn("is more than coupon FFCI-SCOPED10 gives", str(caught.exception))
+		self.assertEqual(flt(doc.discount_amount), 11)
+
+	def test_paid_online_scoped_coupon_header_next_to_fnf_only_scope_refused(self):
+		"""Ruling 98: a line that got F&F gets no coupon, so a coupon scoped to the F&F line
+		alone is worth 0 on the paid invoice: any header above one unit is refused online
+		(3.5 and 5 were the logged stacked case before)."""
+		for header in (0.5, 3.5, 5):
+			with self.subTest(header=header):
+				doc = self._scoped_fnf_invoice(header)
+				with self.assertRaises(frappe.ValidationError) as caught:
+					apply_friends_and_family_on_invoice(doc)
+				self.assertIn("is more than coupon FFCI-SCOPED10 gives", str(caught.exception))
+				self.assertEqual(flt(doc.discount_amount), header)
+
+	def test_scoped_coupon_next_to_fnf_cart_sends_no_header(self):
+		"""Ruling 98 parity: in the R1 shape the cart's coupon header is 0 (F&F wins on
+		ITEM_A, ITEM_B is out of scope), so the paid invoice the cart builds is saved."""
+		self._excluded(ITEM_B)
+		self._coupon(
+			"FFCI-SCOPED10",
+			max_amount=1000,
+			apply_scope="Item Code",
+			applicable_items=[{"item_code": ITEM_A}],
+			exclude_already_discounted_items=0,
+		)
+		calculated = self._calculate(
+			"FFCI-SCOPED10", self._lines((ITEM_A, 1, 50, None), (ITEM_B, 1, 80, None))
+		)
+		self.assertFalse(calculated["valid"])
+		self.assertEqual(flt(calculated["discount"]), 0)
+		doc = self._scoped_fnf_invoice(flt(calculated["discount"]))
+		apply_friends_and_family_on_invoice(doc)  # paid online: must not throw
+		self.assertEqual(flt(doc.discount_amount), 0)
+
+	def test_paid_online_coupon_header_valued_on_lines_without_fnf(self):
+		"""Ruling 98: the coupon is valued on ITEM_B only (8), never on the F&F line.
+		8 next to F&F is the logged stacked case; 9 is refused."""
+		self._excluded(ITEM_B)
+		self._coupon("FFCI-NOFNF10", max_amount=1000)
+		# The cart never sends more than that limit.
+		calculated = self._calculate(
+			"FFCI-NOFNF10", self._lines((ITEM_A, 1, 50, None), (ITEM_B, 1, 80, None))
+		)
+		self.assertLessEqual(flt(calculated["discount"]), 8)
+		for header, refused in ((8, False), (9, True)):
+			with self.subTest(header=header):
+				rows = [self._row(ITEM_A, pct=30, marked=True), self._row(ITEM_B)]
+				doc = self._invoice(rows, coupon_code="FFCI-NOFNF10", discount_amount=header)
+				if refused:
+					with self.assertRaises(frappe.ValidationError) as caught:
+						apply_friends_and_family_on_invoice(doc)
+					self.assertIn("is more than coupon FFCI-NOFNF10 gives", str(caught.exception))
+					continue
+				apply_friends_and_family_on_invoice(doc)
+				self.assertEqual(flt(doc.discount_amount), header)
+				entries = [e for e in self._entries(doc) if e["reason"] == ff_paid.HEADER_DISCOUNT]
+				self.assertEqual([e.get("stacked") for e in entries], [1])
+
+	def test_paid_online_coupon_header_all_lines_fnf_refused(self):
+		"""Every paid line got F&F: the coupon is worth 0 there, never its % of the whole base.
+		The cart sends no header there either, for an order-level or a line-level coupon."""
+		self._coupon("FFCI-ALLFNF10", max_amount=1000)
+		self._coupon("FFCI-ALLFNF10L", apply_on="Grand Total")  # uncapped %: per line
+		for code in ("FFCI-ALLFNF10", "FFCI-ALLFNF10L"):
+			with self.subTest(code=code):
+				calculated = self._calculate(code, self._lines((ITEM_A, 1, 50, None)))
+				self.assertEqual(flt(calculated["discount"]), 0)
+		doc = self._invoice(
+			[self._row(ITEM_A, pct=30, marked=True)], coupon_code="FFCI-ALLFNF10", discount_amount=2
+		)
+		with self.assertRaises(frappe.ValidationError) as caught:
+			apply_friends_and_family_on_invoice(doc)
+		self.assertIn("is more than coupon FFCI-ALLFNF10 gives", str(caught.exception))
+
+	def test_paid_draft_header_above_scoped_value_logged(self):
+		"""Ruling 97: pos_next flags a re-saved stored paid draft; its header is logged, not
+		refused, as offline. The same invoice paid online and not a draft is refused."""
+		doc = self._scoped_fnf_invoice(11)
+		doc.flags[ff_paid.PAID_DRAFT_FLAG] = True
+		apply_friends_and_family_on_invoice(doc)
+		self.assertEqual(flt(doc.discount_amount), 11)
+		entries = [e for e in self._entries(doc) if e["reason"] == ff_paid.HEADER_DISCOUNT]
+		self.assertEqual(len(entries), 1)
+		log_invoice_submit(doc)
+		self.assertEqual(
+			[log.reason for log in self._logs(doc, LOG_PAID_DISAGREEMENT)], [ff_paid.HEADER_DISCOUNT]
+		)
+		self.assertEqual(self._logs(doc, LOG_OFFLINE_DISAGREEMENT), [])
+
+		online = self._scoped_fnf_invoice(11)
+		with self.assertRaises(frappe.ValidationError):
+			apply_friends_and_family_on_invoice(online)
+
+	def test_paid_draft_row_over_entitlement_still_refused(self):
+		"""Ruling 97 covers the header only: a paid draft's F&F row above the entitlement
+		(90% where 30% is due) has no other bound, so it is still refused online."""
+		doc = self._invoice([self._row(ITEM_A, pct=90, marked=True)])
+		doc.flags[ff_paid.PAID_DRAFT_FLAG] = True
+		with self.assertRaises(frappe.ValidationError) as caught:
+			apply_friends_and_family_on_invoice(doc)
+		self.assertIn("this customer is entitled to", str(caught.exception))
+
+	def test_paid_offline_scoped_coupon_header_next_to_fnf_logged(self):
+		doc = self._scoped_fnf_invoice(11, paid=False, offline=True)
+		apply_friends_and_family_on_invoice(doc)
+		self.assertEqual(flt(doc.discount_amount), 11)
+		log_invoice_submit(doc)
+		self.assertEqual(
+			[log.reason for log in self._logs(doc, LOG_OFFLINE_DISAGREEMENT)], [ff_paid.HEADER_DISCOUNT]
+		)
+
 	def test_resolver_granularity_is_shared(self):
 		# Uncapped % → per line; fixed amount or capped % → whole order. One rule for both endpoints.
 		lines = self._lines((ITEM_A, 1, 50, None))
@@ -471,26 +602,130 @@ class TestFFCouponIntegrity(PaidInvoiceFixture, FrappeTestCase):
 			{"discount_type": "Amount", "discount_amount": 60},
 			{"discount_percentage": 20, "max_amount": 100},  # order-level %
 		)
+		# Ruling 93: a "Better of the two" order coupon only tops up the promoted line
+		# (its share on ITEM_A less the 5 the line keeps): 60 → 55, 26 → 21.
+		expected = {"FFCI-PAR-BETT-0": 55, "FFCI-PAR-BETT-1": 21}
 		for conflict in ("Skip the line", "Better of the two", "Add on top"):
 			for n, fields in enumerate(coupons):
 				code = f"FFCI-PAR-{conflict[:4].upper()}-{n}"
 				self._coupon(code, promotion_conflict=conflict, **fields)
-				self._check_header_parity(code, rule)
+				self._check_header_parity(code, rule, expected.get(code))
 
-	def _check_header_parity(self, code, rule):
-		with self.subTest(code=code):
-			promoted = _line(self.ctx, ITEM_A, qty=1)
+	def _price_rule(self, percentage):
+		from posnext_promotions.test_promotions import _make_rule
+
+		return _make_rule(
+			f"_PNXT_FFP_PRICE{percentage}",
+			apply_on="Item Code",
+			items=[{"item_code": ITEM_A}],
+			price_or_product_discount="Price",
+			rate_or_discount="Discount Percentage",
+			discount_percentage=percentage,
+		)
+
+	def test_better_order_coupon_line_discount_above_its_share_adds_nothing(self):
+		"""A 20% order coupon (10 on ITEM_A) next to ITEM_A's own 30% (15): that line adds 0,
+		so the header is the 16 on ITEM_B alone, at the cart and on the paid invoice."""
+		self._excluded(ITEM_A, ITEM_B)
+		self._coupon(
+			"FFCI-BETTER-ZERO", discount_percentage=20, max_amount=100, promotion_conflict="Better of the two"
+		)
+		self._check_header_parity("FFCI-BETTER-ZERO", self._price_rule(30), expected=16, promoted_pct=30)
+
+	def test_better_order_coupon_mixed_lines_paid_header_capped(self):
+		"""Promoted ITEM_A (10%: 5) tops up to the coupon's 10; plain ITEM_B gives 16: 21.
+		The paid invoice keeps 21 and refuses 22 (the coupon never stacks on the promotion)."""
+		self._excluded(ITEM_A, ITEM_B)
+		self._coupon(
+			"FFCI-BETTER-MIX", discount_percentage=20, max_amount=100, promotion_conflict="Better of the two"
+		)
+		rule = self._price_rule(10)
+		self._check_header_parity("FFCI-BETTER-MIX", rule, expected=21)
+		doc = self._invoice(
+			[self._row(ITEM_A, pct=10, rules=rule), self._row(ITEM_B)],
+			coupon_code="FFCI-BETTER-MIX",
+			discount_amount=22,
+		)
+		with self.assertRaises(frappe.ValidationError) as caught:
+			apply_friends_and_family_on_invoice(doc)
+		self.assertIn("is more than coupon FFCI-BETTER-MIX gives", str(caught.exception))
+
+	def test_calculated_coupon_header_kept_by_invoice_qty_two(self):
+		"""Ruling 96: at qty 2 the saved row's discount_amount is per unit; the invoice values
+		the line's own discount from its rate, so cart and invoice still agree. The 20%
+		"Better of the two" coupon: ITEM_A ×2 tops up 20 − 10 = 10, ITEM_B 16: 26."""
+		self._excluded(ITEM_A, ITEM_B)
+		rule = self._price_rule(10)
+		coupons = (
+			{"discount_type": "Amount", "discount_amount": 60},
+			{"discount_percentage": 20, "max_amount": 100},
+		)
+		expected = {"FFCI-PQ2-BETT-1": 26, "FFCI-PQ2-ADD -1": 34}
+		for conflict in ("Skip the line", "Better of the two", "Add on top"):
+			for n, fields in enumerate(coupons):
+				code = f"FFCI-PQ2-{conflict[:4].upper()}-{n}"
+				self._coupon(code, promotion_conflict=conflict, **fields)
+				self._check_header_parity(code, rule, expected.get(code), qty=2)
+
+	def test_better_order_coupon_forged_row_discount_amount_ignored(self):
+		"""Ruling 96: a row that understates discount_amount (0.01) while charging rate 45
+		(10% off 50) is still credited with its 5: the paid header caps at 21, not 25.99."""
+		self._excluded(ITEM_A, ITEM_B)
+		self._coupon(
+			"FFCI-BETTER-FORGE",
+			discount_percentage=20,
+			max_amount=1000,
+			promotion_conflict="Better of the two",
+		)
+		for header, refused in ((21, False), (22, True), (25.99, True)):
+			with self.subTest(header=header):
+				row = self._row(ITEM_A, pct=10)
+				row.discount_amount = 0.01
+				doc = self._invoice(
+					[row, self._row(ITEM_B)], coupon_code="FFCI-BETTER-FORGE", discount_amount=header
+				)
+				if refused:
+					with self.assertRaises(frappe.ValidationError) as caught:
+						apply_friends_and_family_on_invoice(doc)
+					self.assertIn("is more than coupon FFCI-BETTER-FORGE gives", str(caught.exception))
+				else:
+					apply_friends_and_family_on_invoice(doc)
+					self.assertEqual(flt(doc.discount_amount), header)
+
+	def _check_header_parity(self, code, rule, expected=None, promoted_pct=10, qty=1):
+		with self.subTest(code=code, qty=qty):
+			promoted = _line(self.ctx, ITEM_A, qty=qty)
+			promoted_off = flt(50 * promoted_pct / 100, 2)
 			promoted.update(
-				{"discount_percentage": 10, "discount_amount": 5, "rate": 45, "pricing_rules": rule}
+				{
+					"discount_percentage": promoted_pct,
+					"discount_amount": promoted_off * qty,  # the cart sends the line total
+					"rate": 50 - promoted_off,
+					"pricing_rules": rule,
+				}
 			)
 			plain = _line(self.ctx, ITEM_B, qty=1)
 			calculated = self._calculate(code, [promoted, plain])
 			header = flt(calculated["discount"])
+			if expected is not None:
+				self.assertAlmostEqual(header, expected, places=2)
 
-			row_a = self._row(ITEM_A, pct=10, rules=rule)
-			for paid in (False, True):
-				doc = self._invoice(
-					[row_a.copy(), self._row(ITEM_B)], paid=paid, coupon_code=code, discount_amount=header
+			row_a = self._row(ITEM_A, qty=qty, pct=promoted_pct, rules=rule)  # saved row: per unit
+
+			def invoice(paid, amount):
+				return self._invoice(
+					[row_a.copy(), self._row(ITEM_B)], paid=paid, coupon_code=code, discount_amount=amount
 				)
+
+			for paid in (False, True):
+				doc = invoice(paid, header)
 				apply_friends_and_family_on_invoice(doc)  # paid online: must not throw
 				self.assertEqual(flt(doc.discount_amount), header)
+			if header <= 0:
+				return
+			# The cart's header is also the invoice's limit: unpaid caps at it, paid refuses above it.
+			doc = invoice(False, header + 5)
+			apply_friends_and_family_on_invoice(doc)
+			self.assertAlmostEqual(flt(doc.discount_amount), header, places=2)
+			with self.assertRaises(frappe.ValidationError):
+				apply_friends_and_family_on_invoice(invoice(True, header + 1))

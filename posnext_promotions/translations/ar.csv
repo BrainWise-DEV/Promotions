@@ -12,3 +12,4 @@
 "Approved Domains","النطاقات المعتمدة",""
 "Email Domain","نطاق البريد الإلكتروني",""
 "Discount Percentage must be below 100","يجب أن تكون نسبة الخصم أقل من 100",""
+"The invoice discount {0} is more than coupon {1} gives ({2}).","خصم الفاتورة {0} أكبر مما تمنحه القسيمة {1} ({2}).",""
