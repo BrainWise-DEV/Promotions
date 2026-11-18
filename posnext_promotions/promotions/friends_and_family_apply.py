@@ -308,6 +308,7 @@ _REPLACED_FIELDS = (
 	"rate",
 	"pricing_rules",
 	"posnext_coupon_code",
+	"posnext_coupon_discount",
 	"coupon_code",
 	"is_already_discounted",
 )
@@ -481,6 +482,8 @@ def _drop_competing_tags(item, competing_source: str | None) -> list[str]:
 	if competing_source == bd.SOURCE_COUPON or item.get("posnext_coupon_code"):
 		if item.get("posnext_coupon_code"):
 			_set_item_attr(item, "posnext_coupon_code", None)
+		if item.get("posnext_coupon_discount"):
+			_set_item_attr(item, "posnext_coupon_discount", 0)
 		if item.get("coupon_code"):
 			_set_item_attr(item, "coupon_code", None)
 	return removed
