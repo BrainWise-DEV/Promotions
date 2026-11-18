@@ -68,6 +68,14 @@ class TestScopedCoupon(unittest.TestCase):
 		with self.assertRaises(frappe.ValidationError):
 			self._run([row], _coupon(promotion_conflict="Add on top", max_amount=8))
 
+	def test_add_on_top_amount_cap_counts_saved_coupon_share(self):
+		# Line already 30 off; the Amount coupon adds 20 on top. Only the 20 counts against its cap.
+		coupon = _coupon(discount_type="Amount", discount_amount=20, promotion_conflict="Add on top")
+		row = _row(discount_percentage=0, discount_amount=50, price_list_rate=100, posnext_coupon_discount=20)
+		self._run([row], coupon)
+		with self.assertRaises(frappe.ValidationError):
+			self._run([_row(discount_percentage=0, discount_amount=50, posnext_coupon_discount=25)], coupon)
+
 	def test_tag_must_match_invoice_coupon(self):
 		with self.assertRaises(frappe.ValidationError):
 			self._run([_row()], _coupon(), coupon_code="OTHER")

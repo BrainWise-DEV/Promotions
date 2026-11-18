@@ -70,7 +70,7 @@ def validate_scoped_coupon_lines(doc, method=None):
 					row.idx, flt(row.discount_percentage), code, pct
 				)
 			)
-		spent[code] += _coupon_share(row, pct if stacked else 0)
+		spent[code] += _coupon_share(row, pct if stacked else None)
 
 	for code, total in spent.items():
 		coupon = coupons[code]
@@ -82,19 +82,22 @@ def validate_scoped_coupon_lines(doc, method=None):
 			frappe.throw(_("POS Coupon {0} discount {1} exceeds its limit of {2}").format(code, total, cap))
 
 
-def _coupon_share(row, stacked_pct=0) -> float:
-	"""Coupon discount on the row (line total).
+def _coupon_share(row, stacked_pct=None) -> float:
+	"""Coupon discount on the row (line total). ``stacked_pct``: None when not stacked.
 
 	A stacked percentage coupon takes pct of what the line's own discount left
 	(line - pre), so with line D = pre + share its share is pct * (base - D) / (1 - pct).
+	A stacked Amount coupon's share can't be derived: the POS saves it in
+	``posnext_coupon_discount``. Either way never more than the row's discount.
 	"""
 	total = flt(row.discount_amount) * flt(row.qty)
-	if not 0 < stacked_pct < 100:
-		# ponytail: a stacked Amount coupon still counts the line's own discount against its cap;
-		# needs the coupon share saved on the row to split it.
+	if stacked_pct is None:
 		return total
+	if not stacked_pct:
+		# The rest of the row's discount is judged by pos_next as the line's own (POS Settings limits).
+		return min(total, max(flt(row.get("posnext_coupon_discount")), 0))
 	base = flt(row.price_list_rate) * flt(row.qty)
-	if base <= 0:
+	if base <= 0 or stacked_pct >= 100:
 		return total
 	p = stacked_pct / 100
 	return min(total, max(base - total, 0) * p / (1 - p))
