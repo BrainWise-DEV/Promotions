@@ -6,7 +6,7 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
 	frappe = None
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # F&F contract version between posnext_promotions and pos_next. Bump with any cross-app change.
 FF_CONTRACT = 2
