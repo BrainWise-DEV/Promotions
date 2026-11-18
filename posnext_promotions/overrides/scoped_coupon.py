@@ -11,7 +11,11 @@ import frappe
 from frappe import _
 from frappe.utils import cint, flt
 
-from posnext_promotions.api.coupon_engine import _item_matches_scope
+from posnext_promotions.api.coupon_engine import (
+	PROMOTION_CONFLICT_ADD,
+	_item_matches_scope,
+	get_promotion_conflict_mode,
+)
 
 SCOPED = ("Item Code", "Item Group", "Brand")
 # Currency rounding on the client can leave a line a few cents above its allocation.
@@ -57,13 +61,16 @@ def validate_scoped_coupon_lines(doc, method=None):
 					_("Row {0}: item {1} is not covered by POS Coupon {2}").format(row.idx, row.item_code, code)
 				)
 
-		if coupon.discount_type == "Percentage" and flt(row.discount_percentage) > flt(coupon.discount_percentage) + TOLERANCE:
+		pct = flt(coupon.discount_percentage) if coupon.discount_type == "Percentage" else 0
+		# "Add on top": the row also carries its own discount, so its total is no measure of the coupon.
+		stacked = get_promotion_conflict_mode(coupon) == PROMOTION_CONFLICT_ADD
+		if pct and not stacked and flt(row.discount_percentage) > pct + TOLERANCE:
 			frappe.throw(
 				_("Row {0}: discount {1}% exceeds POS Coupon {2} ({3}%)").format(
-					row.idx, flt(row.discount_percentage), code, flt(coupon.discount_percentage)
+					row.idx, flt(row.discount_percentage), code, pct
 				)
 			)
-		spent[code] += flt(row.discount_amount) * flt(row.qty)
+		spent[code] += _coupon_share(row, pct if stacked else 0)
 
 	for code, total in spent.items():
 		coupon = coupons[code]
@@ -73,6 +80,24 @@ def validate_scoped_coupon_lines(doc, method=None):
 		# Percentage coupons without a cap are priced as a percentage, not an amount.
 		if cap and total > cap + TOLERANCE:
 			frappe.throw(_("POS Coupon {0} discount {1} exceeds its limit of {2}").format(code, total, cap))
+
+
+def _coupon_share(row, stacked_pct=0) -> float:
+	"""Coupon discount on the row (line total).
+
+	A stacked percentage coupon takes pct of what the line's own discount left
+	(line - pre), so with line D = pre + share its share is pct * (base - D) / (1 - pct).
+	"""
+	total = flt(row.discount_amount) * flt(row.qty)
+	if not 0 < stacked_pct < 100:
+		# ponytail: a stacked Amount coupon still counts the line's own discount against its cap;
+		# needs the coupon share saved on the row to split it.
+		return total
+	base = flt(row.price_list_rate) * flt(row.qty)
+	if base <= 0:
+		return total
+	p = stacked_pct / 100
+	return min(total, max(base - total, 0) * p / (1 - p))
 
 
 # Scope -> (child table, legacy single field or None, label for the message)

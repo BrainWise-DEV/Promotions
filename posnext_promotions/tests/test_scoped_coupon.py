@@ -60,6 +60,14 @@ class TestScopedCoupon(unittest.TestCase):
 		with self.assertRaises(frappe.ValidationError):
 			self._run([_row(discount_percentage=50)], _coupon())
 
+	def test_add_on_top_percentage_stacks_on_line_discount(self):
+		# 10% own discount + 10% coupon on top = 19% on the row (HANO case)
+		coupon = _coupon(promotion_conflict="Add on top", max_amount=10)
+		row = _row(discount_percentage=19, discount_amount=19, price_list_rate=100)
+		self._run([row], coupon)  # coupon share 9, under the 10 cap
+		with self.assertRaises(frappe.ValidationError):
+			self._run([row], _coupon(promotion_conflict="Add on top", max_amount=8))
+
 	def test_tag_must_match_invoice_coupon(self):
 		with self.assertRaises(frappe.ValidationError):
 			self._run([_row()], _coupon(), coupon_code="OTHER")
