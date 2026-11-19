@@ -27,6 +27,8 @@ def validate_scoped_coupon_lines(doc, method=None):
 	if not tagged:
 		return
 
+	_restore_offline_header_coupon(doc, tagged)
+
 	coupons = {}
 	for code in {row.posnext_coupon_code.upper() for row in tagged}:
 		name = frappe.db.get_value("POS Coupon", {"coupon_code": code})
@@ -68,6 +70,34 @@ def validate_scoped_coupon_lines(doc, method=None):
 		# Percentage coupons without a cap are priced as a percentage, not an amount.
 		if cap and total > cap + TOLERANCE:
 			frappe.throw(_("POS Coupon {0} discount {1} exceeds its limit of {2}").format(code, total, cap))
+
+
+def _restore_offline_header_coupon(doc, tagged) -> None:
+	"""An offline sale being synced with tagged lines but no header coupon takes that coupon (D-18).
+
+	The POS offline checkout queues the sale without its header ``coupon_code``
+	while the lines keep ``posnext_coupon_code``. Restoring the header (only when
+	every tagged line names the same existing coupon) lets the coupon be counted
+	on submit, where POS Settings ``offline_coupon_overshoot`` decides an over-limit
+	sale: "Allow and log" keeps and logs it, "Reject" refuses it. Online sales and
+	mixed codes are left to the checks below.
+
+	``flags.pos_offline_sync`` only means the caller sent an ``offline_id``; it is
+	not proof the sale happened offline. The restore is safe on that basis alone
+	because it grants nothing a header ``coupon_code`` would not (the coupon is
+	still checked per line here and re-checked and counted on submit).
+	"""
+	flags = getattr(doc, "flags", None) or {}
+	if not flags.get("pos_offline_sync") or (doc.get("coupon_code") or "").strip():
+		return
+	codes = {row.posnext_coupon_code.strip().upper() for row in tagged}
+	if len(codes) != 1:
+		return
+	from pos_next.pos_next.doctype.pos_coupon.pos_coupon import resolve_coupon_name
+
+	name = resolve_coupon_name(codes.pop())  # case-safe whatever the DB collation
+	if name:
+		doc.coupon_code = frappe.db.get_value("POS Coupon", name, "coupon_code")
 
 
 # Scope -> (child table, legacy single field or None, label for the message)

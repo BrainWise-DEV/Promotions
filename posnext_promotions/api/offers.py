@@ -23,7 +23,11 @@ from posnext_promotions.promotions.scope import (
 	get_item_group_with_descendants,
 	get_scope_config,
 )
-from posnext_promotions.api.gwp import PROMOTION_TYPE_GWP, calculate_gwp_discount_percentage
+from posnext_promotions.api.gwp import (
+	PROMOTION_TYPE_GWP,
+	calculate_gwp_discount_percentage,
+	normalize_gwp_paid_qty_basis,
+)
 from posnext_promotions.api.gift_pool import PROMOTION_TYPE_GIFT_POOL
 
 # ============================================================================
@@ -475,37 +479,23 @@ class OfferBuilder:
 		# Determine offer type
 		is_price_discount = rule.get("price_or_product_discount") == DiscountType.PRICE
 		promotion_type = rule.get("promotion_type") or None
-		gwp_discount_percentage = 0
-		if promotion_type == PROMOTION_TYPE_GWP and not is_price_discount:
-			gwp_discount_percentage = calculate_gwp_discount_percentage(
-				flt(slab.get("free_qty", 0)),
-				flt(slab.get("min_qty", 0)),
-			)
+		kind = (
+			OfferBuilder.price_fields(slab)
+			if is_price_discount
+			else OfferBuilder.product_fields(slab, promotion_type)
+		)
 
 		return Offer(
 			name=rule["name"],
 			title=rule.get("title") or rule.get("promotional_scheme") or rule["name"],
 			description=rule.get("title") or rule.get("promotional_scheme") or "",
 			apply_on=rule["apply_on"],
-			offer="Item Price" if is_price_discount else "Give Product",
 			auto=is_auto,
 			coupon_based=1 if rule.get("coupon_code_based") else 0,
 			min_qty=flt(slab.get("min_qty", 0)),
 			max_qty=flt(slab.get("max_qty", 0)),
 			min_amt=flt(slab.get("min_amount", 0)),
 			max_amt=flt(slab.get("max_amount", 0)),
-			discount_type=slab.get("rate_or_discount") if is_price_discount else None,
-			rate=flt(slab.get("rate", 0)) if is_price_discount else 0,
-			discount_amount=flt(slab.get("discount_amount", 0)) if is_price_discount else 0,
-			discount_percentage=(
-				flt(slab.get("discount_percentage", 0))
-				if is_price_discount
-				else gwp_discount_percentage
-			),
-			apply_discount_on_price=(slab.get("apply_discount_on_price") if is_price_discount else None),
-			min_or_max_discount_qty_limit=(
-				cint(slab.get("min_or_max_discount_qty_limit", 0)) if is_price_discount else 0
-			),
 			valid_from=rule.get("valid_from"),
 			valid_upto=rule.get("valid_upto"),
 			source=OfferSource.PROMOTIONAL_SCHEME,
@@ -514,21 +504,55 @@ class OfferBuilder:
 			eligible_items=eligible_items,
 			eligible_item_groups=eligible_item_groups,
 			eligible_brands=eligible_brands,
-			# Free item fields for product discounts
-			free_item=slab.get("free_item") if not is_price_discount else None,
-			free_qty=(
-				flt(slab.get("free_qty", 0)) if not is_price_discount and flt(slab.get("free_qty", 0)) > 0
-				else (1 if not is_price_discount and slab.get("is_recursive") else 0)
-			) if not is_price_discount else 0,
-			free_item_uom=slab.get("free_item_uom") if not is_price_discount else None,
-			same_item=1 if slab.get("same_item") and not is_price_discount else 0,
-			is_recursive=1 if slab.get("is_recursive") and not is_price_discount else 0,
-			recurse_for=flt(slab.get("recurse_for", 0)) if not is_price_discount else 0,
-			apply_recursion_over=flt(slab.get("apply_recursion_over", 0)) if not is_price_discount else 0,
 			one_time_per_customer=1 if rule.get("one_time_per_customer") else 0,
 			promotion_type=promotion_type,
-			gwp_paid_qty_basis=slab.get("gwp_paid_qty_basis"),
+			**kind,
 		)
+
+	@staticmethod
+	def price_fields(src: dict) -> dict:
+		"""Offer fields of a Price rule, read from a scheme price slab or a standalone Pricing Rule."""
+		return {
+			"offer": "Item Price",
+			"discount_type": src.get("rate_or_discount"),
+			"rate": flt(src.get("rate", 0)),
+			"discount_amount": flt(src.get("discount_amount", 0)),
+			"discount_percentage": flt(src.get("discount_percentage", 0)),
+			"apply_discount_on_price": src.get("apply_discount_on_price"),
+			"min_or_max_discount_qty_limit": cint(src.get("min_or_max_discount_qty_limit", 0)),
+		}
+
+	@staticmethod
+	def product_fields(src: dict, promotion_type: str | None) -> dict:
+		"""Offer fields of a Product rule (free item), read from a scheme product slab or a
+		standalone Pricing Rule — one shape, so the cart treats both the same online and offline."""
+		free_qty = flt(src.get("free_qty", 0))
+		is_recursive = 1 if src.get("is_recursive") else 0
+		return {
+			"offer": "Give Product",
+			"discount_type": None,
+			"rate": 0,
+			"discount_amount": 0,
+			"discount_percentage": (
+				calculate_gwp_discount_percentage(free_qty, flt(src.get("min_qty", 0)))
+				if promotion_type == PROMOTION_TYPE_GWP
+				else 0
+			),
+			"apply_discount_on_price": None,
+			"min_or_max_discount_qty_limit": 0,
+			"free_item": src.get("free_item"),
+			"free_qty": free_qty if free_qty > 0 else (1 if is_recursive else 0),
+			"free_item_uom": src.get("free_item_uom"),
+			"same_item": 1 if src.get("same_item") else 0,
+			"is_recursive": is_recursive,
+			"recurse_for": flt(src.get("recurse_for", 0)),
+			"apply_recursion_over": flt(src.get("apply_recursion_over", 0)),
+			"gwp_paid_qty_basis": (
+				normalize_gwp_paid_qty_basis(src.get("gwp_paid_qty_basis"))
+				if promotion_type == PROMOTION_TYPE_GWP
+				else src.get("gwp_paid_qty_basis")
+			),
+		}
 
 	@staticmethod
 	def build_from_standalone_rule(rule: dict, eligibility: OfferEligibility) -> Offer:
@@ -549,24 +573,24 @@ class OfferBuilder:
 		elif rule["apply_on"] == ApplyOn.BRAND:
 			eligible_brands = eligibility.brands
 
+		promotion_type = rule.get("promotion_type") or None
+		kind = (
+			OfferBuilder.product_fields(rule, promotion_type)
+			if rule.get("price_or_product_discount") == DiscountType.PRODUCT
+			else OfferBuilder.price_fields(rule)
+		)
+
 		return Offer(
 			name=rule["name"],
 			title=rule.get("title") or rule["name"],
 			description=rule.get("title") or f"Pricing Rule: {rule['name']}",
 			apply_on=rule["apply_on"],
-			offer="Item Price",
 			auto=is_auto,
 			coupon_based=1 if rule.get("coupon_code_based") else 0,
 			min_qty=flt(rule.get("min_qty", 0)),
 			max_qty=flt(rule.get("max_qty", 0)),
 			min_amt=flt(rule.get("min_amt", 0)),
 			max_amt=flt(rule.get("max_amt", 0)),
-			discount_type=rule.get("rate_or_discount"),
-			rate=flt(rule.get("rate", 0)),
-			discount_amount=flt(rule.get("discount_amount", 0)),
-			discount_percentage=flt(rule.get("discount_percentage", 0)),
-			apply_discount_on_price=rule.get("apply_discount_on_price"),
-			min_or_max_discount_qty_limit=cint(rule.get("min_or_max_discount_qty_limit", 0)),
 			valid_from=rule.get("valid_from"),
 			valid_upto=rule.get("valid_upto"),
 			source=OfferSource.PRICING_RULE,
@@ -576,7 +600,8 @@ class OfferBuilder:
 			eligible_item_groups=eligible_item_groups,
 			eligible_brands=eligible_brands,
 			one_time_per_customer=1 if rule.get("one_time_per_customer") else 0,
-			promotion_type=rule.get("promotion_type") or None,
+			promotion_type=promotion_type,
+			**kind,
 		)
 
 
@@ -608,11 +633,12 @@ def get_offers(pos_profile: str) -> list[dict]:
 		offers = []
 
 		# Get offers from promotional schemes
-		scheme_offers = _get_promotional_scheme_offers(profile.company, date)
+		price_list = profile.get("selling_price_list")
+		scheme_offers = _get_promotional_scheme_offers(profile.company, date, price_list)
 		offers.extend(scheme_offers)
 
 		# Get standalone pricing rule offers
-		standalone_offers = _get_standalone_pricing_rule_offers(profile.company, date)
+		standalone_offers = _get_standalone_pricing_rule_offers(profile.company, date, price_list)
 		offers.extend(standalone_offers)
 
 		_attach_accumulative_config(offers)
@@ -733,12 +759,24 @@ def _attach_gift_pool_config(offers: list[Offer]) -> None:
 			offer.gift_pool_items = by_scheme[offer.promotional_scheme]
 
 
-def _get_promotional_scheme_offers(company: str, date: str) -> list[Offer]:
+# Ruling 135: a Product rule priced for another price list is not this profile's offer
+# (the offline cart cannot tell, so it must not get it). Rules without a price list,
+# and Price rules, are listed as before.
+PRODUCT_PRICE_LIST_SQL = """
+			AND (
+				price_or_product_discount <> 'Product'
+				OR IFNULL(for_price_list, '') = ''
+				OR %(price_list)s IS NULL
+				OR for_price_list = %(price_list)s
+			)"""
+
+
+def _get_promotional_scheme_offers(company: str, date: str, price_list: str | None = None) -> list[Offer]:
 	"""Fetch offers from promotional schemes"""
 
 	# Fetch pricing rules linked to promotional schemes
 	pricing_rules = frappe.db.sql(
-		"""
+		f"""
 		SELECT
 			name, title, apply_on, selling, promotional_scheme,
 			promotional_scheme_id, coupon_code_based, one_time_per_customer,
@@ -752,9 +790,10 @@ def _get_promotional_scheme_offers(company: str, date: str) -> list[Offer]:
 			AND company = %(company)s
 			AND (valid_from IS NULL OR valid_from <= %(date)s)
 			AND (valid_upto IS NULL OR valid_upto >= %(date)s)
+			{PRODUCT_PRICE_LIST_SQL}
 		ORDER BY priority DESC, name
 	""",
-		{"company": company, "date": date},
+		{"company": company, "date": date, "price_list": price_list or None},
 		as_dict=1,
 	)
 
@@ -790,19 +829,26 @@ def _get_promotional_scheme_offers(company: str, date: str) -> list[Offer]:
 	return offers
 
 
-def _get_standalone_pricing_rule_offers(company: str, date: str) -> list[Offer]:
+def _get_standalone_pricing_rule_offers(company: str, date: str, price_list: str | None = None) -> list[Offer]:
 	"""Fetch offers from standalone pricing rules"""
 
-	# Fetch standalone pricing rules (not linked to schemes)
+	# Fetch standalone pricing rules (not linked to schemes), Price and Product alike:
+	# a Product rule (BXGY, free item, cart-total gift, GWP) reaches the cart as
+	# "Give Product", the same shape as a Promotional Scheme product rule (D-17).
+	optional_sql = (
+		", gwp_paid_qty_basis" if frappe.db.has_column("Pricing Rule", "gwp_paid_qty_basis") else ""
+	)
 	pricing_rules = frappe.db.sql(
-		"""
+		f"""
 		SELECT
 			name, title, apply_on, selling,
 			coupon_code_based, one_time_per_customer, price_or_product_discount,
 			rate_or_discount, rate, discount_amount, discount_percentage,
 			apply_discount_on_price, min_or_max_discount_qty_limit,
 			min_qty, max_qty, min_amt, max_amt,
-			priority, valid_from, valid_upto, promotion_type
+			free_item, free_qty, free_item_uom, same_item, is_recursive,
+			recurse_for, apply_recursion_over,
+			priority, valid_from, valid_upto, promotion_type{optional_sql}
 		FROM `tabPricing Rule`
 		WHERE
 			disable = 0
@@ -811,10 +857,16 @@ def _get_standalone_pricing_rule_offers(company: str, date: str) -> list[Offer]:
 			AND company = %(company)s
 			AND (valid_from IS NULL OR valid_from <= %(date)s)
 			AND (valid_upto IS NULL OR valid_upto >= %(date)s)
-			AND price_or_product_discount = %(discount_type)s
+			AND price_or_product_discount IN %(discount_types)s
+			{PRODUCT_PRICE_LIST_SQL}
 		ORDER BY priority DESC, name
 	""",
-		{"company": company, "date": date, "discount_type": DiscountType.PRICE},
+		{
+			"company": company,
+			"date": date,
+			"price_list": price_list or None,
+			"discount_types": (DiscountType.PRICE, DiscountType.PRODUCT),
+		},
 		as_dict=1,
 	)
 
