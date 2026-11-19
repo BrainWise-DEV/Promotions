@@ -70,7 +70,7 @@
   },
   {
    "default": "0",
-   "description": "Global for Free Item, Gift Pool, discount-type Gift with Purchase, Cart Total Gift and Brand Gift. Unchecked (default): a gift whose trigger item received Friends & Family is not given, and a cart-total gift is removed when F&F applies. Checked: the gift and F&F both apply. Product Gift with Purchase rules count as Buy X Get Y, and Buy X Get Y and Item Level Discount (Routine) items never receive F&F, so this checkbox does not apply to them.",
+   "description": "Global for Free Item, Gift Pool, Gift with Purchase, Cart Total Gift, Brand Gift and Buy X Get Y (a same-item Gift with Purchase counts as Buy X Get Y). Unchecked (default): a gift whose trigger item received Friends & Family is not given, a cart-total gift is removed when F&F applies, and Buy X Get Y items get no F&F. Checked: the gift and F&F both apply, and a Buy X Get Y item gets F&F and keeps its free item. Item Level Discount (Routine) items never receive F&F, whatever this checkbox says.",
    "fieldname": "allow_free_gift_with_ff",
    "fieldtype": "Check",
    "label": "Allow Free Gift with F&F"
@@ -278,7 +278,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-11-17 14:00:00.000000",
+ "modified": "2026-11-19 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "POSNext Promotions",
  "name": "Friends and Family Settings",

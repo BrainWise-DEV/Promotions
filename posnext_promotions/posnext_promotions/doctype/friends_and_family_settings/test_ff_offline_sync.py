@@ -99,6 +99,21 @@ class TestFFOfflineSync(PaidInvoiceFixture, FrappeTestCase):
 		self.assertEqual(self._prices(doc), before)
 		self.assertEqual(self._reasons(doc), [ff_paid.COMPATIBILITY])
 
+	def test_offline_bxgy_fnf_no_disagreement_when_gift_allowed(self):
+		# Task 8s: with Allow Free Gift with F&F on, a BXGY line's F&F is an entitlement.
+		self._settings(allow_free_gift_with_ff=1)
+		rule = self._bxgy()
+		doc = self._invoice(
+			[self._row(qty=2, pct=30, marked=True, rules=rule), self._free_row(rule, item_code=ITEM_A)],
+			paid=False,
+			offline=True,
+		)
+		before = self._prices(doc)
+		self._sync(doc)
+		self.assertEqual(self._prices(doc), before)
+		self.assertEqual(self._reasons(doc), [])
+		self.assertEqual(self._ledger_amount(doc), 30)
+
 	def test_offline_header_discount_logged(self):
 		doc = self._invoice([self._row(pct=30, marked=True)], paid=False, offline=True, discount_amount=5)
 		self._sync(doc)

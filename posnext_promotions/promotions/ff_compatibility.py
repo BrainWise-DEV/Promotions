@@ -583,7 +583,8 @@ def _is_unclassified(rule) -> bool:
 
 
 def _decide_gifts(snapshot: GiftSnapshot, fnf_keys: set, rule_map: dict):
-	"""Returns ``(suppressed rule names, dropped gifts)``. BXGY is never dropped.
+	"""Returns ``(suppressed rule names, dropped gifts)``. BXGY is never dropped: with the
+	setting off its lines get no F&F (``gifts.scheme_blocking_kind``).
 
 	The caller has already checked that free gifts are not allowed with F&F.
 	"""

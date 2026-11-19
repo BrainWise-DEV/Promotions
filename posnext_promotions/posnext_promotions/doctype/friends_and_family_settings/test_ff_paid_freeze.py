@@ -329,6 +329,20 @@ class TestFFPaidFreeze(PaidInvoiceFixture, FrappeTestCase):
 		self.assertEqual(self._prices(doc), before)
 		self.assertEqual(doc["items"][0].get(FIELD_DISCOUNT_SOURCE), FNF)  # not stripped
 
+	def test_paid_bxgy_fnf_accepted_when_gift_allowed(self):
+		# Task 8s: Allow Free Gift with F&F covers Buy X Get Y, so the line may carry F&F.
+		self._settings(allow_free_gift_with_ff=1)
+		rule = self._bxgy()
+		doc = self._invoice(
+			[self._row(qty=2, pct=30, marked=True, rules=rule), self._free_row(rule, item_code=ITEM_A)]
+		)
+		before = self._prices(doc)
+		apply_friends_and_family_on_invoice(doc)  # no compatibility throw
+		self.assertEqual(self._prices(doc), before)
+		self.assertEqual(len(doc["items"]), 2)
+		self.assertEqual(self._entries(doc), [])
+		self.assertEqual(doc["items"][0].get(FIELD_DISCOUNT_SOURCE), FNF)
+
 	def test_paid_online_forbidden_gift_logged_not_removed(self):
 		self._settings(allow_free_gift_with_ff=0)
 		rule, doc = self._gift_invoice()

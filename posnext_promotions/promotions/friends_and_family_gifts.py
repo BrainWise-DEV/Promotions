@@ -5,11 +5,18 @@
 
 Rules
 -----
-* **Buy X Get Y (BXGY)** and **Routine** (Promotional Scheme of type *Item Level
-  Discount*) are *not eligible* for F&F. Lines matched by such a scheme never
-  receive F&F — they keep their promotion (free units / item-level discount).
-  Other cart lines still get F&F. See
+* **Routine** (Promotional Scheme of type *Item Level Discount*) lines are *not
+  eligible* for F&F, whatever the setting below: they keep their item-level
+  discount. **Buy X Get Y (BXGY)** lines are not eligible either while *Allow
+  Free Gift with F&F* is off. Other cart lines still get F&F. See
   :func:`ff_compatibility.block_ineligible_lines` and :func:`line_blocked_by_scheme`.
+  BXGY covers (:func:`ff_classifier.classify_promotion`):
+
+  - Product schemes with a same-item free row (Buy 1 Get 1, B2G1, …), even
+    when labelled GWP;
+  - Price Discount schemes that give 100% off (or Rate 0) a limited number of
+    units (Min/Max price + a discounted-qty limit, e.g. dev-miraaya "buy one"),
+    whatever their Promotion Type label (:func:`is_price_bxgy_rule`).
 * **Allow Free Gift with F&F** (Friends and Family Settings, global, default
   off) controls Free Item, GWP, Gift Pool, Cart Total Gift and Brand Gift:
 
@@ -19,7 +26,10 @@ Rules
     (Transaction) gift is removed when F&F applied anywhere on the cart; its
     threshold is evaluated on the subtotal *after* F&F either way.
 
-  BXGY is never touched by this setting (its lines carry no F&F).
+  - BXGY (Task 8s): checked → the BXGY line gets F&F *and* keeps its free row;
+    unchecked → the line gets no F&F (as above). The BXGY free row is never
+    dropped by the gift policy. A Price "buy one" has no free row: checked, its
+    line enters the usual best-discount comparison with F&F.
 * The hidden per-scheme ``apply_with_ff`` field is left untouched (reserved for a
   future per-promotion override).
 """
@@ -83,7 +93,14 @@ def classify_gift_rule(rule) -> str | None:
 
 
 def scheme_blocking_kind(rule) -> str | None:
-	"""``bxgy`` / ``item_level`` when lines under this rule must not get F&F."""
+	"""``bxgy`` / ``item_level`` when lines under this rule must not get F&F.
+
+	The one switch every judge reads (cart, F&F-only call, invoice validate, paid
+	freeze, ``fnf_line_rates``). Item Level always blocks; BXGY blocks only while
+	*Allow Free Gift with F&F* is off (Task 8s).
+	"""
+	from posnext_promotions.promotions import ff_config
+
 	rule = _rule_values(rule)
 	if not rule:
 		return None
@@ -91,7 +108,9 @@ def scheme_blocking_kind(rule) -> str | None:
 		# Coupons keep the best-discount comparison.
 		return None
 	kind = classify_promotion(rule)
-	return kind if kind in (SCHEME_KIND_BXGY, SCHEME_KIND_ITEM_LEVEL) else None
+	if kind == SCHEME_KIND_BXGY:
+		return None if ff_config.resolve().allow_free_gift_with_ff.value else kind
+	return kind if kind == SCHEME_KIND_ITEM_LEVEL else None
 
 
 def _split_rule_names(raw) -> list[str]:
@@ -215,7 +234,8 @@ def suppress_incompatible_gifts(
 	rule_map: dict,
 	applied_rules: set | None = None,
 ) -> set[str]:
-	"""Remove gifts that may not coexist with F&F (setting off). BXGY is never removed.
+	"""Remove gifts that may not coexist with F&F (setting off). BXGY is never removed (its
+	lines get no F&F while the setting is off).
 
 	``fnf_indices``: paid lines that received F&F *before* the gift passes ran.
 	Returns the Pricing Rule names suppressed.

@@ -1855,8 +1855,8 @@ def apply_offers(invoice_data, selected_offers=None):
 		# whatever promotion / manual discount the line carries, compared in money,
 		# tie → F&F, never stacked. Percentage always from Settings.
 		# Snapshot the lines first: scenario "no F&F" for the order-level check.
-		# Miraaya: Buy X Get Y / Routine (Item Level Discount) lines are not
-		# eligible for F&F. Flag them *before* F&F runs — BXGY free units are only
+		# Miraaya: Routine (Item Level Discount) lines, and Buy X Get Y lines while
+		# Allow Free Gift with F&F is off, are not eligible for F&F. Flag them *before* F&F runs — BXGY free units are only
 		# valued further down, so the paid line would otherwise look undiscounted.
 		# One rule source with invoice validate (Ruling 19): rules tagged on the lines plus
 		# every applicable blocking rule, not only the offers the client selected.
@@ -1943,7 +1943,8 @@ def apply_offers(invoice_data, selected_offers=None):
 		# Miraaya F&F gift rules (Allow Free Gift with F&F, default off): a Free
 		# Item / GWP / Gift Pool / Brand gift whose trigger line got F&F, or a
 		# cart-total gift on a cart with F&F, is dropped when the setting is off.
-		# BXGY is never dropped here — its lines carry no F&F.
+		# BXGY is never dropped here: with the setting off its lines carry no F&F; with
+		# it on the BXGY line gets F&F and keeps its free row (Task 8s).
 		gift_suppressed = enforce_gift_policy(
 			prepared_items,
 			free_items_map,
