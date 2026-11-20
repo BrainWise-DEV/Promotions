@@ -389,6 +389,9 @@ def _submit_rows(doc, items) -> list[dict]:
 	"""Rows for the decision the validate hook took (``doc.flags.friends_and_family``)."""
 	flags = getattr(doc, "flags", None)
 	payload = flags.get("friends_and_family") if flags is not None else None
+	plan = flags.get(ff_paid.PLAN_FLAG) if flags is not None else None
+	if not payload and plan:
+		return _paid_submit_rows(doc, items, plan)
 	if not payload:
 		# The validate hook did not run (e.g. non-POS invoice); log what the rows carry.
 		return [
@@ -419,22 +422,7 @@ def _submit_rows(doc, items) -> list[dict]:
 		if entry:
 			rows.append(log_values(entry[0], **entry[1]))
 
-	caps = payload.get("caps") or {}
-	if caps.get("capped"):
-		rows.append(
-			log_values(
-				LOG_CAP_HIT,
-				**_invoice_context(doc),
-				discount_source=FNF,
-				discount_amount=flt(caps.get("fnf_applied_total")),
-				fnf_uncapped_amount=flt(caps.get("fnf_uncapped_total")),
-				capped=1,
-				cap_hit=caps.get("cap_hit"),
-				reason="cap_reached",
-				message=caps.get("message_en") or caps.get("message"),
-				details=caps,
-			)
-		)
+	rows.extend(_cap_summary_rows(doc, payload.get("caps")))
 
 	order = (payload.get("best_discount") or {}).get("order")
 	if order:
@@ -456,6 +444,68 @@ def _submit_rows(doc, items) -> list[dict]:
 			)
 		)
 	return rows
+
+
+def _cap_summary_rows(doc, caps) -> list[dict]:
+	"""The invoice-level ``Cap Hit`` row when a PN-129 cap reduced F&F."""
+	caps = caps or {}
+	if not caps.get("capped"):
+		return []
+	return [
+		log_values(
+			LOG_CAP_HIT,
+			**_invoice_context(doc),
+			discount_source=FNF,
+			discount_amount=flt(caps.get("fnf_applied_total")),
+			fnf_uncapped_amount=flt(caps.get("fnf_uncapped_total")),
+			capped=1,
+			cap_hit=caps.get("cap_hit"),
+			reason="cap_reached",
+			message=caps.get("message_en") or caps.get("message"),
+			details=caps,
+		)
+	]
+
+
+def _paid_submit_rows(doc, items, plan: dict) -> list[dict]:
+	"""Rows for a paid invoice: what its rows carry, with the caps the server computed (D-R2-02).
+
+	``plan`` is the capped F&F computation the paid-invoice freeze made on the server's
+	data (:data:`ff_paid.PLAN_FLAG`), the computation the cart made. A row that carries
+	F&F where the plan applies it is logged from the plan (capped, cap hit, uncapped
+	amount, comparison) with the amount the row carries; a row the cap left without F&F
+	is a ``Cap Hit`` row; a cap that reduced F&F adds the invoice-level ``Cap Hit`` row,
+	unless :func:`ff_ledger.on_submit` (which runs first) already wrote its breach Cap Hit
+	row for this submit (:data:`ff_ledger.BREACH_LOGGED_FLAG`): one row, never two or none.
+	Rows that disagree with the plan are the ``Paid Disagreement`` rows' business.
+	"""
+	lines = plan.get("items") or []
+	rows = []
+	for position, row in enumerate(items):
+		line = lines[position] if position < len(lines) else {}
+		carries = _is_fnf_row(row)
+		if carries and not line.get("applies"):
+			rows.append(
+				log_values(
+					LOG_APPLIED,
+					**_invoice_context(doc),
+					**_row_context(row),
+					discount_source=FNF,
+					discount_amount=_row_fnf_amount(row),
+					discount_percentage=flt(row.get("discount_percentage")),
+					reason="applied",
+				)
+			)
+			continue
+		if carries or (not line.get("applies") and line.get("reason") == "cap_reached"):
+			entry = _line_entry(doc, row, line, plan)
+			if entry:
+				rows.append(log_values(entry[0], **entry[1]))
+	flags = getattr(doc, "flags", None)
+	if flags is not None and flags.get(ff_ledger.BREACH_LOGGED_FLAG):
+		# The ledger ran first (hooks order) and wrote this invoice's breach Cap Hit row.
+		return rows
+	return rows + _cap_summary_rows(doc, plan.get("caps"))
 
 
 @_safe

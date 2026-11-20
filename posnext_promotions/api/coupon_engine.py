@@ -18,6 +18,19 @@ def get_promotion_conflict_mode(coupon) -> str:
 	return mode if mode in PROMOTION_CONFLICT_OPTIONS else PROMOTION_CONFLICT_SKIP
 
 
+def max_discount_allowed(pos_profile) -> float:
+	"""POS Settings **Max Discount Percentage Allowed** of ``pos_profile`` (0 = no limit).
+
+	An "Add on top" coupon never takes a line past it: the promotion plus the coupon
+	stay within this share of the line's list price.
+	"""
+	if not pos_profile or not frappe.db.table_exists("POS Settings"):
+		return 0.0
+	if not frappe.get_meta("POS Settings").has_field("max_discount_allowed"):
+		return 0.0
+	return flt(frappe.db.get_value("POS Settings", {"pos_profile": pos_profile}, "max_discount_allowed"))
+
+
 def with_item_master_scope(items) -> list:
 	"""Copies of ``items`` whose ``brand`` / ``item_group`` come from the Item master.
 
@@ -364,7 +377,7 @@ def _coupon_rejection_message(coupon, items) -> str:
 	return _("No eligible items for this coupon")
 
 
-def apply_coupon_to_items(coupon, items, amount_basis: str = "line"):
+def apply_coupon_to_items(coupon, items, amount_basis: str = "line", max_discount_pct: float = 0):
 	"""
 	Calculate per-line coupon discounts for matrix-eligible items only.
 
@@ -374,6 +387,13 @@ def apply_coupon_to_items(coupon, items, amount_basis: str = "line"):
 
 	``amount_basis``: ``"line"`` for cart payloads, ``"unit"`` for saved invoice rows
 	(see :func:`_line_existing_discount`).
+
+	``max_discount_pct`` (POS Settings Max Discount, :func:`max_discount_allowed`; 0 = no
+	limit): an "Add on top" coupon tops a discounted line up to that share of its list
+	price at most, and leaves a line already there alone. A fixed or capped coupon is
+	then spread by what each line may still take (its headroom under the limit, not its
+	room after the promotion), so a promoted line near the limit takes a small share and
+	the other lines take the rest.
 
 	Returns dict with valid, message, eligible_item_codes, line_updates, total_discount.
 	"""
@@ -409,11 +429,18 @@ def apply_coupon_to_items(coupon, items, amount_basis: str = "line"):
 		existing = flt(item["_existing_discount"]) if mode == PROMOTION_CONFLICT_ADD else 0.0
 		return max(flt(item["_base_amount"]) - existing, 0.0)
 
+	def most(item):
+		"""Most the coupon may add to the line: up to the POS max discount when stacking."""
+		existing = flt(item["_existing_discount"]) if mode == PROMOTION_CONFLICT_ADD else 0.0
+		if existing <= 0 or flt(max_discount_pct) <= 0:
+			return room(item)
+		return max(min(room(item), flt(item["_base_amount"]) * flt(max_discount_pct) / 100.0 - existing), 0.0)
+
 	def coupon_parts(lines):
 		"""Coupon share per line before the cap: % of its room, or a fixed amount split by room."""
 		if is_percentage:
-			return [room(item) * pct / 100.0 for item in lines]
-		rooms = [room(item) for item in lines]
+			return [min(room(item) * pct / 100.0, most(item)) for item in lines]
+		rooms = [most(item) for item in lines]
 		total = flt(coupon.discount_amount)
 		if coupon.max_amount and total > flt(coupon.max_amount):
 			total = flt(coupon.max_amount)
@@ -428,9 +455,10 @@ def apply_coupon_to_items(coupon, items, amount_basis: str = "line"):
 	def better_than_promotion(item, part):
 		return flt(item["_existing_discount"]) <= 0 or part > flt(item["_existing_discount"])
 
-	chosen = list(eligible)
+	# A stacked line already at the POS max discount takes nothing more.
+	chosen = [item for item in eligible if flt(most(item), 6) > 0]
+	kept = [item for item in eligible if flt(most(item), 6) <= 0]
 	parts = coupon_parts(chosen)
-	kept = []
 	if mode == PROMOTION_CONFLICT_BETTER:
 		kept = [item for item, part in zip(chosen, parts) if not better_than_promotion(item, part)]
 		chosen = [item for item in chosen if item not in kept]
@@ -450,7 +478,11 @@ def apply_coupon_to_items(coupon, items, amount_basis: str = "line"):
 	if not chosen:
 		return {
 			"valid": False,
-			"message": _("The promotion already gives more on these items")
+			"message": (
+				_("These items already have the maximum discount allowed")
+				if mode == PROMOTION_CONFLICT_ADD
+				else _("The promotion already gives more on these items")
+			)
 			if kept
 			else _coupon_rejection_message(coupon, items),
 			"eligible_item_codes": [],

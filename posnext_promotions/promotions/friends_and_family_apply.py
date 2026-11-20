@@ -1036,7 +1036,7 @@ def _scenario_b_lines(items, snapshots, fnf_like) -> list:
 
 
 def _pos_coupon_value(
-	coupon_code: str, base_net: float, base_grand: float, lines=None, tax_rate: float = 0
+	coupon_code: str, base_net: float, base_grand: float, lines=None, tax_rate: float = 0, pos_profile=None
 ) -> tuple[float, float | None] | None:
 	"""``(value, percentage)`` of an order-level POS Coupon (``None`` if unknown).
 
@@ -1059,7 +1059,7 @@ def _pos_coupon_value(
 		# the lines are saved rows, so their own discount is read from their rate (Ruling 96).
 		from posnext_promotions.promotions.best_discount_coupon import coupon_value_on
 
-		value = coupon_value_on(row, lines, tax_rate, amount_basis=bd.AMOUNT_BASIS_UNIT)
+		value = coupon_value_on(row, lines, tax_rate, amount_basis=bd.AMOUNT_BASIS_UNIT, pos_profile=pos_profile)
 	else:
 		base = base_grand if cstr(row.apply_on) == "Grand Total" else base_net
 		value = flt(base) * pct / 100.0 if pct is not None else flt(row.discount_amount)
@@ -1091,7 +1091,9 @@ def _coupon_without_fnf(doc, items, b_line_values, snapshots=None, fnf_like=None
 		return None
 	base_net, base_grand, tax_rate = _scenario_b_bases(doc, items, b_line_values)
 	lines = _scenario_b_lines(items, snapshots, fnf_like) if snapshots else None
-	return _pos_coupon_value(coupon_code, base_net, base_grand, lines=lines, tax_rate=tax_rate)
+	return _pos_coupon_value(
+		coupon_code, base_net, base_grand, lines=lines, tax_rate=tax_rate, pos_profile=doc.get("pos_profile")
+	)
 
 
 def _order_candidate_without_fnf(doc, items, b_line_values, snapshots=None, fnf_like=None) -> bd.Candidate:
@@ -1564,7 +1566,9 @@ def _paid_coupon_value(doc, items, fnf_ids=frozenset()) -> float | None:
 	b_line_values = [bd.line_discount_value(i, bd.AMOUNT_BASIS_UNIT) for i in rows]
 	base_net, base_grand, tax_rate = _scenario_b_bases(doc, rows, b_line_values)
 	lines = _scenario_b_lines(rows, [_snapshot_line(i) for i in rows], [False] * len(rows))
-	coupon = _pos_coupon_value(doc.get("coupon_code"), base_net, base_grand, lines=lines, tax_rate=tax_rate)
+	coupon = _pos_coupon_value(
+		doc.get("coupon_code"), base_net, base_grand, lines=lines, tax_rate=tax_rate, pos_profile=doc.get("pos_profile")
+	)
 	return None if coupon is None else coupon[0]
 
 
@@ -1724,6 +1728,8 @@ def _freeze_paid_invoice(doc, items) -> None:
 		# Not the entitlement payload: the submit log then records what the rows carry.
 		flags.friends_and_family = None
 		flags[ff_paid.DISAGREEMENTS_FLAG] = {"offline": offline, "entries": found}
+		# The caps as the cart computed them, for the submit log (D-R2-02).
+		flags[ff_paid.PLAN_FLAG] = capped
 
 
 def _paid_gift_disagreements(items, fnf_ids: set) -> list:
@@ -1762,6 +1768,23 @@ def _clear_paid_fnf_markers(item) -> None:
 	_clear_fnf_audit_fields(item)
 	if cstr(item.get("discount_source")) == DISCOUNT_SOURCE_FRIENDS_AND_FAMILY:
 		_set_item_attr(item, "discount_source", None)
+
+
+def _clear_fnf_markers_on_coupon_rows(items) -> None:
+	"""A row a line coupon discounts carries no F&F: drop its stale F&F markers and snapshot.
+
+	A coupon never combines with F&F, so an F&F marker on a coupon-tagged row
+	(``posnext_coupon_code``) is left over from before the coupon took the line, e.g. an
+	F&F line that an "Add on top" coupon stacked on the promotion F&F had displaced.
+	Kept, it would make the paid freeze read promotion + coupon as F&F (``_carried_fnf``)
+	and the unpaid path restore the old promotion over the coupon (review I-1).
+	"""
+	for item in items or []:
+		if cint(item.get("is_free_item")) or not item.get("posnext_coupon_code"):
+			continue
+		_clear_paid_fnf_markers(item)
+		if item.get(FIELD_FNF_REPLACED):
+			_set_item_attr(item, FIELD_FNF_REPLACED, None)
 
 
 def _loyalty_total(doc) -> float:
@@ -1836,6 +1859,8 @@ def apply_friends_and_family_on_invoice(doc, method=None):
 	is_pos_doc = cstr(doc.get("doctype")) == "POS Invoice" or cint(doc.get("is_pos"))
 	if not is_pos_doc:
 		return
+
+	_clear_fnf_markers_on_coupon_rows(items)
 
 	if ff_paid.is_paid(doc):
 		# Never re-price a paid invoice (offline sync or payment collected).

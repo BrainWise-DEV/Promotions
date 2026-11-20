@@ -187,16 +187,19 @@ def _line_updates(result: dict, items) -> list:
 	]
 
 
-def coupon_value_on(coupon, lines, tax_rate: float = 0.0, amount_basis: str = bd.AMOUNT_BASIS_LINE) -> float:
+def coupon_value_on(
+	coupon, lines, tax_rate: float = 0.0, amount_basis: str = bd.AMOUNT_BASIS_LINE, pos_profile=None
+) -> float:
 	"""The coupon's money on ``lines`` — the one value rule for the cart and the invoice.
 
 	``amount_basis``: :data:`best_discount.AMOUNT_BASIS_UNIT` for saved invoice rows, whose
 	own discount is then read from what they charge, never from ``discount_amount``.
+	``pos_profile``: its POS Settings Max Discount limits an "Add on top" coupon, as on the cart.
 	"""
-	from posnext_promotions.api.coupon_engine import apply_coupon_to_items
+	from posnext_promotions.api.coupon_engine import apply_coupon_to_items, max_discount_allowed
 
 	lines = [frappe._dict(dict(line)) for line in lines or []]
-	result = apply_coupon_to_items(coupon, lines, amount_basis)
+	result = apply_coupon_to_items(coupon, lines, amount_basis, max_discount_allowed(pos_profile))
 	if not result.get("valid"):
 		return 0.0
 	rate = tax_rate if cstr(coupon.get("apply_on")) == "Grand Total" else 0.0
@@ -258,7 +261,11 @@ def decide_coupon_vs_fnf(cart, coupon, customer=None, pos_profile=None) -> Coupo
 	order total. On the order the rival is every F&F line (an order coupon replaces
 	F&F on the whole cart) plus the best other discount on the coupon's lines.
 	"""
-	from posnext_promotions.api.coupon_engine import apply_coupon_to_items, exclusive_tax_rate
+	from posnext_promotions.api.coupon_engine import (
+		apply_coupon_to_items,
+		exclusive_tax_rate,
+		max_discount_allowed,
+	)
 
 	cart = cart or {}
 	pos_profile = pos_profile or cart.get("pos_profile")
@@ -268,7 +275,9 @@ def decide_coupon_vs_fnf(cart, coupon, customer=None, pos_profile=None) -> Coupo
 	granularity = bd.GRANULARITY_LINE if is_line_level_coupon(coupon) else bd.GRANULARITY_ORDER
 
 	ctx = restore_context(customer, posting_date, pos_profile)
-	result = apply_coupon_to_items(coupon, [_neutral_copy(i, ctx) for i in items])
+	result = apply_coupon_to_items(
+		coupon, [_neutral_copy(i, ctx) for i in items], max_discount_pct=max_discount_allowed(pos_profile)
+	)
 	decision = CouponDecision(coupon_code=code, granularity=granularity, result=result, items=items)
 	if not result.get("valid"):
 		return decision
@@ -304,14 +313,40 @@ def decide_coupon_vs_fnf(cart, coupon, customer=None, pos_profile=None) -> Coupo
 		for (update, item), amount in zip(updates, amounts, strict=True)
 	]
 
+	def stacked(row) -> bool:
+		"""An "Add on top" line: it keeps its own discount, so that discount is no rival."""
+		return bool(row[0].get("stacked"))
+
+	def rivals(row) -> list:
+		"""What the coupon competes with on the line: F&F only on a stacked line (F&F would
+		replace the promotion and the coupon both), else F&F and the line's own discount."""
+		return [row[3]] if stacked(row) else [row[3], row[4]]
+
+	def stacked_own(row) -> float:
+		"""The discount a stacked line keeps under the coupon, as the engine priced it.
+
+		From the engine's ``existing_discount`` (it ran on the neutral copy, so an F&F
+		line shows the promotion F&F displaced), never from the cart line, whose own
+		discount on an F&F-held line is F&F itself (review I-1).
+		"""
+		return flt(row[0].get("existing_discount")) * (1.0 + tax_rate) if stacked(row) else 0.0
+
+	def line_scenario(row) -> bd.Candidate:
+		"""The coupon as the line would get it: on a stacked line, the promotion plus the coupon."""
+		if not stacked(row):
+			return row[2]
+		return replace(row[2], amount=row[2].amount + stacked_own(row))
+
 	def replaced(row):
-		best = bd.pick_best([row[3], row[4]])
+		best = bd.pick_best(rivals(row))
 		return best.source if best else None
 
 	kept_rows = []
 	if granularity == bd.GRANULARITY_LINE:
 		for row in rows:
-			line = bd.decide([row[3], row[4], row[2]], idx=row[0].get("line_key"), item_code=row[1].get("item_code"))
+			line = bd.decide(
+				[*rivals(row), line_scenario(row)], idx=row[0].get("line_key"), item_code=row[1].get("item_code")
+			)
 			decision.line_decisions.append(line)
 			if line.winner_source == bd.SOURCE_COUPON:
 				kept_rows.append(row)
@@ -341,6 +376,8 @@ def decide_coupon_vs_fnf(cart, coupon, customer=None, pos_profile=None) -> Coupo
 			if rival_source != bd.SOURCE_NONE
 			else None
 		)
+		# A stacked line keeps its own discount in the coupon's scenario too.
+		scenario_value += sum(stacked_own(row) for row in rows)
 		decision.order_decision = bd.decide(
 			[rival, bd.Candidate(source=bd.SOURCE_COUPON, amount=scenario_value, percentage=pct, code=code)],
 			granularity=bd.GRANULARITY_ORDER,

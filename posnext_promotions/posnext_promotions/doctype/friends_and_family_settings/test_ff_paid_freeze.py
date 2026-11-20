@@ -310,6 +310,8 @@ class TestFFPaidFreeze(PaidInvoiceFixture, FrappeTestCase):
 		log_invoice_submit(doc)
 		self.assertEqual(self._ledger_amount(doc), 30)
 		self.assertEqual([log.reason for log in self._logs(doc, LOG_PAID_DISAGREEMENT)], [ff_paid.CAP_EXCEEDED])
+		# One invoice-level Cap Hit row: the ledger's breach row, not a second one from the log.
+		self.assertEqual([log.reason for log in self._logs(doc, "Cap Hit") if not log.item_code], [ff_ledger.REASON_BREACH])
 
 		# Block submit: validate still saves (drafts), submit raises.
 		self._cap_with_remaining(20, on_cap_breach_at_submit="Block submit")
@@ -567,6 +569,76 @@ class TestFFPaidFreeze(PaidInvoiceFixture, FrappeTestCase):
 		self.assertEqual(self._logs(doc, "Discount Applied"), [])
 		self.assertEqual([log.reason for log in self._logs(doc, LOG_PAID_DISAGREEMENT)], [ff_paid.UNDER_DISCOUNT])
 		self.assertEqual(self._ledger_amount(doc), 0)
+
+	# ---- cap audit log on a paid sale (D-R2-02) ------------------------------------
+
+	def _cap_logs(self, doc):
+		return frappe.get_all(
+			LOG_DOCTYPE,
+			filters={"reference_name": doc.name},
+			fields=["log_type", "item_code", "discount_amount", "fnf_uncapped_amount", "capped", "cap_hit", "reason"],
+			order_by="creation asc, name asc",
+		)
+
+	def test_paid_capped_sale_logs_the_cap(self):
+		# D-R2-02: per-order cap 50, ITEM_B ×3 (F&F would be 72). The cart caps it; the paid
+		# invoice's log must say so, from the server's own capped computation.
+		self._settings(max_discount_per_order=50)
+		doc = self._pos_invoice([(ITEM_B, 3)])
+		for row in doc["items"]:  # the markers the POS sends (fnfSubmissionMarkers)
+			row[FIELD_DISCOUNT_SOURCE] = FNF
+			row[FIELD_FNF_AMOUNT] = flt((row.price_list_rate - row.rate) * row.qty, 2)
+		apply_friends_and_family_on_invoice(doc)
+		self.assertEqual(self._entries(doc), [])
+		log_invoice_submit(doc)
+		logs = self._cap_logs(doc)
+		[applied] = [log for log in logs if log.log_type == "Discount Applied"]
+		self.assertEqual(applied.capped, 1)
+		self.assertEqual(applied.cap_hit, "order")
+		self.assertAlmostEqual(flt(applied.fnf_uncapped_amount), 72)
+		self.assertAlmostEqual(flt(applied.discount_amount), flt(doc["items"][0].get(FIELD_FNF_AMOUNT)))
+		[summary] = [log for log in logs if log.log_type == "Cap Hit"]
+		self.assertIsNone(summary.item_code)
+		self.assertEqual(summary.capped, 1)
+		self.assertEqual(summary.cap_hit, "order")
+		self.assertAlmostEqual(flt(summary.fnf_uncapped_amount), 72)
+		self.assertAlmostEqual(flt(summary.discount_amount), 50, delta=3 * 0.01)  # 49.98: per-unit rounding
+
+	def test_paid_line_dropped_by_cap_logs_cap_hit(self):
+		# The 00077 case: the cap leaves a line no F&F; that line is a Cap Hit row.
+		self._cap_with_remaining(0)
+		doc = self._invoice([self._row(ITEM_B)])  # full price: the cap is used up
+		apply_friends_and_family_on_invoice(doc)
+		log_invoice_submit(doc)
+		lines = [log for log in self._cap_logs(doc) if log.item_code]
+		self.assertEqual([(log.log_type, log.reason, log.cap_hit) for log in lines], [("Cap Hit", "cap_reached", "monthly")])
+		self.assertAlmostEqual(flt(lines[0].discount_amount), 0)
+
+	def test_paid_cap_hit_row_follows_what_the_ledger_wrote(self):
+		# Review M-1: ITEM_A ×7 carries 50.03 at a per-order cap of 50. Validate allows
+		# qty × 0.01 (no cap_exceeded), the ledger one unit (breach row). One Cap Hit row only.
+		self._settings(max_discount_per_order=50)
+		row = self._row(ITEM_A, qty=7, marked=True)
+		row.rate = 50 - 50.03 / 7
+		row.discount_amount = 50.03 / 7
+		row[FIELD_DISCOUNT_SOURCE] = FNF
+		row[FIELD_FNF_AMOUNT] = 50.03
+		doc = self._invoice([row])
+		apply_friends_and_family_on_invoice(doc)
+		self.assertNotIn(ff_paid.CAP_EXCEEDED, [e["reason"] for e in self._entries(doc)])
+		ff_ledger.on_submit(doc)
+		log_invoice_submit(doc)
+		summary = [log for log in self._cap_logs(doc) if log.log_type == "Cap Hit" and not log.item_code]
+		self.assertEqual([log.reason for log in summary], [ff_ledger.REASON_BREACH])
+
+	def test_paid_uncapped_sale_logs_no_cap(self):
+		doc = self._pos_invoice([(ITEM_B, 1)])
+		apply_friends_and_family_on_invoice(doc)
+		log_invoice_submit(doc)
+		logs = self._cap_logs(doc)
+		self.assertEqual([log.log_type for log in logs], ["Discount Applied"])
+		self.assertEqual(logs[0].capped, 0)
+		self.assertIsNone(logs[0].cap_hit)
 
 	# ---- kill switch ------------------------------------------------------------------
 

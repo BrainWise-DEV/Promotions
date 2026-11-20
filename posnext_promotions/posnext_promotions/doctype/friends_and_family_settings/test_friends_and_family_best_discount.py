@@ -378,6 +378,180 @@ class TestFriendsAndFamilyBestDiscount(FrappeTestCase):
 		self.assertEqual(result["line_updates"], [])
 		self.assertEqual(result["kept_promotion_items"], [ITEM])
 
+	# ---- POS Coupon promotion_conflict, end to end (D-R2-15) --------------
+
+	def _add_on_top(self, **fields):
+		return self._coupon(promotion_conflict="Add on top", code="_PNXT_G3_ADD", **fields)
+
+	def test_add_on_top_stacks_on_the_promoted_line(self):
+		# D-R2-15: 20% promo line (room 80) + plain line; a 10% "Add on top" coupon gives 8 + 10.
+		lines = [self._promo_line(pct=20), self._line(item_code=ITEM_2)]
+		result = resolve_coupon_best_discount(self._add_on_top(pct=10), lines, customer=INELIGIBLE, posting_date=DATE)
+		self.assertTrue(result["valid"])
+		by_key = {u["line_key"]: u for u in result["line_updates"]}
+		self.assertEqual(sorted(by_key), [0, 1])
+		self.assertTrue(by_key[0]["stacked"])
+		self.assertAlmostEqual(by_key[0]["coupon_only_discount"], 8)
+		self.assertAlmostEqual(by_key[0]["discount_amount"], 28)  # promo kept, coupon on top
+		self.assertAlmostEqual(result["total_discount"], 18)  # the coupon's own money only
+		self.assertEqual(result["eligible_item_codes"], [ITEM, ITEM_2])
+
+	def test_add_on_top_loses_to_bigger_fnf(self):
+		# F&F 30 beats promo 20 + coupon 4 = 24: F&F keeps the line, never combined with the coupon.
+		result = resolve_coupon_best_discount(
+			self._add_on_top(pct=5), [self._promo_line(pct=20)], customer=ELIGIBLE, posting_date=DATE
+		)
+		self.assertFalse(result["valid"])
+		self.assertEqual(result["reason"], REASON_BETTER_DISCOUNT_EXISTS)
+		self.assertEqual(result["best_discount"]["lines"][0]["winner"], bd.SOURCE_FRIENDS_AND_FAMILY)
+
+	def test_add_on_top_beats_fnf_with_the_stack(self):
+		# Promo 25 + coupon 7.5 = 32.5 beats F&F 30: the stack replaces F&F (coupon money 7.5).
+		result = resolve_coupon_best_discount(
+			self._add_on_top(pct=10), [self._promo_line(pct=25)], customer=ELIGIBLE, posting_date=DATE
+		)
+		self.assertTrue(result["valid"])
+		[update] = result["line_updates"]
+		self.assertTrue(update["stacked"])
+		self.assertAlmostEqual(update["discount_amount"], 32.5)
+		self.assertEqual(update["replaces"], bd.SOURCE_FRIENDS_AND_FAMILY)
+		self.assertAlmostEqual(result["total_discount"], 7.5)
+
+	def test_add_on_top_order_coupon_stacks_on_a_single_promoted_line(self):
+		# Capped % coupon (order level): scenario 30 + 7 = 37 vs the promotion's 30 alone.
+		result = resolve_coupon_best_discount(
+			self._add_on_top(pct=10, max_amount=100), [self._promo_line(pct=30)], customer=INELIGIBLE, posting_date=DATE
+		)
+		self.assertTrue(result["valid"])
+		[update] = result["line_updates"]
+		self.assertTrue(update["stacked"])
+		self.assertAlmostEqual(result["total_discount"], 7)
+
+	def test_add_on_top_respects_pos_max_discount(self):
+		# POS Settings Max Discount 25%: promo 20 leaves room for 5 of the coupon's 8.
+		from unittest.mock import patch
+
+		lines = [self._promo_line(pct=20), self._line(item_code=ITEM_2)]
+		with patch("posnext_promotions.api.coupon_engine.max_discount_allowed", return_value=25):
+			result = resolve_coupon_best_discount(
+				self._add_on_top(pct=10), lines, customer=INELIGIBLE, posting_date=DATE, pos_profile="_PNXT_G3_P"
+			)
+		by_key = {u["line_key"]: u for u in result["line_updates"]}
+		self.assertAlmostEqual(by_key[0]["coupon_only_discount"], 5)
+		self.assertAlmostEqual(by_key[0]["discount_amount"], 25)
+		self.assertAlmostEqual(by_key[1]["discount_percentage"], 10)  # a plain line is no stack
+
+		# Promo already at the limit: the coupon leaves that line alone.
+		with patch("posnext_promotions.api.coupon_engine.max_discount_allowed", return_value=20):
+			result = resolve_coupon_best_discount(
+				self._add_on_top(pct=10), lines, customer=INELIGIBLE, posting_date=DATE, pos_profile="_PNXT_G3_P"
+			)
+		self.assertEqual([u["line_key"] for u in result["line_updates"]], [1])
+
+	def _stamped_promo_line(self, pct):
+		"""A promotion line F&F (30%) already took, as the cart holds it: signed snapshot kept."""
+		line = self._promo_line(pct=pct)
+		apply_friends_and_family_to_items([line], customer=ELIGIBLE, posting_date=DATE)
+		self.assertEqual(line.discount_source, DISCOUNT_SOURCE_FRIENDS_AND_FAMILY)
+		self.assertTrue(line.get(FIELD_FNF_REPLACED))
+		return line
+
+	def test_add_on_top_line_coupon_on_fnf_stamped_line(self):
+		# Review I-1 P1: F&F holds the 25% promo line; promo 25 + coupon 7.5 = 32.5 beats F&F 30.
+		result = resolve_coupon_best_discount(
+			self._add_on_top(pct=10), [self._stamped_promo_line(25)], customer=ELIGIBLE, posting_date=DATE
+		)
+		self.assertTrue(result["valid"], result.get("message"))
+		[update] = result["line_updates"]
+		self.assertTrue(update["stacked"])
+		self.assertAlmostEqual(update["discount_amount"], 32.5)
+		self.assertEqual(update["replaces"], bd.SOURCE_FRIENDS_AND_FAMILY)
+		self.assertAlmostEqual(result["total_discount"], 7.5)
+		# A smaller stack still loses to F&F: promo 20 + coupon 4 = 24 < 30.
+		weak = resolve_coupon_best_discount(
+			self._add_on_top(pct=5), [self._stamped_promo_line(20)], customer=ELIGIBLE, posting_date=DATE
+		)
+		self.assertFalse(weak["valid"])
+
+	def test_add_on_top_order_coupon_on_fnf_stamped_line(self):
+		# Review I-1 P3: order coupon (10%, max 100) over a stamped 30% promo: 30 + 7 = 37 vs F&F 30.
+		result = resolve_coupon_best_discount(
+			self._add_on_top(pct=10, max_amount=100), [self._stamped_promo_line(30)], customer=ELIGIBLE, posting_date=DATE
+		)
+		self.assertTrue(result["valid"], result.get("message"))
+		self.assertEqual(result["best_discount"]["order"]["winner"], bd.SOURCE_COUPON)
+		self.assertAlmostEqual(result["total_discount"], 7)
+
+	def test_add_on_top_on_fnf_stamped_line_within_max_discount(self):
+		# Review I-1 P4: max 40%, 20% coupon over a stamped 25% promo: 25 + 15 = 40 vs F&F 30.
+		# No pos_profile: the F&F snapshot is signed for the cart's own (empty) profile.
+		from unittest.mock import patch
+
+		with patch("posnext_promotions.api.coupon_engine.max_discount_allowed", return_value=40):
+			line = resolve_coupon_best_discount(
+				self._add_on_top(pct=20), [self._stamped_promo_line(25)], customer=ELIGIBLE,
+				posting_date=DATE,
+			)
+			order = resolve_coupon_best_discount(
+				self._add_on_top(pct=20, max_amount=100), [self._stamped_promo_line(25)], customer=ELIGIBLE,
+				posting_date=DATE,
+			)
+		self.assertTrue(line["valid"], line.get("message"))
+		[update] = line["line_updates"]
+		self.assertAlmostEqual(update["discount_amount"], 40)
+		self.assertAlmostEqual(update["coupon_only_discount"], 15)
+		self.assertTrue(order["valid"], order.get("message"))
+		self.assertAlmostEqual(order["total_discount"], 15)
+		# Max 28%: promo 25 + 3 = 28 loses to F&F 30, so F&F keeps the line.
+		with patch("posnext_promotions.api.coupon_engine.max_discount_allowed", return_value=28):
+			low = resolve_coupon_best_discount(
+				self._add_on_top(pct=20), [self._stamped_promo_line(25)], customer=ELIGIBLE,
+				posting_date=DATE,
+			)
+		self.assertFalse(low["valid"])
+
+	def test_invoice_coupon_row_keeps_no_fnf_markers(self):
+		# A stamped line that became a stacked coupon line: stale F&F markers and snapshot
+		# must not make the invoice read promotion + coupon as F&F (review I-1 follow-on).
+		line = self._stamped_promo_line(25)
+		line.update(
+			{
+				"discount_source": "coupon",
+				"posnext_coupon_code": "_PNXT_G3_ADD",
+				"discount_percentage": 0,
+				"discount_amount": 32.5,
+				"rate": 67.5,
+				"pricing_rules": PROMO_RULE,
+			}
+		)
+		doc = self._invoice([line], coupon_code="_PNXT_G3_ADD")
+		apply_friends_and_family_on_invoice(doc)
+		self.assertFalse(line.get(FIELD_DISCOUNT_SOURCE))
+		self.assertFalse(flt(line.get(FIELD_FNF_PERCENTAGE)))
+		self.assertFalse(line.get(FIELD_FNF_REPLACED))
+		self.assertEqual(line.posnext_coupon_code, "_PNXT_G3_ADD")  # stack (32.5) beats F&F 30: kept
+		self.assertAlmostEqual(flt(line.rate), 67.5)
+
+	def test_every_promotion_conflict_option_on_a_promoted_line(self):
+		lines = [self._promo_line(pct=20), self._line(item_code=ITEM_2)]
+		expected = {  # option -> (lines the coupon takes, coupon money)
+			"": ([1], 10),
+			"Skip the line": ([1], 10),
+			"Better of the two": ([1], 10),  # 10 < the promotion's 20: promotion kept
+			"Add on top": ([0, 1], 18),
+		}
+		for option, (keys, total) in expected.items():
+			with self.subTest(option=option):
+				coupon = self._coupon(pct=10, promotion_conflict=option, code="_PNXT_G3_OPT")
+				result = resolve_coupon_best_discount(coupon, lines, customer=INELIGIBLE, posting_date=DATE)
+				self.assertEqual(sorted(u["line_key"] for u in result["line_updates"]), keys)
+				self.assertAlmostEqual(result["total_discount"], total)
+		better = self._coupon(pct=30, promotion_conflict="Better of the two", code="_PNXT_G3_OPT")
+		result = resolve_coupon_best_discount(better, lines, customer=INELIGIBLE, posting_date=DATE)
+		by_key = {u["line_key"]: u for u in result["line_updates"]}
+		self.assertAlmostEqual(by_key[0]["discount_amount"], 30)  # replaces the promotion, never stacks
+		self.assertFalse(by_key[0].get("stacked"))
+
 	# ---- invoice validate (server-side enforcement) -----------------------
 
 	def _invoice(self, items, **header):

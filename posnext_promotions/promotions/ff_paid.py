@@ -27,6 +27,9 @@ PAID_DRAFT_FLAG = "pos_paid_draft"
 
 # ``doc.flags`` key: disagreements found by validate, written to the log at submit.
 DISAGREEMENTS_FLAG = "ff_paid_disagreements"
+# ``doc.flags`` key: the server's capped F&F computation for a paid invoice; the submit log
+# takes its caps (capped, cap_hit, uncapped amount, Cap Hit rows) from it (D-R2-02).
+PLAN_FLAG = "ff_paid_plan"
 
 # Disagreement reasons (Friends and Family Log ``reason`` and ``details.reason``).
 NOT_ELIGIBLE = "not_eligible"

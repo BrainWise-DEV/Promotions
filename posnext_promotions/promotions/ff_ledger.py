@@ -598,6 +598,10 @@ def _check_caps(doc, rows, used: float) -> dict | None:
 	}
 
 
+# ``doc.flags`` key: this submit wrote the breach ``Cap Hit`` row (the submit log then adds none).
+BREACH_LOGGED_FLAG = "ff_ledger_breach_logged"
+
+
 def _log_breach(doc, breach: dict) -> None:
 	from posnext_promotions.promotions.friends_and_family_log import LOG_CAP_HIT, write_log
 
@@ -617,6 +621,9 @@ def _log_breach(doc, breach: dict) -> None:
 		message=breach["message"],
 		details=breach,
 	)
+	flags = getattr(doc, "flags", None)
+	if flags is not None:
+		flags[BREACH_LOGGED_FLAG] = True
 
 
 # ---- hooks ------------------------------------------------------------------
