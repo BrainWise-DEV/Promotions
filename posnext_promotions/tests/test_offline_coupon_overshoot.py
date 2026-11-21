@@ -17,7 +17,13 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import flt
 
-from posnext_promotions.test_promotions import ITEM_C, ITEM_PRICES, _cart_payload, _line
+from posnext_promotions.test_promotions import (
+	ITEM_C,
+	ITEM_PRICES,
+	_cart_payload,
+	_line,
+	_pos_invoice_pipeline,
+)
 
 CODE = "_PNXT_F1_MAX1"
 OVERSHOOT_FIELD = "offline_coupon_overshoot"
@@ -143,8 +149,9 @@ class TestOfflineLineCouponOvershoot(FrappeTestCase):
 		return payload
 
 	def _sync(self, payload):
-		from pos_next.api.invoices import submit_invoice
-
+		submit_invoice, _update = _pos_invoice_pipeline()  # optional app: never imported directly
+		if submit_invoice is None:
+			self.skipTest("pos_next invoice APIs are not installed")
 		result = submit_invoice(invoice=json.dumps(payload), data=json.dumps({}))
 		return frappe.get_doc("Sales Invoice", result["name"])
 

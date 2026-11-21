@@ -11,6 +11,7 @@ import json
 
 import frappe
 from frappe import _
+from frappe.query_builder.functions import Upper
 from frappe.utils import cint, flt
 
 from posnext_promotions.api.coupon_engine import _item_matches_scope, with_item_master_scope
@@ -161,11 +162,16 @@ def _restore_offline_header_coupon(doc, tagged) -> None:
 	codes = {row.posnext_coupon_code.strip().upper() for row in tagged}
 	if len(codes) != 1:
 		return
-	from pos_next.pos_next.doctype.pos_coupon.pos_coupon import resolve_coupon_name
-
-	name = resolve_coupon_name(codes.pop())  # case-safe whatever the DB collation
-	if name:
-		doc.coupon_code = frappe.db.get_value("POS Coupon", name, "coupon_code")
+	# Matched case-insensitively whatever the DB collation (this app never imports pos_next).
+	coupon = frappe.qb.DocType("POS Coupon")
+	rows = (
+		frappe.qb.from_(coupon)
+		.select(coupon.coupon_code)
+		.where(Upper(coupon.coupon_code) == codes.pop())
+		.limit(1)
+	).run()
+	if rows:
+		doc.coupon_code = rows[0][0]
 
 
 # Scope -> (child table, legacy single field or None, label for the message)
