@@ -20,6 +20,8 @@ const MAX = "Max";
 const DISCOUNT_SOURCE = "accumulative_promotion";
 const PROMOTION_TYPE_GIFT_POOL = "Gift Pool";
 const PROMOTION_TYPE_GWP = "GWP";
+const PROMOTION_TYPE_AUTO = "Auto Discount";
+const PROMOTION_TYPE_ITEM_LEVEL = "Item Level Discount";
 
 /**
  * Total percentage an Accumulative offer grants, given what's in the cart.
@@ -184,16 +186,36 @@ function listPrice(item) {
 	return Number.parseFloat(item.price_list_rate || item.rate) || 0;
 }
 
-/** The line's discount, if any, is a pricing rule's (not a coupon, F&F or manual one). */
+// Discounts that belong to someone else: a line carrying one is never written to.
+// Every other source on a line carrying the rule (pricing_rule, auto_discount,
+// item_level_promotion) is the rule's own stamp (mark_item_discount_flags).
+const FOREIGN_DISCOUNT_SOURCES = new Set([
+	"coupon",
+	"friends_and_family",
+	"manual_discount",
+	"gwp",
+	"free_item",
+]);
+
 function ownsDiscount(item) {
-	return !item.discount_source || item.discount_source === "pricing_rule";
+	return !FOREIGN_DISCOUNT_SOURCES.has(item.discount_source || "");
 }
 
 function hasRule(item, offerName) {
 	return asPricingRules(item.pricing_rules).includes(offerName);
 }
 
-/** Take this offer off a line, and its discount with it when it was the only rule. */
+/**
+ * The flags the server stamps on the lines a Min/Max rule tags, by its
+ * promotion_type (promotion_exclusions.mark_item_discount_flags).
+ */
+function ruleLineFlags(offer) {
+	return offer.promotion_type === PROMOTION_TYPE_ITEM_LEVEL
+		? { discount_source: "item_level_promotion", is_already_discounted: 1 }
+		: { discount_source: "pricing_rule", is_already_discounted: 0 };
+}
+
+/** Take this offer off a line, and its discount and stamps with it when it was the only rule. */
 function releaseLine(item, offerName) {
 	const rules = asPricingRules(item.pricing_rules).filter((name) => name !== offerName);
 	item.pricing_rules = rules;
@@ -201,7 +223,18 @@ function releaseLine(item, offerName) {
 		item.discount_percentage = 0;
 		item.discount_amount = 0;
 		item.discount_mode = null;
+		item.is_already_discounted = 0;
+		item.discount_source = "";
 	}
+}
+
+function rankable(item) {
+	return (
+		!item.is_free_item &&
+		lineQty(item) > 0 &&
+		listPrice(item) > 0 &&
+		item.is_rate_manually_edited !== 1
+	);
 }
 
 /**
@@ -215,40 +248,62 @@ function releaseLine(item, offerName) {
  * with a promotion % per unit at currency precision (pos_next G6), which is the
  * rate the server saves: one free in six at 50 is 41.67 a unit, 250.02.
  *
- * @returns {boolean} True if a line was discounted
+ * - An "Auto Discount" Min/Max rule is never applied by apply_offers (the per-item
+ *   path skips Auto Discount rules and the Auto Discount pass skips Min/Max), so
+ *   offline it only comes off its lines.
+ * - A line whose discount is someone else's (coupon, F&F, manual, gift) is never
+ *   written to. If it carries the rule it is still ranked, as the server ranks
+ *   it; when it wins, no other line is discounted.
+ * - Known gap (documented server limitation): with two overlapping Min/Max (or
+ *   Min/Max and Accumulative) rules, the first rule tags every ranked line, so
+ *   the second finds no line offline; a winner that also holds a second rule
+ *   keeps its % after release. The server does not support Min/Max with
+ *   apply_multiple_pricing_rules either (apply_min_max_price_discounts).
+ *
+ * @returns {boolean} True if the offer still applies to the cart
  */
 function applyMinMaxDiscount(offer, eligibleItems, ctx) {
 	const touched = new Set();
 	for (const item of ctx.invoiceItems || eligibleItems) {
-		// A coupon, F&F or manual discount on the line is not this rule's to take off.
 		if (!hasRule(item, offer.name) || !ownsDiscount(item)) continue;
 		releaseLine(item, offer.name);
 		touched.add(item);
 	}
 
-	const lines = eligibleItems.filter(
-		(item) =>
-			!item.is_free_item &&
-			lineQty(item) > 0 &&
-			listPrice(item) > 0 &&
-			item.is_rate_manually_edited !== 1 &&
-			// Lines another rule (or a manual or coupon discount) already holds are
-			// not this rule's, matching the server where one rule wins a line.
-			asPricingRules(item.pricing_rules).length === 0 &&
-			!item.is_already_discounted
-	);
+	const writable =
+		offer.promotion_type === PROMOTION_TYPE_AUTO
+			? []
+			: eligibleItems.filter(
+					(item) =>
+						rankable(item) &&
+						// Lines another rule (or a manual discount) holds are not this
+						// rule's, matching the server where one rule wins a line.
+						asPricingRules(item.pricing_rules).length === 0 &&
+						!item.is_already_discounted
+				);
+	const readOnly =
+		offer.promotion_type === PROMOTION_TYPE_AUTO
+			? []
+			: eligibleItems.filter(
+					(item) => rankable(item) && !ownsDiscount(item) && hasRule(item, offer.name)
+				);
+	const ranked = eligibleItems.filter((item) => writable.includes(item) || readOnly.includes(item));
 
-	const result = computeMinMaxDiscount(offer, lines);
+	const result = computeMinMaxDiscount(offer, ranked);
 	if (result) {
-		// As the server answers: every ranked line carries the rule, only the
-		// winner carries its discount.
-		for (const item of lines) {
+		// As the server answers: every ranked line carries the rule and its stamps,
+		// only the winner carries its discount.
+		const flags = ruleLineFlags(offer);
+		for (const item of writable) {
 			item.pricing_rules = [offer.name];
+			Object.assign(item, flags);
 			touched.add(item);
 		}
-		result.target.discount_percentage = result.percentage;
-		result.target.discount_amount = 0;
-		result.target.discount_mode = null;
+		if (writable.includes(result.target)) {
+			result.target.discount_percentage = result.percentage;
+			result.target.discount_amount = 0;
+			result.target.discount_mode = null;
+		}
 	}
 
 	for (const item of touched) ctx.recalculateItem(item);
