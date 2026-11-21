@@ -141,14 +141,67 @@ def _line_qty(item) -> float:
 	return flt(item.get("qty") or item.get("quantity") or 0)
 
 
-def _rule_scope_matches(item, rule_name) -> bool:
-	from posnext_promotions.api.gwp import item_matches_pricing_rule_apply_on
+_SCOPE_MEMO = "posnext_ff_rule_scope"
+_APPLY_ON_FIELDS = {"Item Code": "item_code", "Item Group": "item_group", "Brand": "brand"}
 
+
+def rule_scope(rule_name) -> frappe._dict | None:
+	"""A Pricing Rule's scope, its item group tree expanded once per request.
+
+	``field`` / ``members``: the line field and values of the rule's own ``apply_on``
+	(``field`` None for a Transaction rule: every line). ``other_field`` /
+	``other_value``: ``apply_rule_on_other``'s, as ERPNext's
+	``get_pricing_rule_items(other_items=True)`` reads it (one value, not expanded).
+	Memoized on ``frappe.local`` by rule name and ``modified``: the untagged judge asks
+	it of every blocking rule for every line. None for a missing rule.
+	"""
 	try:
-		full_rule = frappe.get_cached_doc("Pricing Rule", rule_name)
+		doc = frappe.get_cached_doc("Pricing Rule", rule_name)
 	except frappe.DoesNotExistError:
+		return None
+	modified = cstr(doc.get("modified"))
+	if not modified:
+		# Never saved (no version to key on): not memoized.
+		return _build_scope(doc)
+	memo = getattr(frappe.local, _SCOPE_MEMO, None)
+	if memo is None:
+		memo = {}
+		setattr(frappe.local, _SCOPE_MEMO, memo)
+	key = (cstr(rule_name), modified)
+	if key not in memo:
+		memo[key] = _build_scope(doc)
+	return memo[key]
+
+
+def _build_scope(doc) -> frappe._dict:
+	from posnext_promotions.api.gwp import _pricing_rule_apply_on_values
+
+	apply_on = cstr(doc.get("apply_on")).strip()
+	other_field = _APPLY_ON_FIELDS.get(cstr(doc.get("apply_rule_on_other")).strip())
+	return frappe._dict(
+		field=None if apply_on == "Transaction" else _APPLY_ON_FIELDS.get(apply_on, ""),
+		members=frozenset(_pricing_rule_apply_on_values(doc)),
+		other_field=other_field,
+		other_value=cstr(doc.get(f"other_{other_field}")) if other_field else "",
+	)
+
+
+def _rule_scope_matches(item, rule_name) -> bool:
+	"""The line is in the rule's own ``apply_on`` scope (:func:`rule_scope`)."""
+	scope = rule_scope(rule_name)
+	if scope is None:
 		return False
-	return item_matches_pricing_rule_apply_on(item, full_rule)
+	if scope.field is None:
+		return True
+	return bool(scope.field) and cstr(item.get(scope.field)) in scope.members
+
+
+def rule_other_scope_matches(item, rule_name) -> bool:
+	"""The line is the rule's ``apply_rule_on_other`` target (ERPNext prices it)."""
+	scope = rule_scope(rule_name)
+	return bool(scope and scope.other_field and scope.other_value) and (
+		cstr(item.get(scope.other_field)) == scope.other_value
+	)
 
 
 def line_blocked_by_scheme(item) -> list[str]:

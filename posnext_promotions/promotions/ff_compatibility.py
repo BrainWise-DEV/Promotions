@@ -236,6 +236,7 @@ def rule_fields() -> list[str]:
 		"territory",
 		"for_price_list",
 		"warehouse",
+		"condition",
 	]
 	if frappe.get_meta("Pricing Rule").has_field("one_time_per_customer"):
 		fields.append("one_time_per_customer")
@@ -277,7 +278,20 @@ def rule_applies_to_doc(rule, doc, profile: dict | None = None) -> bool:
 	# a time is judged at the doc's posting moment (now for a live cart).
 	if schedule.has_time_bound(rule) and not schedule.is_active_at(rule, schedule.resolve_moment(doc)):
 		return False
-	return _rule_applies_to_doc(rule, doc, profile)
+	return _rule_applies_to_doc(rule, doc, profile) and _condition_holds(rule, doc)
+
+
+def _condition_holds(rule, doc) -> bool:
+	"""The rule's ``condition`` on ``doc``, as ERPNext's ``filter_pricing_rule_based_on_condition``:
+	evaluated with the doc's fields as names; one that raises never applies."""
+	condition = cstr(rule.get("condition")).strip()
+	if not condition:
+		return True
+	values = doc.as_dict() if callable(getattr(doc, "as_dict", None)) else dict(doc)
+	try:
+		return bool(frappe.safe_eval(condition, None, values))
+	except Exception:
+		return False
 
 
 def blocking_rule_map(doc=None) -> dict:
@@ -389,7 +403,8 @@ def line_meets_rule(item, rule, rule_uoms=None, check_max=False) -> bool:
 	uoms = rule_uoms or {""}
 	line_uom = cstr(item.get("uom"))
 	stock_qty = qty * _line_factor(item)
-	amount = qty * flt(item.get("price_list_rate") or item.get("rate"))
+	# ERPNext: price_list_rate x qty, never the rate charged.
+	amount = qty * flt(item.get("price_list_rate"))
 	if "" in uoms:
 		qty_factor = amt_factor = 1.0
 	elif not line_uom:
@@ -399,6 +414,10 @@ def line_meets_rule(item, rule, rule_uoms=None, check_max=False) -> bool:
 		qty_factor, amt_factor = _line_factor(item), 1.0
 	else:
 		return False
+	return _meets_thresholds(rule, stock_qty, amount, qty_factor, amt_factor, check_max)
+
+
+def _meets_thresholds(rule, stock_qty, amount, qty_factor=1.0, amt_factor=1.0, check_max=False) -> bool:
 	if stock_qty < flt(rule.get("min_qty")) * qty_factor or amount < flt(rule.get("min_amt")) * amt_factor:
 		return False
 	if not check_max:
@@ -433,14 +452,54 @@ def rule_eligible_on_line(item, rule_name, doc=None, profile=None, rule_map=None
 	``rule_map`` supplies the row of a rule that is not in the database (unit tests).
 	"""
 	rule = _eligibility_row(rule_name, rule_map)
-	if not rule or not gifts._rule_scope_matches(item, rule_name):
-		return False
-	if doc is not None:
-		if not rule_applies_to_doc(rule, doc, profile):
-			return False
-	elif cint(rule.get("disable")) or not rule_valid_on(rule, nowdate()):
+	if not rule or not gifts._rule_scope_matches(item, rule_name) or not _rule_live(rule, doc, profile):
 		return False
 	return line_meets_rule(item, rule, _rule_uoms(item, rule_name), check_max)
+
+
+def _rule_live(rule, doc=None, profile=None) -> bool:
+	"""With ``doc``: :func:`rule_applies_to_doc`. Without: enabled and valid today."""
+	if doc is not None:
+		return rule_applies_to_doc(rule, doc, profile)
+	return not cint(rule.get("disable")) and rule_valid_on(rule, nowdate())
+
+
+def item_level_covers_line(item, rule_name, lines, doc=None, profile=None, rule_map=None) -> bool:
+	"""An untagged Item Level rule prices this line, judged as ERPNext judges it (C1).
+
+	A per-line rule: :func:`rule_eligible_on_line` with its caps. A cart-wide rule
+	(:data:`CART_WIDE_FIELDS`) on the cart's ``lines``, not on the line alone:
+
+	* ``is_cumulative``: the customer's history counts, which no line shows, so a
+	  line in its scope is covered (fail closed, as its tag does);
+	* ``mixed_conditions``: the stock qty and the price-list amount of every paid
+	  line in the rule's scope, summed, meet its thresholds and caps
+	  (``get_qty_and_rate_for_mixed_conditions``);
+	* ``apply_rule_on_other``: a paid line in the rule's own scope meets them, and
+	  this line is that trigger or the rule's other item, group or brand
+	  (``get_qty_and_rate_for_other_item``).
+	"""
+	rule = _eligibility_row(rule_name, rule_map)
+	if not rule or not is_cart_wide(rule):
+		return rule_eligible_on_line(item, rule_name, doc, profile, rule_map, check_max=True)
+	if not (gifts._rule_scope_matches(item, rule_name) or gifts.rule_other_scope_matches(item, rule_name)):
+		return False
+	if not _rule_live(rule, doc, profile):
+		return False
+	if cint(rule.get("is_cumulative")):
+		return True
+	in_scope = [
+		line
+		for line in lines or [item]
+		if not cint(line.get("is_free_item"))
+		and gifts._line_qty(line) > 0
+		and gifts._rule_scope_matches(line, rule_name)
+	]
+	if cint(rule.get("mixed_conditions")):
+		stock_qty = sum(gifts._line_qty(line) * _line_factor(line) for line in in_scope)
+		amount = sum(gifts._line_qty(line) * flt(line.get("price_list_rate")) for line in in_scope)
+		return _meets_thresholds(rule, stock_qty, amount, check_max=True)
+	return any(line_meets_rule(line, rule, _rule_uoms(line, rule_name), check_max=True) for line in in_scope)
 
 
 def tag_blocks(item, rule_name, doc=None, profile=None, rule_map=None) -> bool:
@@ -452,7 +511,9 @@ def tag_blocks(item, rule_name, doc=None, profile=None, rule_map=None) -> bool:
 	rule = _eligibility_row(rule_name, rule_map)
 	if rule and is_cart_wide(rule):
 		return True
-	return rule_eligible_on_line(item, rule_name, doc, profile, rule_map)
+	# An Item Level tag above the rule's cap is judged as the untagged line is (m1).
+	check_max = gifts.scheme_blocking_kind(rule or rule_name) == gifts.SCHEME_KIND_ITEM_LEVEL
+	return rule_eligible_on_line(item, rule_name, doc, profile, rule_map, check_max)
 
 
 # ---- The judge's verdict --------------------------------------------------
@@ -540,10 +601,11 @@ def block_ineligible_lines(items, rule_map=None, *, doc=None) -> set[int]:
 	* an untagged BXGY rule whose scope covers the line (above ``max_qty`` ERPNext
 	  tags nothing). BXGY free units are valued *after* F&F, so a paid line can
 	  look undiscounted at that point;
-	* an untagged Routine rule that applies to the line within its ``max_qty`` /
-	  ``max_amt``. The invoice's paid rows carry no tags (pos_next blanks them
-	  before save), so the server finds the rule itself; trusting only a tag let
-	  the invoice give F&F to a line the cart had blocked (D-R3-01).
+	* an untagged Routine rule that prices the line (:func:`item_level_covers_line`:
+	  within its ``max_qty`` / ``max_amt``; a cart-wide rule judged on all ``items``).
+	  The invoice's paid rows carry no tags (pos_next blanks them before save), so
+	  the server finds the rule itself; trusting only a tag let the invoice give F&F
+	  to a line the cart had blocked (D-R3-01).
 
 	Settings ``unclassified_promotion_policy`` = "Block F&F on line": a line carrying a
 	rule the classifier cannot place is blocked too ("Compete": it competes as before).
@@ -576,9 +638,13 @@ def block_ineligible_lines(items, rule_map=None, *, doc=None) -> set[int]:
 			elif block_unclassified and _is_unclassified(rule):
 				names.append(rule_name)
 		for rule_name, kind in untagged_rules.items():
-			if rule_name not in tagged and rule_eligible_on_line(
-				item, rule_name, doc, profile, rule_map, check_max=kind == gifts.SCHEME_KIND_ITEM_LEVEL
-			):
+			if rule_name in tagged:
+				continue
+			if kind == gifts.SCHEME_KIND_ITEM_LEVEL:
+				covered = item_level_covers_line(item, rule_name, items, doc, profile, rule_map)
+			else:
+				covered = rule_eligible_on_line(item, rule_name, doc, profile, rule_map)
+			if covered:
 				names.append(rule_name)
 		_set_verdict(item, names)
 		if names:
