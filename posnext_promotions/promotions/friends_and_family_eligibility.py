@@ -268,7 +268,14 @@ def is_customer_ff_member(customer: str | None, pos_profile: str | None = None) 
 
 
 def _log_verification_change(customer: str, verified: bool, email_domain: str | None, via: str | None) -> None:
-	"""F&F Log row for an email-verification change. Domain and flags only, never the address."""
+	"""F&F Log row for an email-verification change. Domain and flags only, never the address.
+
+	Inside a save of this Customer (POS Next resets the verification from its
+	``on_update`` when the email changes) the Customer ``on_update`` logger writes the
+	row, with the diff and the previous qualifying reason: one change, one row.
+	"""
+	if ("Customer", customer) in (frappe.flags.currently_saving or []):
+		return
 	from posnext_promotions.promotions.friends_and_family_log import (
 		LOG_ELIGIBILITY_APPLIED,
 		LOG_ELIGIBILITY_REMOVED,

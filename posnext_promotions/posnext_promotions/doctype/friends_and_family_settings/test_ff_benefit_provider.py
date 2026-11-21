@@ -62,6 +62,14 @@ class TestFFBenefitProvider(FrappeTestCase):
 		self.assertNotIn("staff@", blob)
 		self.assertNotIn(address, blob)
 
+	def test_verification_change_inside_customer_save_left_to_on_update_log(self):
+		# POS Next resets the verification from Customer.on_update; that save's own
+		# eligibility log records it, so the provider must not write a second row.
+		before = frappe.db.count(LOG_DOCTYPE)
+		with patch.dict(frappe.flags, {"currently_saving": [("Customer", CUSTOMER)]}):
+			benefit_provider()["on_verification_change"](CUSTOMER, False, DOMAIN, "otp")
+		self.assertEqual(frappe.db.count(LOG_DOCTYPE), before)
+
 	def test_hook_declared(self):
 		self.assertIn(HOOK_PATH, frappe.get_hooks("pos_next_customer_benefit_providers"))
 
