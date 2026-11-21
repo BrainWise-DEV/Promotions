@@ -510,6 +510,64 @@ class TestFriendsAndFamilyBestDiscount(FrappeTestCase):
 			)
 		self.assertFalse(low["valid"])
 
+	def test_fnf_line_result_hands_the_cart_its_signed_snapshot(self):
+		# G5: the cart sends the snapshot back with an "Add on top" coupon line, so each
+		# F&F line result carries the snapshot its line was stamped with.
+		lines = [self._promo_line(pct=25), self._line(item_code=ITEM_2)]
+		payload = apply_friends_and_family_to_items(lines, customer=ELIGIBLE, posting_date=DATE)
+		by_idx = {line["idx"]: line for line in payload["items"]}
+		self.assertTrue(by_idx[0]["applies"])
+		self.assertEqual(by_idx[0][FIELD_FNF_REPLACED], lines[0].get(FIELD_FNF_REPLACED))
+		self.assertTrue(by_idx[0][FIELD_FNF_REPLACED])
+		self.assertFalse(by_idx[1].get(FIELD_FNF_REPLACED))  # nothing displaced on a plain line
+
+	def test_add_on_top_never_stacks_a_coupon_on_itself(self):
+		# Re-review M-A (G5): F&F took a line coupon X 20% gave, so its signed snapshot holds X.
+		# X "Add on top" must not stack on its own restored discount (20 + 20% of 80 = 36):
+		# the line carries X once, 20, which loses to F&F 30.
+		code = "_PNXT_G5_SELF"
+		line = self._line(
+			discount_percentage=20,
+			discount_amount=20,
+			discount_source="coupon",
+			coupon_code=code,
+			posnext_coupon_code=code,
+		)
+		apply_friends_and_family_to_items([line], customer=ELIGIBLE, posting_date=DATE)
+		self.assertEqual(line.discount_source, DISCOUNT_SOURCE_FRIENDS_AND_FAMILY)
+		self.assertTrue(line.get(FIELD_FNF_REPLACED))
+		coupon = self._coupon(pct=20, promotion_conflict="Add on top", code=code)
+		result = resolve_coupon_best_discount(coupon, [line], customer=ELIGIBLE, posting_date=DATE)
+		self.assertFalse(any(u.get("stacked") for u in result.get("line_updates") or []), result)
+		self.assertFalse(result["valid"], result)
+		self.assertEqual(result["reason"], REASON_BETTER_DISCOUNT_EXISTS)
+		# Without F&F in the way (40% coupon), X is priced once on the plain line: 40, not 52.
+		strong = self._coupon(pct=40, promotion_conflict="Add on top", code=code)
+		result = resolve_coupon_best_discount(strong, [line], customer=ELIGIBLE, posting_date=DATE)
+		self.assertTrue(result["valid"], result)
+		[update] = result["line_updates"]
+		self.assertFalse(update.get("stacked"))
+		self.assertAlmostEqual(update["discount_percentage"], 40)
+
+	def test_add_on_top_never_stacks_on_another_coupon(self):
+		# G5 review m-4: F&F took a line coupon Y gave (20%). Coupon X "Add on top" (40%) is
+		# priced on the plain line: 40, never stacked on Y (20 + 40% of 80 = 52).
+		line = self._line(
+			discount_percentage=20,
+			discount_amount=20,
+			discount_source="coupon",
+			coupon_code="_PNXT_G5_Y",
+			posnext_coupon_code="_PNXT_G5_Y",
+		)
+		apply_friends_and_family_to_items([line], customer=ELIGIBLE, posting_date=DATE)
+		self.assertTrue(line.get(FIELD_FNF_REPLACED))
+		coupon = self._coupon(pct=40, promotion_conflict="Add on top", code="_PNXT_G5_X")
+		result = resolve_coupon_best_discount(coupon, [line], customer=ELIGIBLE, posting_date=DATE)
+		self.assertTrue(result["valid"], result)
+		[update] = result["line_updates"]
+		self.assertFalse(update.get("stacked"), update)
+		self.assertAlmostEqual(update["discount_percentage"], 40)
+
 	def test_invoice_coupon_row_keeps_no_fnf_markers(self):
 		# A stamped line that became a stacked coupon line: stale F&F markers and snapshot
 		# must not make the invoice read promotion + coupon as F&F (review I-1 follow-on).

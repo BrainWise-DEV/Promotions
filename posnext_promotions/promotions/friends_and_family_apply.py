@@ -965,7 +965,12 @@ def apply_friends_and_family_to_items(
 		caps = build_cap_payload(ctx, uncapped_total, _applied_total(results))
 
 	applied = sum(1 for r in results if r.applies)
-	payload["items"] = [r.to_client_payload() for r in results]
+	# Each F&F line hands the cart the snapshot its line was stamped with: the cart sends
+	# it back with an "Add on top" coupon line over that line (G5).
+	payload["items"] = [
+		{**r.to_client_payload(), FIELD_FNF_REPLACED: item.get(FIELD_FNF_REPLACED) if r.applies else None}
+		for item, r in zip(items, results, strict=False)
+	]
 	payload["applied_count"] = applied
 	payload["suppressed_pricing_rules"] = sorted(suppressed_rules)
 	if program is not None:

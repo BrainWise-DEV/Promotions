@@ -50,21 +50,43 @@ from posnext_promotions.promotions.friends_and_family_eligibility import get_cus
 REASON_BETTER_DISCOUNT_EXISTS = "better_discount_exists"
 
 
-def _neutral_copy(item, ctx):
-	"""Line as the coupon engine should see it: an F&F stamp is not a blocker."""
+def _neutral_copy(item, ctx, coupon_code: str = ""):
+	"""Line as the coupon engine should see it: an F&F stamp is not a blocker.
+
+	For the coupon ``coupon_code`` is priced: a restored discount that is a coupon (F&F had
+	replaced a coupon line) is no discount to stack on. The line goes back to list price,
+	so ``coupon_code`` is priced on it once and never on top of itself or of another
+	coupon (re-review M-A, G5 review m-4).
+	"""
 	line = frappe._dict(dict(item))
 	if _restore_replaced_discount(line, ctx):
+		if coupon_code and _holds_coupon(line):
+			_plain_line(line)
 		return line
 	if _is_fnf_stamped(line):
-		line.discount_source = None
-		line.discount_percentage = 0
-		line.discount_amount = 0
-		line.is_already_discounted = 0
-		price_list_rate = bd.line_price_list_rate(line)
-		if price_list_rate:
-			line.rate = price_list_rate
-			line.amount = price_list_rate * bd.line_qty(line)
+		_plain_line(line)
 	return line
+
+
+def _holds_coupon(line) -> bool:
+	"""The line's own discount is a POS Coupon's (any code)."""
+	return bool(bd.line_coupon_code(line)) or cstr(line.get("discount_source")) == bd._COUPON_DISCOUNT_SOURCE
+
+
+def _plain_line(line) -> None:
+	"""``line`` at list price with no discount of its own."""
+	line.discount_source = None
+	line.discount_percentage = 0
+	line.discount_amount = 0
+	line.is_already_discounted = 0
+	if line.get("posnext_coupon_code") or line.get("coupon_code"):
+		line.posnext_coupon_code = None
+		line.coupon_code = None
+		line.pricing_rules = ""
+	price_list_rate = bd.line_price_list_rate(line)
+	if price_list_rate:
+		line.rate = price_list_rate
+		line.amount = price_list_rate * bd.line_qty(line)
 
 
 def _capped_fnf_candidates(items, customer, posting_date, pos_profile=None) -> dict:
@@ -276,7 +298,7 @@ def decide_coupon_vs_fnf(cart, coupon, customer=None, pos_profile=None) -> Coupo
 
 	ctx = restore_context(customer, posting_date, pos_profile)
 	result = apply_coupon_to_items(
-		coupon, [_neutral_copy(i, ctx) for i in items], max_discount_pct=max_discount_allowed(pos_profile)
+		coupon, [_neutral_copy(i, ctx, code) for i in items], max_discount_pct=max_discount_allowed(pos_profile)
 	)
 	decision = CouponDecision(coupon_code=code, granularity=granularity, result=result, items=items)
 	if not result.get("valid"):

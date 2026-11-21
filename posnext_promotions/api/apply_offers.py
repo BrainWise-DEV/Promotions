@@ -1160,7 +1160,14 @@ def _friends_and_family_only_response(items, prepared_items, customer, invoice) 
 			dict(prepared) if _is_fnf_stamped(original) else original
 			for original, prepared in zip(items, prepared_items, strict=False)
 		]
-		return {"items": cleaned, "friends_and_family": _friends_and_family_response_block(ff_result)}
+		return {
+			"items": cleaned,
+			# One response shape whatever the path (a selected offer ERPNext does not pick
+			# ends here too, G5).
+			"free_items": [],
+			"skipped_free_items": [],
+			"friends_and_family": _friends_and_family_response_block(ff_result),
+		}
 	return {
 		"items": [dict(item) for item in prepared_items],
 		"free_items": [],
@@ -1663,6 +1670,17 @@ def apply_offers(invoice_data, selected_offers=None):
 			# Restrict available rules to the ones explicitly selected from the UI.
 			rule_map = {name: details for name, details in rule_map.items() if name in selected_offer_names}
 			missing_selected = selected_offer_names - set(rule_map.keys())
+			if missing_selected:
+				# Only the names ERPNext's own selection picks for this cart (G5, ledger 531).
+				from posnext_promotions.api.selected_rules import selected_rules_that_win
+
+				missing_selected = selected_rules_that_win(
+					missing_selected,
+					pricing_args,
+					pricing_items,
+					price_list=profile.get("selling_price_list"),
+					redeemed=redeemed_rules,
+				)
 			if missing_selected:
 				extra_records = frappe.get_all(
 					"Pricing Rule",

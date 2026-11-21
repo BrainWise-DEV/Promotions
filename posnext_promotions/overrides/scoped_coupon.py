@@ -7,6 +7,8 @@ client (or an offline invoice synced later) from tagging lines the coupon does
 not cover, so the invoice is checked here before it is saved.
 """
 
+import json
+
 import frappe
 from frappe import _
 from frappe.utils import cint, flt
@@ -18,15 +20,36 @@ SCOPED = ("Item Code", "Item Group", "Brand")
 TOLERANCE = 0.05
 
 
+# Error Log title of a coupon check an offline sync keeps instead of refusing (G5 review I-1).
+OFFLINE_KEPT_LOG_TITLE = "POS Coupon check kept on offline sync"
+
+
 def validate_scoped_coupon_lines(doc, method=None):
+	"""Each tagged line is checked against its coupon; only the coupon's own share of a
+	line's discount (``coupon_share``) counts against the coupon's limits (G5).
+
+	Online a coupon over its limit (its % or its cap / fixed amount) refuses the save. On
+	an offline sync (the server-set ``flags.pos_offline_sync``, never a client field) the
+	sale already happened and the customer has left, and the server may no longer see the
+	promotion under a stacked line: the limit is not enforced, the conservative share is
+	kept and each breach is written to an Error Log (``OFFLINE_KEPT_LOG_TITLE``) with the
+	coupon, the row, the share, the promotion under it and the limit, as pos_next keeps and
+	logs an offline sale's unexplained discount (G5 review I-1). The coupon's identity and
+	scope (it exists, is enabled, is the invoice's, covers the item) stay strict on every
+	route (D-18).
+	"""
+	from posnext_promotions.overrides.coupon_share import set_coupon_shares
+
 	tagged = [
 		row
 		for row in doc.get("items") or []
 		if row.get("posnext_coupon_code") and not cint(row.get("is_free_item"))
 	]
 	if not tagged:
+		set_coupon_shares(doc, [], {})
 		return
 
+	refuse = _refuser(doc)
 	_restore_offline_header_coupon(doc, tagged)
 
 	coupons = {}
@@ -35,8 +58,10 @@ def validate_scoped_coupon_lines(doc, method=None):
 		if not name:
 			frappe.throw(_("POS Coupon {0} does not exist").format(code))
 		coupons[code] = frappe.get_cached_doc("POS Coupon", name)
+	shares = set_coupon_shares(doc, tagged, coupons)
 
 	spent = {code: 0.0 for code in coupons}
+	rows_of = {code: [] for code in coupons}
 	# Scope is judged on the Item master's brand / group, never the row's (one query).
 	scope_lines = with_item_master_scope({"item_code": row.item_code} for row in tagged)
 	for row, scope_line in zip(tagged, scope_lines, strict=True):
@@ -54,13 +79,27 @@ def validate_scoped_coupon_lines(doc, method=None):
 					_("Row {0}: item {1} is not covered by POS Coupon {2}").format(row.idx, row.item_code, code)
 				)
 
-		if coupon.discount_type == "Percentage" and flt(row.discount_percentage) > flt(coupon.discount_percentage) + TOLERANCE:
-			frappe.throw(
-				_("Row {0}: discount {1}% exceeds POS Coupon {2} ({3}%)").format(
-					row.idx, flt(row.discount_percentage), code, flt(coupon.discount_percentage)
-				)
+		share, promotion = shares.get(id(row), (flt(row.discount_amount), 0.0))
+		details = {"coupon": code, "row": row.idx, "share": share, "promotion": promotion}
+		if coupon.discount_type == "Percentage":
+			# A stacked line: the coupon's % of what the promotion leaves.
+			percentage = (
+				flt(share / (flt(row.price_list_rate) - promotion) * 100, 2)
+				if promotion > 0 and flt(row.price_list_rate) > promotion
+				else flt(row.discount_percentage)
 			)
-		spent[code] += flt(row.discount_amount) * flt(row.qty)
+			if percentage > flt(coupon.discount_percentage) + TOLERANCE:
+				refuse(
+					_("Row {0}: discount {1}% exceeds POS Coupon {2} ({3}%)").format(
+						row.idx, percentage, code, flt(coupon.discount_percentage)
+					),
+					**details,
+					limit=f"{flt(coupon.discount_percentage)}%",
+				)
+		spent[code] += share * flt(row.qty)
+		rows_of[code].append(
+			{"row": row.idx, "item": row.item_code, "qty": flt(row.qty), "share": share, "promotion": promotion}
+		)
 
 	for code, total in spent.items():
 		coupon = coupons[code]
@@ -69,7 +108,36 @@ def validate_scoped_coupon_lines(doc, method=None):
 			cap = min(cap, flt(coupon.discount_amount)) if cap else flt(coupon.discount_amount)
 		# Percentage coupons without a cap are priced as a percentage, not an amount.
 		if cap and total > cap + TOLERANCE:
-			frappe.throw(_("POS Coupon {0} discount {1} exceeds its limit of {2}").format(code, total, cap))
+			refuse(
+				_("POS Coupon {0} discount {1} exceeds its limit of {2}").format(code, total, cap),
+				coupon=code,
+				rows=rows_of[code],
+				limit=cap,
+			)
+
+
+def _refuser(doc):
+	"""``refuse(message, **details)`` for a coupon over its limit: throws online; on an
+	offline sync logs and keeps."""
+	from posnext_promotions.promotions.ff_paid import OFFLINE_SYNC_FLAG
+
+	flags = getattr(doc, "flags", None) or {}
+	if not flags.get(OFFLINE_SYNC_FLAG):
+
+		def refuse(message, **details):
+			frappe.throw(message)
+
+		return refuse
+
+	reference = doc.get("name") or doc.get("offline_id") or "new"
+
+	def keep(message, **details):
+		frappe.log_error(
+			title=OFFLINE_KEPT_LOG_TITLE,
+			message=f"Invoice {reference}: {message}\n{json.dumps(details, default=str, sort_keys=True)}",
+		)
+
+	return keep
 
 
 def _restore_offline_header_coupon(doc, tagged) -> None:

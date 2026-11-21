@@ -6,10 +6,10 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
 	frappe = None
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 # F&F contract version between posnext_promotions and pos_next. Bump with any cross-app change.
-FF_CONTRACT = 2
+FF_CONTRACT = 3
 
 
 # ERPNext copies only a fixed list of slab fields onto generated Pricing Rules.

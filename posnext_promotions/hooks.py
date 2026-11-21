@@ -135,6 +135,8 @@ doc_events = {
 before_install = "posnext_promotions.install.before_install"
 after_install = "posnext_promotions.install.after_install"
 after_migrate = "posnext_promotions.install.after_migrate"
+# An older pos_next must not run next to this F&F contract (no shim, Ruling 104).
+before_migrate = ["posnext_promotions.contract_gate.before_migrate"]
 
 # POS Next asks these providers who is a Friends & Family member.
 pos_next_customer_benefit_providers = [
