@@ -179,8 +179,29 @@ class PaidInvoiceFixture:
 		]
 
 	def _cap_with_remaining(self, remaining, **values):
-		"""Monthly cap = this customer's usage so far (the dev DB may hold some) + ``remaining``."""
-		used = ff_ledger.get_usage(self.ctx.customer, self.ctx.company, ff_ledger.period_key(nowdate()))
+		"""Monthly cap = this customer's usage so far (the dev DB may hold some) + ``remaining``.
+
+		Some usage is recorded first (rolled back with the test): on a fresh site the
+		usage is 0, and a cap of 0 + 0 would mean "no cap" rather than "used up".
+		"""
+		period = ff_ledger.period_key(nowdate())
+		invoice = self._name()
+		ff_ledger.record_rows(
+			[
+				{
+					"customer": self.ctx.customer,
+					"company": self.ctx.company,
+					"invoice_doctype": "POS Invoice",
+					"invoice": invoice,
+					"invoice_item": f"{invoice}-1",
+					"posting_date": nowdate(),
+					"period_key": period,
+					"amount": 10,
+					"base_amount": 10,
+				}
+			]
+		)
+		used = ff_ledger.get_usage(self.ctx.customer, self.ctx.company, period)
 		return self._settings(max_discount_per_customer_month=flt(used) + remaining, **values)
 
 	@staticmethod
