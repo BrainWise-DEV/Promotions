@@ -2028,6 +2028,11 @@ def apply_offers(invoice_data, selected_offers=None):
 			# PN-128: which discount won per line / for the order, and why.
 			"best_discount": ff_result.get("best_discount"),
 		}
+	except frappe.PermissionError:
+		# A refused read (ERPNext's validate_pricing_context: the cart's target doctype,
+		# a document or a party this user may not read) is the answer, not an offers
+		# error: it reaches the caller as it is, unlogged (D-R3-06).
+		raise
 	except Exception as e:
 		frappe.log_error(frappe.get_traceback(), "Apply Offers Error")
 		frappe.throw(_("Error applying offers: {0}").format(str(e)))
