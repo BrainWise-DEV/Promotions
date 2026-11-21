@@ -25,9 +25,9 @@ jobs:
     timeout-minutes: 60
 
     env:
-      # Dispatch input, else repo variable POS_NEXT_REF, else develop. A PR that
-      # depends on an unmerged pos_next branch sets the repo variable.
-      POS_NEXT_REF: ${{ inputs.pos_next_ref || vars.POS_NEXT_REF || 'develop' }}
+      # Dispatch input, else repo variable POS_NEXT_REF, else the paired F&F branch
+      # (set back to develop when the three F&F PRs merge).
+      POS_NEXT_REF: ${{ inputs.pos_next_ref || vars.POS_NEXT_REF || 'feature/ff-generic-redesign' }}
 
     services:
       mariadb:
