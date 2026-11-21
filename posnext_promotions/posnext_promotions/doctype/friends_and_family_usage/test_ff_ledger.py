@@ -44,12 +44,32 @@ def _company():
 	return frappe.db.get_single_value("Global Defaults", "default_company") or frappe.db.get_value("Company", {})
 
 
+OTHER_COMPANY = "_Test FF Ledger Company 2"
+
+
 def _other_company():
 	"""A second company on the site (caps are per company)."""
 	return frappe.db.get_value("Company", {"name": ["!=", _company()]}, "name", order_by="name asc")
 
 
+def _ensure_other_company():
+	"""A fresh site has one company: add a second, same currency and country as the first."""
+	if _other_company():
+		return
+	currency, country = frappe.db.get_value("Company", _company(), ["default_currency", "country"])
+	frappe.get_doc(
+		{
+			"doctype": "Company",
+			"company_name": OTHER_COMPANY,
+			"abbr": "_TFFL2",
+			"default_currency": currency,
+			"country": country,
+		}
+	).insert(ignore_permissions=True)
+
+
 def _ensure_fixtures():
+	_ensure_other_company()
 	ensure_customer_flag_field()
 	ensure_invoice_item_fields()
 	root_cg = frappe.db.get_value("Customer Group", {"is_group": 1, "parent_customer_group": ""}) or (
