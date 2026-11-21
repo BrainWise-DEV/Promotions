@@ -9,11 +9,14 @@
  *
  * These functions are the OFFLINE mirror of the server pipeline:
  * - Accumulative → apply_accumulative_discount_rules (promotions/engine.py)
+ * - Min / Max    → apply_min_max_price_discounts (overrides/pricing_rule.py)
  * - Gift Pool / GWP → apply_offers / gift_pool.py
  * When the server changes, change this too.
  */
 
 const ACCUMULATIVE = "Accumulative";
+const MIN = "Min";
+const MAX = "Max";
 const DISCOUNT_SOURCE = "accumulative_promotion";
 const PROMOTION_TYPE_GIFT_POOL = "Gift Pool";
 const PROMOTION_TYPE_GWP = "GWP";
@@ -118,6 +121,148 @@ function appendPricingRule(item, offerName) {
 	if (!prArr.includes(offerName)) prArr.push(offerName);
 	item.pricing_rules = prArr;
 }
+
+function lineQty(item) {
+	return Number.parseFloat(item.quantity ?? item.qty) || 0;
+}
+
+/**
+ * The discount a Min/Max rule gives its winning line, as the server computes it
+ * (overrides/pricing_rule.py `_apply_discount`): `eligibleQty` units discounted by
+ * the rule, spread over the whole line as one blended, unrounded percentage.
+ *
+ * @returns {number} Percentage off list price for the whole line, 0 for none
+ */
+export function minMaxBlendedPercentage(offer, basePrice, qty, eligibleQty) {
+	const base = Number.parseFloat(basePrice) || 0;
+	if (base <= 0 || qty <= 0 || eligibleQty <= 0) return 0;
+
+	const type = offer.discount_type || offer.rate_or_discount;
+	let totalDiscount;
+	if (type === "Rate") {
+		totalDiscount = (base - (Number.parseFloat(offer.rate) || 0)) * eligibleQty;
+	} else if (type === "Discount Percentage") {
+		totalDiscount = ((base * (Number.parseFloat(offer.discount_percentage) || 0)) / 100) * eligibleQty;
+	} else if (type === "Discount Amount") {
+		totalDiscount = (Number.parseFloat(offer.discount_amount) || 0) * eligibleQty;
+	} else {
+		return 0;
+	}
+
+	const lineValue = base * qty;
+	// Never negative (a Rate above list price), never beyond the line.
+	totalDiscount = Math.min(Math.max(totalDiscount, 0), lineValue);
+	if (totalDiscount <= 0) return 0;
+	return (totalDiscount / lineValue) * 100;
+}
+
+/**
+ * Which line a Min/Max rule discounts, how many of its units, and the line's
+ * blended percentage. Mirrors `apply_min_max_price_discounts`: the lines are
+ * ranked by list price (cheapest first for Min, dearest first for Max; ties keep
+ * cart order, as Python's stable sort does) and only the first line is
+ * discounted, never spilling onto the next one. `min_or_max_discount_qty_limit`
+ * caps the discounted units (0 = every unit of that line).
+ *
+ * @returns {{ target: Object, eligibleQty: number, percentage: number } | null}
+ */
+export function computeMinMaxDiscount(offer, lines) {
+	if (!lines.length) return null;
+	const isMax = offer.apply_discount_on_price === MAX;
+	const ranked = [...lines].sort((a, b) =>
+		isMax ? listPrice(b) - listPrice(a) : listPrice(a) - listPrice(b)
+	);
+	const target = ranked[0];
+	const qty = lineQty(target);
+	const limit = Number.parseFloat(offer.min_or_max_discount_qty_limit) || 0;
+	const eligibleQty = limit <= 0 ? qty : Math.min(limit, qty);
+	const percentage = minMaxBlendedPercentage(offer, listPrice(target), qty, eligibleQty);
+	return percentage > 0 ? { target, eligibleQty, percentage } : null;
+}
+
+function listPrice(item) {
+	return Number.parseFloat(item.price_list_rate || item.rate) || 0;
+}
+
+/** The line's discount, if any, is a pricing rule's (not a coupon, F&F or manual one). */
+function ownsDiscount(item) {
+	return !item.discount_source || item.discount_source === "pricing_rule";
+}
+
+function hasRule(item, offerName) {
+	return asPricingRules(item.pricing_rules).includes(offerName);
+}
+
+/** Take this offer off a line, and its discount with it when it was the only rule. */
+function releaseLine(item, offerName) {
+	const rules = asPricingRules(item.pricing_rules).filter((name) => name !== offerName);
+	item.pricing_rules = rules;
+	if (rules.length === 0) {
+		item.discount_percentage = 0;
+		item.discount_amount = 0;
+		item.discount_mode = null;
+	}
+}
+
+/**
+ * Apply a Min/Max offer offline. Idempotent: the host calls it again on every
+ * offline cart change (`recomputesOffline`), so it first takes the offer off every
+ * line that carries it (a line priced online carries it too) and ranks again.
+ * A qty change, a new cheaper line or a line removed therefore never leaves a
+ * stale blended percentage behind.
+ *
+ * The line gets the server's unrounded blended percentage; the host prices a line
+ * with a promotion % per unit at currency precision (pos_next G6), which is the
+ * rate the server saves: one free in six at 50 is 41.67 a unit, 250.02.
+ *
+ * @returns {boolean} True if a line was discounted
+ */
+function applyMinMaxDiscount(offer, eligibleItems, ctx) {
+	const touched = new Set();
+	for (const item of ctx.invoiceItems || eligibleItems) {
+		// A coupon, F&F or manual discount on the line is not this rule's to take off.
+		if (!hasRule(item, offer.name) || !ownsDiscount(item)) continue;
+		releaseLine(item, offer.name);
+		touched.add(item);
+	}
+
+	const lines = eligibleItems.filter(
+		(item) =>
+			!item.is_free_item &&
+			lineQty(item) > 0 &&
+			listPrice(item) > 0 &&
+			item.is_rate_manually_edited !== 1 &&
+			// Lines another rule (or a manual or coupon discount) already holds are
+			// not this rule's, matching the server where one rule wins a line.
+			asPricingRules(item.pricing_rules).length === 0 &&
+			!item.is_already_discounted
+	);
+
+	const result = computeMinMaxDiscount(offer, lines);
+	if (result) {
+		// As the server answers: every ranked line carries the rule, only the
+		// winner carries its discount.
+		for (const item of lines) {
+			item.pricing_rules = [offer.name];
+			touched.add(item);
+		}
+		result.target.discount_percentage = result.percentage;
+		result.target.discount_amount = 0;
+		result.target.discount_mode = null;
+	}
+
+	for (const item of touched) ctx.recalculateItem(item);
+	return Boolean(result);
+}
+
+export const minMaxStrategy = {
+	// Ranks the whole scope, so it runs before first-come plain offers take a line.
+	order: 90,
+	// Re-run on every offline cart change: the winner and its blended % depend on
+	// every line's qty and price.
+	recomputesOffline: true,
+	apply: applyMinMaxDiscount,
+};
 
 /**
  * Apply Gift Pool product discount offline: paid items in a group grant
@@ -299,6 +444,8 @@ function applyOfflineGwpSameItem(offer, eligibleItems, ctx) {
 /** Entry point called by pos_next's registry after it imports this module. */
 export function register({ registerOfferStrategy, registerProductOfferStrategy }) {
 	registerOfferStrategy(ACCUMULATIVE, accumulativeStrategy);
+	registerOfferStrategy(MIN, minMaxStrategy);
+	registerOfferStrategy(MAX, minMaxStrategy);
 
 	if (typeof registerProductOfferStrategy === "function") {
 		registerProductOfferStrategy(PROMOTION_TYPE_GIFT_POOL, {
