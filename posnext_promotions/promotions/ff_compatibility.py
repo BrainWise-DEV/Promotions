@@ -371,7 +371,7 @@ def _rule_uoms(item, rule_name) -> set[str]:
 	return {cstr(row.get("uom")) for row in rule_doc.get(table) or [] if cstr(row.get(field)) == value} or {""}
 
 
-def line_meets_rule(item, rule, rule_uoms=None) -> bool:
+def line_meets_rule(item, rule, rule_uoms=None, check_max=False) -> bool:
 	"""ERPNext's per-line thresholds (``filter_pricing_rules_for_qty_amount``).
 
 	Stock qty (qty × the line's UOM factor) ≥ ``min_qty`` × the factor of the rule
@@ -379,8 +379,9 @@ def line_meets_rule(item, rule, rule_uoms=None) -> bool:
 	(× 1 when the rule row's UOM is the line's). A rule row with a UOM covers only
 	lines in that UOM, as in ERPNext's rule lookup. ``rule_uoms``: :func:`_rule_uoms`.
 
-	No ``max_qty`` / ``max_amt``: above them ERPNext tags nothing, yet the line is
-	still the scheme's (capped B1G1 at qty 4 stays blocked).
+	``max_qty`` / ``max_amt`` only with ``check_max``: above them ERPNext tags
+	nothing. A Buy X Get Y line is still the scheme's there (capped B1G1 at qty 4
+	stays blocked); an Item Level line gets no discount there, so it is not.
 	"""
 	qty = gifts._line_qty(item)
 	if qty <= 0:
@@ -398,11 +399,16 @@ def line_meets_rule(item, rule, rule_uoms=None) -> bool:
 		qty_factor, amt_factor = _line_factor(item), 1.0
 	else:
 		return False
-	return stock_qty >= flt(rule.get("min_qty")) * qty_factor and amount >= flt(rule.get("min_amt")) * amt_factor
+	if stock_qty < flt(rule.get("min_qty")) * qty_factor or amount < flt(rule.get("min_amt")) * amt_factor:
+		return False
+	if not check_max:
+		return True
+	max_qty, max_amt = flt(rule.get("max_qty")), flt(rule.get("max_amt"))
+	return (not max_qty or stock_qty <= max_qty * qty_factor) and (not max_amt or amount <= max_amt * amt_factor)
 
 
 def _eligibility_fields() -> list[str]:
-	return [*rule_fields(), "min_qty", "min_amt", *CART_WIDE_FIELDS]
+	return [*rule_fields(), "min_qty", "min_amt", "max_qty", "max_amt", *CART_WIDE_FIELDS]
 
 
 def _eligibility_row(rule_name, rule_map=None):
@@ -414,27 +420,27 @@ def is_cart_wide(rule) -> bool:
 	return any(cstr(rule.get(field)) not in ("", "0") for field in CART_WIDE_FIELDS)
 
 
-def rule_eligible_on_line(item, rule_name, doc=None, profile=None, rule_map=None) -> bool:
+def rule_eligible_on_line(item, rule_name, doc=None, profile=None, rule_map=None, check_max=False) -> bool:
 	"""``rule_name`` applies to this line as it is now (Ruling 119).
 
 	A rule name on the line is a client tag, not a fact: it may be stale (the
 	qty dropped below ``min_qty``, the rule expired, a held draft). With ``doc``:
 	:func:`rule_applies_to_doc` (enabled, dates / times, company, profile,
 	customer tree, one-time). Without one: enabled and valid today. Either way the
-	line meets the rule's thresholds (:func:`line_meets_rule`) and is in its scope.
+	line is in its scope and meets the rule's thresholds (:func:`line_meets_rule`;
+	``check_max`` adds its caps). Scope first: it is cached, and an untagged scan
+	asks it of every blocking rule for every line.
 	``rule_map`` supplies the row of a rule that is not in the database (unit tests).
 	"""
 	rule = _eligibility_row(rule_name, rule_map)
-	if not rule:
+	if not rule or not gifts._rule_scope_matches(item, rule_name):
 		return False
 	if doc is not None:
 		if not rule_applies_to_doc(rule, doc, profile):
 			return False
 	elif cint(rule.get("disable")) or not rule_valid_on(rule, nowdate()):
 		return False
-	return line_meets_rule(item, rule, _rule_uoms(item, rule_name)) and gifts._rule_scope_matches(
-		item, rule_name
-	)
+	return line_meets_rule(item, rule, _rule_uoms(item, rule_name), check_max)
 
 
 def tag_blocks(item, rule_name, doc=None, profile=None, rule_map=None) -> bool:
@@ -533,7 +539,11 @@ def block_ineligible_lines(items, rule_map=None, *, doc=None) -> set[int]:
 	  a cart-wide / history rule's tag always does (Ruling 121);
 	* an untagged BXGY rule whose scope covers the line (above ``max_qty`` ERPNext
 	  tags nothing). BXGY free units are valued *after* F&F, so a paid line can
-	  look undiscounted at that point.
+	  look undiscounted at that point;
+	* an untagged Routine rule that applies to the line within its ``max_qty`` /
+	  ``max_amt``. The invoice's paid rows carry no tags (pos_next blanks them
+	  before save), so the server finds the rule itself; trusting only a tag let
+	  the invoice give F&F to a line the cart had blocked (D-R3-01).
 
 	Settings ``unclassified_promotion_policy`` = "Block F&F on line": a line carrying a
 	rule the classifier cannot place is blocked too ("Compete": it competes as before).
@@ -547,9 +557,9 @@ def block_ineligible_lines(items, rule_map=None, *, doc=None) -> set[int]:
 		rule_map = _load_rule_map(items, doc)
 	rule_map = rule_map or {}
 	profile = _profile_values(doc.get("pos_profile")) if doc is not None else None
-	bxgy_rules = [
-		name for name, row in rule_map.items() if gifts.scheme_blocking_kind(row or name) == gifts.SCHEME_KIND_BXGY
-	]
+	untagged_rules = {
+		name: kind for name, row in rule_map.items() if (kind := gifts.scheme_blocking_kind(row or name))
+	}
 	block_unclassified = ff_config.resolve().unclassified_promotion_policy.value == POLICY_BLOCK_FNF
 	flagged: set[int] = set()
 	for position, item in enumerate(items or []):
@@ -565,8 +575,10 @@ def block_ineligible_lines(items, rule_map=None, *, doc=None) -> set[int]:
 					names.append(rule_name)
 			elif block_unclassified and _is_unclassified(rule):
 				names.append(rule_name)
-		for rule_name in bxgy_rules:
-			if rule_name not in tagged and rule_eligible_on_line(item, rule_name, doc, profile, rule_map):
+		for rule_name, kind in untagged_rules.items():
+			if rule_name not in tagged and rule_eligible_on_line(
+				item, rule_name, doc, profile, rule_map, check_max=kind == gifts.SCHEME_KIND_ITEM_LEVEL
+			):
 				names.append(rule_name)
 		_set_verdict(item, names)
 		if names:

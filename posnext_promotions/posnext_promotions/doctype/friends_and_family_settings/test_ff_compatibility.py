@@ -724,6 +724,9 @@ class TestFFCompatibility(FrappeTestCase):
 		rule = self._item_level("ROUTINE")
 		self._assert_tag(rule, 1, blocked=False)
 		self._assert_tag(rule, 2, blocked=True)
+		# Off, or its untagged scope would block the qty-2 line below (D-R3-01).
+		frappe.db.set_value("Pricing Rule", rule, "disable", 1)
+		frappe.clear_document_cache("Pricing Rule", rule)
 		expired = self._item_level(
 			"ROUTINE_OLD", valid_from=add_days(nowdate(), -10), valid_upto=add_days(nowdate(), -1)
 		)
