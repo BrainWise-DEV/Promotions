@@ -6,10 +6,12 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
 	frappe = None
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # F&F contract version between posnext_promotions and pos_next. Bump with any cross-app change.
-FF_CONTRACT = 3
+# 4: a one-time offer the validated invoice redeems itself is not an earlier redemption
+# (D-R3-04 b); pos_next's stacked-line redemption refuses to run against < 4.
+FF_CONTRACT = 4
 
 
 # ERPNext copies only a fixed list of slab fields onto generated Pricing Rules.

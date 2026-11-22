@@ -24,9 +24,11 @@ def _importer(**mods):
 
 
 class TestContractGate(FrappeTestCase):
-	def test_contract_is_3(self):
-		self.assertEqual(posnext_promotions.FF_CONTRACT, 3)
-		self.assertEqual(posnext_promotions.__version__, "0.3.0")
+	def test_contract_is_4(self):
+		# 4: the one-time lookup ignores the validated invoice's own redemption (D-R3-04 b),
+		# which pos_next's stacked-line redemption needs. pos_next itself still needs only 2.
+		self.assertEqual(posnext_promotions.FF_CONTRACT, 4)
+		self.assertEqual(posnext_promotions.__version__, "0.4.0")
 		self.assertEqual(contract_gate.REQUIREMENTS, {"pos_next": (2, "2.6.0")})
 
 	def test_old_pos_next_reported(self):
