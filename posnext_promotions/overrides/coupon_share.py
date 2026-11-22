@@ -138,11 +138,34 @@ def _snapshot_promotion(doc, row) -> float | None:
 
 def _promotion_per_unit(view, coupon_code) -> float:
 	"""A line view's own discount per unit (cart basis), as the coupon engine reads the
-	discount an "Add on top" coupon stacks on."""
+	discount an "Add on top" coupon stacks on.
+
+	A Min/Max ("buy one") line comes back materialised the ERPNext way
+	(``pricing_rule._materialize_rate``): ``rate`` below ``price_list_rate`` and a PER-UNIT
+	``discount_amount`` equal to their gap. That gap is the promotion per unit; reading the
+	field as a line total divided it by qty a second time (D-R4-03: 8.33 -> 1.39 on 6 x 50,
+	so a 10% coupon looked like 22.84%). Every other evaluated line keeps the line-total
+	basis (Accumulative included).
+	"""
 	if _holds_coupon(view):
 		return 0.0  # a coupon (this one or another) is no promotion to stack on (M-A, m-4)
 	qty = bd.line_qty(view)
-	return _line_existing_discount(view, "line") / qty if qty else 0.0
+	if not qty:
+		return 0.0
+	per_unit = _materialised_per_unit(view)
+	if per_unit is not None:
+		return per_unit
+	return _line_existing_discount(view, "line") / qty
+
+
+def _materialised_per_unit(view) -> float | None:
+	"""The per-unit discount of a line priced per unit (rate set below the list price and
+	``discount_amount`` their gap, to the cent), else None."""
+	price, rate = flt(view.get("price_list_rate")), flt(view.get("rate"))
+	if not (price > rate > 0):
+		return None
+	gap = price - rate
+	return gap if abs(gap - flt(view.get("discount_amount"))) <= 0.011 else None
 
 
 def _rederived_promotions(doc, rows) -> dict:
