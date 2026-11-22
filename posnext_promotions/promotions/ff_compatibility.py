@@ -286,16 +286,74 @@ def rule_applies_to_doc(rule, doc, profile: dict | None = None) -> bool:
 
 
 def _condition_holds(rule, doc) -> bool:
-	"""The rule's ``condition`` on ``doc``, as ERPNext's ``filter_pricing_rule_based_on_condition``:
-	evaluated with the doc's fields as names; one that raises never applies."""
+	"""The rule's ``condition``, as ERPNext's ``filter_pricing_rule_based_on_condition``
+	evaluates it, on :func:`condition_namespace` (never ``doc`` itself); one that
+	raises never applies."""
 	condition = cstr(rule.get("condition")).strip()
 	if not condition:
 		return True
-	values = doc.as_dict() if callable(getattr(doc, "as_dict", None)) else dict(doc)
 	try:
-		return bool(frappe.safe_eval(condition, None, values))
+		return bool(frappe.safe_eval(condition, None, condition_namespace(doc)))
 	except Exception:
 		return False
+
+
+_CONDITION_MEMO = "posnext_ff_condition_namespace"
+
+
+def condition_namespace(doc) -> dict:
+	"""The names a rule's ``condition`` sees: ERPNext's pricing doc for this sale (C-R1-1).
+
+	On the cart ERPNext evaluates the condition on ``frappe.get_doc(pricing_args)``
+	(``apply_offers``): an unsaved Sales Invoice with is_pos 1, the company, dates,
+	currency, price list and customer, the customer's group and territory from the
+	Customer, and its totals at their defaults. The cart's judge (a compat doc) and the
+	invoice's (the real invoice) both build that same doc here, so a condition such as
+	``customer_group == …``, ``is_pos == 1`` or ``grand_total > 10`` gives one answer on
+	both sides, the one ERPNext gave the cart. Not the live invoice's totals: ERPNext
+	never saw them. The cart's line rows are not part of it (neither judge has them
+	in that shape). Memoized per request by those values.
+	"""
+	profile = _profile_values(doc.get("pos_profile"))
+	customer = cstr(doc.get("customer"))
+	company = cstr(doc.get("company") or profile.get("company"))
+	posting_date = cstr(doc.get("posting_date") or nowdate())
+	currency = cstr(
+		doc.get("currency")
+		or (doc.get("pos_profile") and frappe.get_cached_value("POS Profile", doc.get("pos_profile"), "currency"))
+		or (company and frappe.get_cached_value("Company", company, "default_currency"))
+	)
+	price_list = cstr(doc.get("selling_price_list") or doc.get("price_list") or profile.get("selling_price_list"))
+	doctype = cstr(doc.get("doctype")) or "Sales Invoice"
+	key = (doctype, customer, company, posting_date, cstr(doc.get("posting_time")), currency, price_list)
+	memo = getattr(frappe.local, _CONDITION_MEMO, None)
+	if memo is None:
+		memo = {}
+		setattr(frappe.local, _CONDITION_MEMO, memo)
+	if key not in memo:
+		group, territory = None, None
+		if customer and frappe.db.exists("Customer", customer):
+			group, territory = frappe.get_cached_value("Customer", customer, ["customer_group", "territory"])
+		pricing_doc = frappe.get_doc(
+			{
+				"doctype": doctype,
+				"name": "POS-INVOICE",
+				"is_pos": 1,
+				"company": company,
+				"transaction_date": posting_date,
+				"posting_date": posting_date,
+				"posting_time": doc.get("posting_time"),
+				"currency": currency,
+				"conversion_rate": 1,
+				"plc_conversion_rate": 1,
+				"price_list": price_list,
+				"customer": customer,
+				"customer_group": group or "All Customer Groups",
+				"territory": territory,
+			}
+		)
+		memo[key] = pricing_doc.as_dict()
+	return memo[key]
 
 
 def blocking_rule_map(doc=None) -> dict:
@@ -474,11 +532,12 @@ def item_level_covers_line(item, rule_name, lines, doc=None, profile=None, rule_
 	A per-line rule: :func:`rule_eligible_on_line` with its caps. A cart-wide rule
 	(:data:`CART_WIDE_FIELDS`) on the cart's ``lines``, not on the line alone:
 
-	* ``is_cumulative``: the customer's history counts, which no line shows, so a
-	  line in its scope is covered (fail closed, as its tag does);
-	* ``mixed_conditions``: the stock qty and the price-list amount of every paid
-	  line in the rule's scope, summed, meet its thresholds and caps
-	  (``get_qty_and_rate_for_mixed_conditions``);
+	* ``is_cumulative``: the line plus ERPNext's posted history
+	  (``get_qty_amount_data_for_cumulative``, :func:`_cumulative_history`) meets its
+	  thresholds and caps; a history that never reaches them leaves the line F&F's;
+	* ``mixed_conditions``: the stock qty and the price-list amount of every line in
+	  the rule's scope, free rows included, summed (plus the history when cumulative),
+	  meet its thresholds and caps (``get_qty_and_rate_for_mixed_conditions``);
 	* ``apply_rule_on_other``: a paid line in the rule's own scope meets them, and
 	  this line is that trigger or the rule's other item, group or brand
 	  (``get_qty_and_rate_for_other_item``).
@@ -490,20 +549,63 @@ def item_level_covers_line(item, rule_name, lines, doc=None, profile=None, rule_
 		return False
 	if not _rule_live(rule, doc, profile):
 		return False
-	if cint(rule.get("is_cumulative")):
-		return True
+	# ERPNext's mixed sums take every row in scope, free rows included (m-r1-1).
 	in_scope = [
 		line
 		for line in lines or [item]
-		if not cint(line.get("is_free_item"))
-		and gifts._line_qty(line) > 0
-		and gifts._rule_scope_matches(line, rule_name)
+		if gifts._line_qty(line) > 0 and gifts._rule_scope_matches(line, rule_name)
 	]
+	doctype = cstr(doc.get("doctype")) if doc is not None else ""
 	if cint(rule.get("mixed_conditions")):
 		stock_qty = sum(gifts._line_qty(line) * _line_factor(line) for line in in_scope)
 		amount = sum(gifts._line_qty(line) * flt(line.get("price_list_rate")) for line in in_scope)
+		if cint(rule.get("is_cumulative")):
+			scope = gifts.rule_scope(rule_name)
+			history = _cumulative_history(rule_name, doctype, sorted(scope.members) if scope else [])
+			stock_qty, amount = stock_qty + history[0], amount + history[1]
 		return _meets_thresholds(rule, stock_qty, amount, check_max=True)
-	return any(line_meets_rule(line, rule, _rule_uoms(line, rule_name), check_max=True) for line in in_scope)
+	paid = [line for line in in_scope if not cint(line.get("is_free_item"))]
+	if cint(rule.get("is_cumulative")):
+		# ERPNext adds the posted history of the line's own value (I-1).
+		scope = gifts.rule_scope(rule_name)
+		field = (scope.field if scope else "") or "item_code"
+		return any(_cumulative_line_meets(line, rule, rule_name, doctype, field) for line in paid)
+	return any(line_meets_rule(line, rule, _rule_uoms(line, rule_name), check_max=True) for line in paid)
+
+
+_CUMULATIVE_MEMO = "posnext_ff_cumulative_history"
+
+
+def _cumulative_history(rule_name, doctype, values) -> tuple[float, float]:
+	"""ERPNext's ``get_qty_amount_data_for_cumulative``: (stock qty, amount) of submitted
+	``doctype`` rows in the rule's window whose apply-on value is in ``values``. Both
+	judges read the same posted rows (the invoice being validated is not submitted).
+	Memoized per request."""
+	from erpnext.accounts.doctype.pricing_rule.utils import get_qty_amount_data_for_cumulative
+
+	try:
+		rule_doc = frappe.get_cached_doc("Pricing Rule", rule_name)
+	except frappe.DoesNotExistError:
+		return 0.0, 0.0
+	key = (cstr(rule_name), cstr(rule_doc.get("modified")), doctype or "Sales Invoice", tuple(values))
+	memo = getattr(frappe.local, _CUMULATIVE_MEMO, None)
+	if memo is None:
+		memo = {}
+		setattr(frappe.local, _CUMULATIVE_MEMO, memo)
+	if key not in memo:
+		data = get_qty_amount_data_for_cumulative(
+			rule_doc, frappe._dict(doctype=doctype or "Sales Invoice"), list(values)
+		)
+		memo[key] = (flt(data[0]), flt(data[1])) if data else (0.0, 0.0)
+	return memo[key]
+
+
+def _cumulative_line_meets(line, rule, rule_name, doctype, field) -> bool:
+	qty = gifts._line_qty(line)
+	history = _cumulative_history(rule_name, doctype, [cstr(line.get(field))])
+	stock_qty = qty * _line_factor(line) + history[0]
+	amount = qty * flt(line.get("price_list_rate")) + history[1]
+	return _meets_thresholds(rule, stock_qty, amount, check_max=True)
 
 
 def tag_blocks(item, rule_name, doc=None, profile=None, rule_map=None) -> bool:

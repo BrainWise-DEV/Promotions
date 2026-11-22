@@ -278,17 +278,54 @@ class TestItemLevelFnFInvoice(FrappeTestCase):
 		rule = self._item_level("IL_OTHER", apply_rule_on_other="Item Code", other_item_code=ITEM_B)
 		self._agree([(ITEM_A, 1), (ITEM_B, 1)], [rule], blocked={ITEM_A, ITEM_B}, msg="apply_rule_on_other")
 
-	def test_cumulative_rule_fails_closed_on_scope(self):
-		# The customer's history may meet min_qty: the line alone cannot tell, so a line in
-		# scope gets no F&F on cart or invoice, whatever its own qty.
+	def _cumulative(self, title, history_margin):
+		"""A cumulative Item Level rule whose min_qty is ERPNext's history of ITEM_A in its
+		window plus ``history_margin``: a qty-1 line meets it at margin 1, not at 2."""
+		from erpnext.accounts.doctype.pricing_rule.utils import get_qty_amount_data_for_cumulative
+
 		rule = self._item_level(
-			"IL_CUMULATIVE",
+			title,
 			is_cumulative=1,
-			min_qty=50,
 			valid_from=frappe.utils.add_days(frappe.utils.nowdate(), -30),
 			valid_upto=frappe.utils.add_days(frappe.utils.nowdate(), 30),
 		)
-		self._agree([(ITEM_A, 1), (ITEM_B, 1)], [rule], blocked={ITEM_A}, msg="cumulative")
+		history = get_qty_amount_data_for_cumulative(
+			frappe.get_doc("Pricing Rule", rule), frappe._dict(doctype="Sales Invoice"), [ITEM_A]
+		)
+		frappe.db.set_value("Pricing Rule", rule, "min_qty", flt(history[0] if history else 0) + history_margin)
+		frappe.clear_document_cache("Pricing Rule", rule)
+		return rule
+
+	def test_cumulative_rule_met_by_history_blocks_on_cart_and_invoice(self):
+		# ERPNext adds the posted history to the line: met, the line is the rule's.
+		rule = self._cumulative("IL_CUMULATIVE_MET", 1)
+		cart = self._agree([(ITEM_A, 1), (ITEM_B, 1)], [rule], blocked={ITEM_A}, msg="cumulative met")
+		self.assertAlmostEqual(cart[ITEM_A], ITEM_PRICES[ITEM_A] * 0.85, places=2)
+
+	def test_cumulative_rule_short_of_history_keeps_fnf(self):
+		# I-1: a history that does not reach min_qty gives no promotion: the line keeps F&F.
+		rule = self._cumulative("IL_CUMULATIVE_SHORT", 2)
+		cart = self._agree([(ITEM_A, 1)], [rule], blocked=set(), msg="cumulative short")
+		self.assertAlmostEqual(cart[ITEM_A], ITEM_PRICES[ITEM_A] * 0.7, places=2)
+
+	def test_conditions_are_judged_on_erpnext_pricing_doc(self):
+		# C-R1-1: the cart's ERPNext saw an unsaved Sales Invoice with the customer's group
+		# and territory, is_pos 1 and no totals; both judges must evaluate the same names.
+		group = frappe.db.get_value("Customer", self.ctx.customer, "customer_group")
+		cases = (
+			# (condition, ERPNext applies it on the cart)
+			("customer_group == 'All Customer Groups'", group == "All Customer Groups"),
+			("is_pos == 1", True),
+			("grand_total > 10", False),
+		)
+		for n, (condition, applies) in enumerate(cases):
+			rule = self._item_level(f"IL_COND_{n}", condition=condition)
+			blocked = {ITEM_A} if applies else set()
+			cart = self._agree([(ITEM_A, 1)], [rule], blocked=blocked, msg=condition)
+			expected = 0.85 if applies else 0.7
+			self.assertAlmostEqual(cart[ITEM_A], ITEM_PRICES[ITEM_A] * expected, places=2, msg=condition)
+			frappe.db.set_value("Pricing Rule", rule, "disable", 1)
+			frappe.clear_document_cache("Pricing Rule", rule)
 
 	def test_rule_whose_condition_is_false_does_not_block(self):
 		# Probe F: ERPNext never applies a rule whose condition is false: the line is F&F's.
@@ -313,6 +350,13 @@ class TestItemLevelFnFInvoice(FrappeTestCase):
 		line = frappe._dict(_line(self.ctx, ITEM_A, qty=qty), **fields)
 		line.setdefault("item_group", frappe.db.get_value("Item", ITEM_A, "item_group"))
 		return line
+
+	def test_mixed_sums_count_free_rows(self):
+		# m-r1-1: ERPNext sums every in-scope row, free rows included.
+		rule = self._item_level("IL_MIXED_FREE", mixed_conditions=1, min_qty=2)
+		paid = self._judge_line(1)
+		free = self._judge_line(1, is_free_item=1, rate=0)
+		self.assertEqual(self._judge([paid, free])[0], [rule])
 
 	def test_tagged_item_level_line_above_max_qty_is_not_blocked(self):
 		# m1: a tag above the cap is judged as the untagged line is.
