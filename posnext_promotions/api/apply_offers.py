@@ -1076,30 +1076,12 @@ def _friends_and_family_response_block(ff_result) -> dict:
 
 
 def _redeemed_one_time_rules(customer) -> set:
-	"""One-time rules ``customer`` already redeemed, fetched once per cart: a usage row
-	(autoname ``{customer}:{pricing_rule}``, so read by fields) or a stamp on one of
-	their other submitted, non-return Sales Invoices (as pos_next decides)."""
-	if not customer:
-		return set()
-	redeemed = set(
-		frappe.get_all("One Time Customer Offer Usage", filters={"customer": customer}, pluck="pricing_rule")
-	)
-	stamps = frappe.get_all(
-		"Sales Invoice",
-		filters={
-			"customer": customer,
-			"docstatus": 1,
-			"is_return": 0,
-			"pos_applied_one_time_rules": ["is", "set"],
-		},
-		pluck="pos_applied_one_time_rules",
-	)
-	for stamp in stamps:
-		try:
-			redeemed.update(json.loads(stamp or "[]"))
-		except (ValueError, TypeError):
-			continue
-	return redeemed
+	"""One-time rules ``customer`` already redeemed, fetched once per cart
+	(:func:`one_time_usage.redeemed_rules`), not counting the invoice being validated
+	(:func:`one_time_usage.judging_invoice`)."""
+	from posnext_promotions.api import one_time_usage
+
+	return one_time_usage.redeemed_rules(customer, one_time_usage.own_invoice())
 
 
 def _one_time_rule_used(record, customer, default_customer, doctype="Sales Invoice", redeemed=()) -> bool:

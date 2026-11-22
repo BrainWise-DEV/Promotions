@@ -195,9 +195,13 @@ def _rederived_promotions(doc, rows) -> dict:
 			for row in paid
 		],
 	}
+	from posnext_promotions.api.one_time_usage import judging_invoice
+
 	message_count = len(frappe.local.message_log or [])
 	try:
-		result = apply_offers(json.loads(json.dumps(payload, default=str)))
+		# This invoice's own one-time redemption is not an earlier one (D-R3-04 b).
+		with judging_invoice(doc.get("name")):
+			result = apply_offers(json.loads(json.dumps(payload, default=str)))
 	except Exception:
 		# No evaluation, no promotion: the stacked rows count their whole discount.
 		del frappe.local.message_log[message_count:]

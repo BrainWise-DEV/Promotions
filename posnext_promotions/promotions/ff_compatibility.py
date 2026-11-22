@@ -178,7 +178,11 @@ def _rule_applies_to_doc(rule, doc, profile: dict) -> bool:
 		customer = cstr(doc.get("customer"))
 		if not customer or customer == cstr(profile.get("customer")):
 			return False
-		if frappe.db.exists("One Time Customer Offer Usage", {"customer": customer, "pricing_rule": rule.get("name")}):
+		from posnext_promotions.api import one_time_usage
+
+		# The doc's own usage row is not an earlier redemption (D-R3-04 b).
+		own = cstr(doc.get("name")) or one_time_usage.own_invoice()
+		if rule.get("name") in one_time_usage.redeemed_rules(customer, own):
 			return False
 	warehouse = cstr(rule.get("warehouse"))
 	if warehouse and profile.get("warehouse") and warehouse != cstr(profile.get("warehouse")):
