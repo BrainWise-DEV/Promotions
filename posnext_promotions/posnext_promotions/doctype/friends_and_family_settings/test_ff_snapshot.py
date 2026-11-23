@@ -19,7 +19,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import flt
 
-from posnext_promotions.promotions import ff_config, ff_snapshot
+from posnext_promotions.promotions import ff_snapshot
 from posnext_promotions.promotions.friends_and_family_apply import (
 	DISCOUNT_SOURCE_FRIENDS_AND_FAMILY as FNF,
 	apply_friends_and_family_on_invoice,
@@ -106,7 +106,6 @@ class TestFFSnapshot(FrappeTestCase):
 			}
 		)
 		doc.save()
-		ff_config.clear_cache()
 		# The test POS profile's company, so the profile tests compare like with like.
 		ensure_named_pricing_rule(RULE, company=self.company)
 		ensure_named_pricing_rule(RULE_2, company=self.company)
@@ -117,7 +116,6 @@ class TestFFSnapshot(FrappeTestCase):
 			frappe.clear_document_cache("Pricing Rule", name)
 		frappe.clear_document_cache("POS Profile", self.pos_profile)
 		self._stack.close()
-		ff_config.clear_cache()
 
 	# ---- helpers -------------------------------------------------------------
 

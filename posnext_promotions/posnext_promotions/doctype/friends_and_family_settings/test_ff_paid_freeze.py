@@ -21,7 +21,7 @@ from frappe.utils import flt, nowdate
 
 from posnext_promotions.api.apply_offers import apply_offers
 from posnext_promotions.posnext_promotions.doctype.friends_and_family_settings.test_ff_compatibility import _pos_rows
-from posnext_promotions.promotions import ff_config, ff_ledger, ff_paid
+from posnext_promotions.promotions import ff_ledger, ff_paid
 from posnext_promotions.promotions import friends_and_family_apply as ffa
 from posnext_promotions.promotions.friends_and_family_apply import (
 	DISCOUNT_SOURCE_FRIENDS_AND_FAMILY as FNF,
@@ -84,7 +84,6 @@ class PaidInvoiceFixture:
 	def tearDown(self):
 		frappe.db.rollback(save_point="ff_paid")
 		self._stack.close()
-		ff_config.clear_cache()
 
 	# ---- helpers ------------------------------------------------------------
 
@@ -111,7 +110,6 @@ class PaidInvoiceFixture:
 		)
 		doc.update(values)
 		doc.save()
-		ff_config.clear_cache()
 		return doc
 
 	def _name(self):

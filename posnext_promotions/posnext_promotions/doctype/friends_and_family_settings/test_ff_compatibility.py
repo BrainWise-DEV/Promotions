@@ -142,7 +142,6 @@ class TestFFCompatibility(FrappeTestCase):
 	def tearDown(self):
 		frappe.db.rollback(save_point="ff_compat")
 		self._stack.close()
-		ff_config.clear_cache()
 
 	def _settings(self, **values):
 		doc = frappe.get_single("Friends and Family Settings")
@@ -167,7 +166,6 @@ class TestFFCompatibility(FrappeTestCase):
 		)
 		doc.update(values)
 		doc.save()
-		ff_config.clear_cache()
 		return doc
 
 	# ---- fixtures ----------------------------------------------------------
@@ -1220,6 +1218,37 @@ class TestFFCompatibility(FrappeTestCase):
 		self.assertNotEqual(_source(self._cart_paid(resp, ITEM_A)), FNF)
 		self.assertEqual(sum(flt(f.get("qty")) for f in resp.get("free_items") or []), 1)
 		self._assert_parity(resp)
+
+	def test_box_off_never_gives_fnf_and_the_free_unit_whatever_a_stale_cache_says(self):
+		"""J1: the box was saved off, and Redis still held an "on" config (a POS request ran
+		between the save and its commit). The cart, the F&F-only call and invoice validate
+		give the BXGY line F&F or the free unit, never both, at every qty."""
+		rule = self._bxgy()
+		cfg = ff_config._build()
+		self.assertIs(cfg.allow_free_gift_with_ff.value, False)
+		frappe.cache().set_value(
+			"ff:effective_config",
+			ff_config.EffectiveConfig(
+				allow_free_gift_with_ff=ff_config.Value(True, "global"),
+				on_cap_breach_at_submit=cfg.on_cap_breach_at_submit,
+				unclassified_promotion_policy=cfg.unclassified_promotion_policy,
+			),
+		)
+		try:
+			for qty in (5, 3, 2):
+				with self.subTest(qty=qty):
+					resp = self._apply([(ITEM_A, qty), (ITEM_B, 1)], [rule])
+					free_units = sum(flt(f.get("qty")) for f in resp.get("free_items") or [] if f["item_code"] == ITEM_A)
+					self.assertEqual(free_units, 1, "the BXGY offer applies")
+					self.assertNotEqual(_source(self._cart_paid(resp, ITEM_A)), FNF, "apply_offers")
+					self.assertEqual(_source(self._cart_paid(resp, ITEM_B)), FNF, "control: plain line")
+					doc = self._invoice(
+						[self._row(ITEM_A, qty, rule), self._row(ITEM_A, 1, rule, free=True), self._row(ITEM_B, 1)]
+					)
+					apply_friends_and_family_on_invoice(doc)
+					self.assertNotEqual(_source(self._paid(doc, ITEM_A)), FNF, "invoice validate")
+		finally:
+			frappe.cache().delete_value("ff:effective_config")
 
 	# ---- A Price "buy one" rule is Buy X Get Y (ported from #24/#25) ------------
 

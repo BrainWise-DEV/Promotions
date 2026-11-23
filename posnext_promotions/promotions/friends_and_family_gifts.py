@@ -49,7 +49,6 @@ from posnext_promotions.promotions.ff_classifier import (  # noqa: F401
 	is_gift_kind,
 	is_price_bxgy_rule,
 )
-from posnext_promotions.promotions.friends_and_family import get_settings
 
 # Magento-style kinds from the clarification.
 GIFT_KIND_FREE_ITEM = "free_item"
@@ -82,8 +81,10 @@ CONFIGURABLE_GIFT_KINDS = frozenset(
 _GIFT_LINE_SOURCES = frozenset({DISCOUNT_SOURCE_GWP, DISCOUNT_SOURCE_FREE_ITEM})
 
 def allow_free_gift_with_ff() -> bool:
-	"""Global Settings checkbox (default off)."""
-	return bool(cint(get_settings().get("allow_free_gift_with_ff")))
+	"""Global Settings checkbox (default off), read where the BXGY judge reads it (J1)."""
+	from posnext_promotions.promotions import ff_config
+
+	return bool(ff_config.resolve().allow_free_gift_with_ff.value)
 
 
 def classify_gift_rule(rule) -> str | None:

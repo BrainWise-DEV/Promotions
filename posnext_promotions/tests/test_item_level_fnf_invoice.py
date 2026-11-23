@@ -18,7 +18,7 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import flt
 
-from posnext_promotions.promotions import ff_compatibility, ff_config
+from posnext_promotions.promotions import ff_compatibility
 from posnext_promotions.promotions import friends_and_family_gifts as gifts
 from posnext_promotions.promotions.friends_and_family_apply import DISCOUNT_SOURCE_FRIENDS_AND_FAMILY as FNF
 from posnext_promotions.promotions.friends_and_family_testing import approved_domain_rows, give_verified_email
@@ -115,7 +115,6 @@ class TestItemLevelFnFInvoice(FrappeTestCase):
 		# The Settings save above was rolled back: drop the cached copy too, so other
 		# processes on a shared dev site never read it (review m6).
 		frappe.clear_document_cache("Friends and Family Settings", "Friends and Family Settings")
-		ff_config.clear_cache()
 
 	def _rule(self, fresh: bool):
 		fields = dict(

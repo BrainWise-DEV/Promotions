@@ -6,7 +6,7 @@ from frappe import _
 from frappe.model.document import Document
 from frappe.utils import cint, flt, getdate
 
-from posnext_promotions.promotions import ff_config, friends_and_family
+from posnext_promotions.promotions import friends_and_family
 from posnext_promotions.promotions import friends_and_family_eligibility as eligibility
 from posnext_promotions.promotions.friends_and_family_log import log_settings_change
 
@@ -25,9 +25,8 @@ class FriendsandFamilySettings(Document):
 	def on_update(self):
 		# get_cached_doc is cleared by Document.save; document for callers that
 		# the next apply_offers / apply_friends_and_family_discount call reloads
-		# inclusions and exclusions without a restart.
+		# inclusions and exclusions without a restart. ff_config reads that document.
 		frappe.clear_cache(doctype=friends_and_family.SETTINGS_DOCTYPE)
-		ff_config.clear_cache()
 		# PN-131: audit row with the field-by-field diff (Version keeps the full history).
 		log_settings_change(self)
 

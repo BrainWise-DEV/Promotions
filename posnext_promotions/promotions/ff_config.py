@@ -18,9 +18,6 @@ from frappe.utils import cint
 from posnext_promotions.promotions import ff_constants as const
 from posnext_promotions.promotions.friends_and_family import SETTINGS_DOCTYPE
 
-CACHE_KEY = "ff:effective_config"
-
-
 @dataclass(frozen=True)
 class Value:
 	value: object
@@ -56,13 +53,11 @@ def _build() -> EffectiveConfig:
 
 
 def resolve(program: str | None = None, scheme: str | None = None) -> EffectiveConfig:
-	"""Effective config. ``program`` and ``scheme`` are ignored until Phase 3."""
-	cached = frappe.cache().get_value(CACHE_KEY)
-	if cached is None:
-		cached = _build()
-		frappe.cache().set_value(CACHE_KEY, cached)
-	return cached
+	"""Effective config. ``program`` and ``scheme`` are ignored until Phase 3.
 
+	Built from the Settings document on every call, never from a cache of its own:
+	``frappe.get_cached_doc`` is cleared on save and on ``db.set_value``, and again after
+	the commit, so every judge reads the checkbox the Settings hold (J1).
+	"""
+	return _build()
 
-def clear_cache() -> None:
-	frappe.cache().delete_value(CACHE_KEY)
