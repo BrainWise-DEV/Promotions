@@ -116,6 +116,11 @@ def validate_scoped_coupon_lines(doc, method=None):
 				limit=cap,
 			)
 
+	# Each row at most its share of the server's own split (K1 review I-2).
+	from posnext_promotions.overrides.coupon_split import check_coupon_split
+
+	check_coupon_split(doc, tagged, coupons, shares, refuse)
+
 
 def _refuser(doc):
 	"""``refuse(message, **details)`` for a coupon over its limit: throws online; on an

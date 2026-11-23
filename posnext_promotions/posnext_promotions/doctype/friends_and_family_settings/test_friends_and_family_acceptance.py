@@ -26,7 +26,11 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import add_days, flt, nowdate
 
-from posnext_promotions.promotions.friends_and_family_testing import approved_domain_rows, ensure_test_pos_profile
+from posnext_promotions.promotions.friends_and_family_testing import (
+	approved_domain_rows,
+	ensure_test_pos_profile,
+	set_coupon_combination,
+)
 from posnext_promotions.api.apply_offers import apply_offers
 from posnext_promotions.api.friends_and_family import apply_friends_and_family_discount
 from posnext_promotions.api.offers import validate_coupon
@@ -34,7 +38,7 @@ from posnext_promotions.posnext_promotions.report.friends_and_family_performance
 	execute as run_report,
 )
 from posnext_promotions.promotions import best_discount as bd
-from posnext_promotions.promotions import ff_money
+from posnext_promotions.promotions import ff_constants, ff_money
 from posnext_promotions.promotions import friends_and_family_demo
 from posnext_promotions.promotions.friends_and_family_caps import (
 	FIELD_DISCOUNT_SOURCE,
@@ -517,6 +521,9 @@ class TestFriendsAndFamilyAcceptance(FrappeTestCase):
 		coupons = self.demo["coupons"]
 		if not coupons:
 			self.skipTest("POS Coupon (POS Next) is not installed")
+		# Per line: the invoice logs F&F's comparison on the coupon line.
+		set_coupon_combination(ff_constants.COUPON_PER_LINE)
+		self.addCleanup(set_coupon_combination, None)
 		cart = self._cart(("laptop", 1), discount_percentage=30, discount_source=FNF, rate=700)
 		weak = validate_coupon(coupons["15"], customer=self.staff, company=self.company, items=cart)
 		self.assertFalse(weak["valid"])

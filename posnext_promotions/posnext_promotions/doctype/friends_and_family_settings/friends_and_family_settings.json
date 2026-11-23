@@ -40,6 +40,7 @@
   "global_rules_section",
   "on_cap_breach_at_submit",
   "unclassified_promotion_policy",
+  "coupon_combination",
   "replaced_discount_snapshot_hours"
  ],
  "fields": [
@@ -268,6 +269,14 @@
    "options": "Compete\nBlock F&F on line"
   },
   {
+   "default": "Better of the two for the whole cart",
+   "description": "How a POS Coupon and the Friends & Family discount combine on one cart. The coupon is always a line discount, before tax. Better of the two for the whole cart (default): the whole cart gets either Friends & Family or the coupon, whichever saves more (Friends & Family on a tie); the two are never mixed. Better per line: each line takes Friends & Family or its share of the coupon, whichever saves more; the coupon's share of a line Friends & Family keeps is not used. Coupon fully used: as per line, but a fixed or capped coupon's share of the lines Friends & Family keeps is spread over the lines the coupon takes.",
+   "fieldname": "coupon_combination",
+   "fieldtype": "Select",
+   "label": "F&F and a Coupon on One Cart",
+   "options": "Better of the two for the whole cart\nBetter per line (unused coupon share is not used)\nBetter per line, coupon fully used"
+  },
+  {
    "default": "24",
    "description": "How long a line keeps the discount F&F replaced (for re-checking on save / submit). After this the line is re-priced from the current rules. Blank or 0 is saved as 24.",
    "fieldname": "replaced_discount_snapshot_hours",
@@ -278,7 +287,7 @@
  ],
  "issingle": 1,
  "links": [],
- "modified": "2026-11-19 12:00:00.000000",
+ "modified": "2026-11-23 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "POSNext Promotions",
  "name": "Friends and Family Settings",

@@ -10,7 +10,7 @@
   on the whole transaction.
 * No promotion strategy turns a paid line into a zero-rate line, and stacked price
   discounts stop at 100 %.
-* Friends & Family below 100 %; ``FF_CONTRACT`` is 4.
+* Friends & Family below 100 %; ``FF_CONTRACT`` is 5.
 """
 
 from __future__ import annotations
@@ -391,5 +391,5 @@ class TestGwpFreeRow(PaidInvoiceFixture, FrappeTestCase):
 		doc.save()
 		self.assertEqual(flt(doc.discount_percentage), 100)
 
-	def test_contract_is_4(self):
-		self.assertEqual(posnext_promotions.FF_CONTRACT, 4)
+	def test_contract_is_5(self):
+		self.assertEqual(posnext_promotions.FF_CONTRACT, 5)

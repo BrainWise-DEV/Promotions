@@ -377,7 +377,9 @@ def _coupon_rejection_message(coupon, items) -> str:
 	return _("No eligible items for this coupon")
 
 
-def apply_coupon_to_items(coupon, items, amount_basis: str = "line", max_discount_pct: float = 0):
+def apply_coupon_to_items(
+	coupon, items, amount_basis: str = "line", max_discount_pct: float = 0, check_minimum: bool = True
+):
 	"""
 	Calculate per-line coupon discounts for matrix-eligible items only.
 
@@ -395,6 +397,9 @@ def apply_coupon_to_items(coupon, items, amount_basis: str = "line", max_discoun
 	room after the promotion), so a promoted line near the limit takes a small share and
 	the other lines take the rest.
 
+	``check_minimum``: False re-spreads a coupon whose minimum was already met on the
+	whole eligible cart over some of its lines (F&F "coupon fully used", K1).
+
 	Returns dict with valid, message, eligible_item_codes, line_updates, total_discount.
 	"""
 	eligible = get_coupon_eligible_items(coupon, items, amount_basis)
@@ -409,7 +414,7 @@ def apply_coupon_to_items(coupon, items, amount_basis: str = "line", max_discoun
 
 	eligible_subtotal = sum(flt(i["_base_amount"]) for i in eligible)
 
-	if coupon.min_amount and flt(eligible_subtotal) < flt(coupon.min_amount):
+	if check_minimum and coupon.min_amount and flt(eligible_subtotal) < flt(coupon.min_amount):
 		return {
 			"valid": False,
 			"message": _("Minimum eligible amount of {0} is required").format(

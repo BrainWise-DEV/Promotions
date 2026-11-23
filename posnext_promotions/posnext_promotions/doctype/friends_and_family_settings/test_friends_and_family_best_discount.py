@@ -7,9 +7,12 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import flt
 
+from posnext_promotions.promotions import ff_constants
 from posnext_promotions.promotions.friends_and_family_testing import (
 	TEST_EMAIL_DOMAIN,
 	approved_domain_rows,
+	coupon_combination,
+	set_coupon_combination,
 	ensure_named_pricing_rule,
 	give_verified_email,
 )
@@ -343,24 +346,33 @@ class TestFriendsAndFamilyBestDiscount(FrappeTestCase):
 		self.assertEqual(result["best_discount"]["lines"][0]["outcome"], bd.OUTCOME_TIE_FNF)
 
 	def test_coupon_per_line_on_mixed_cart(self):
-		# F&F covers ITEM (30%) but not EXCLUDED_ITEM; a 20% coupon only wins the latter.
+		# F&F covers ITEM (30%) but not EXCLUDED_ITEM; per line a 20% coupon only wins the latter.
 		lines = [self._line(), self._line(item_code=EXCLUDED_ITEM)]
-		result = resolve_coupon_best_discount(self._coupon(pct=20), lines, customer=ELIGIBLE, posting_date=DATE)
+		with coupon_combination(ff_constants.COUPON_PER_LINE):
+			result = resolve_coupon_best_discount(self._coupon(pct=20), lines, customer=ELIGIBLE, posting_date=DATE)
 		self.assertTrue(result["valid"])
 		self.assertEqual([u["line_key"] for u in result["line_updates"]], [1])
 		self.assertEqual(result["total_discount"], 20)
 		self.assertEqual(result["best_discount"]["winner"], "mixed")
+		# On the whole cart (the default) the coupon's 40 beats F&F's 30: it takes both lines.
+		result = resolve_coupon_best_discount(self._coupon(pct=20), lines, customer=ELIGIBLE, posting_date=DATE)
+		self.assertEqual([u["line_key"] for u in result["line_updates"]], [0, 1])
+		self.assertTrue(result["replaces_friends_and_family_on_cart"])
 
-	def test_fixed_amount_coupon_compared_on_total(self):
-		lines = [self._line(), self._line(item_code=ITEM_2)]  # F&F would save 60
+	def test_fixed_amount_coupon_compared_per_line(self):
+		# K1: the fixed amount is compared line by line, on its share of each (25 / 40 vs F&F 30).
+		lines = [self._line(), self._line(item_code=ITEM_2)]
+		set_coupon_combination(ff_constants.COUPON_PER_LINE)
+		self.addCleanup(set_coupon_combination, None)
 		weak = resolve_coupon_best_discount(self._coupon(amount=50), lines, customer=ELIGIBLE, posting_date=DATE)
 		self.assertFalse(weak["valid"])
-		self.assertEqual(weak["best_discount"]["order"]["winner"], bd.SOURCE_FRIENDS_AND_FAMILY)
+		self.assertEqual(weak["best_discount"]["granularity"], bd.GRANULARITY_LINE)
+		self.assertEqual(weak["best_discount"]["winner"], bd.SOURCE_FRIENDS_AND_FAMILY)
 		strong = resolve_coupon_best_discount(self._coupon(amount=80), lines, customer=ELIGIBLE, posting_date=DATE)
 		self.assertTrue(strong["valid"])
 		self.assertEqual(len(strong["line_updates"]), 2)
 		self.assertEqual(strong["total_discount"], 80)
-		self.assertEqual(strong["best_discount"]["order"]["winner"], bd.SOURCE_COUPON)
+		self.assertEqual(strong["best_discount"]["winner"], bd.SOURCE_COUPON)
 
 	def test_coupon_for_ineligible_customer_unchanged(self):
 		result = resolve_coupon_best_discount(self._coupon(pct=15), [self._line()], customer=INELIGIBLE, posting_date=DATE)
@@ -417,8 +429,8 @@ class TestFriendsAndFamilyBestDiscount(FrappeTestCase):
 		self.assertEqual(update["replaces"], bd.SOURCE_FRIENDS_AND_FAMILY)
 		self.assertAlmostEqual(result["total_discount"], 7.5)
 
-	def test_add_on_top_order_coupon_stacks_on_a_single_promoted_line(self):
-		# Capped % coupon (order level): scenario 30 + 7 = 37 vs the promotion's 30 alone.
+	def test_add_on_top_capped_coupon_stacks_on_a_single_promoted_line(self):
+		# Capped % coupon: the line gets 30 + 7 = 37 vs the promotion's 30 alone.
 		result = resolve_coupon_best_discount(
 			self._add_on_top(pct=10, max_amount=100), [self._promo_line(pct=30)], customer=INELIGIBLE, posting_date=DATE
 		)
@@ -473,13 +485,13 @@ class TestFriendsAndFamilyBestDiscount(FrappeTestCase):
 		)
 		self.assertFalse(weak["valid"])
 
-	def test_add_on_top_order_coupon_on_fnf_stamped_line(self):
-		# Review I-1 P3: order coupon (10%, max 100) over a stamped 30% promo: 30 + 7 = 37 vs F&F 30.
+	def test_add_on_top_capped_coupon_on_fnf_stamped_line(self):
+		# Review I-1 P3: capped coupon (10%, max 100) over a stamped 30% promo: 30 + 7 = 37 vs F&F 30.
 		result = resolve_coupon_best_discount(
 			self._add_on_top(pct=10, max_amount=100), [self._stamped_promo_line(30)], customer=ELIGIBLE, posting_date=DATE
 		)
 		self.assertTrue(result["valid"], result.get("message"))
-		self.assertEqual(result["best_discount"]["order"]["winner"], bd.SOURCE_COUPON)
+		self.assertEqual(result["best_discount"]["lines"][0]["winner"], bd.SOURCE_COUPON)
 		self.assertAlmostEqual(result["total_discount"], 7)
 
 	def test_add_on_top_on_fnf_stamped_line_within_max_discount(self):
@@ -627,6 +639,9 @@ class TestFriendsAndFamilyBestDiscount(FrappeTestCase):
 		)
 
 	def test_invoice_line_coupon_weaker_than_fnf_is_replaced(self):
+		# Per line (unpaid): F&F re-prices the line. On the whole cart the split check refuses it.
+		set_coupon_combination(ff_constants.COUPON_PER_LINE)
+		self.addCleanup(set_coupon_combination, None)
 		line = self._line(discount_percentage=20, posnext_coupon_code="FFBEST")
 		apply_friends_and_family_on_invoice(self._invoice([line]))
 		self.assertEqual(line.discount_percentage, 30)

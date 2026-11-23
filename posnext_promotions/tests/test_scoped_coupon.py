@@ -54,6 +54,7 @@ class TestScopedCoupon(unittest.TestCase):
 			patch(MOD + ".db", new=db),
 			patch(MOD + ".get_cached_doc", return_value=coupon),
 			patch(MOD + ".throw", new=throw),
+			patch("posnext_promotions.overrides.coupon_split.check_coupon_split"),  # real data: test_coupon_line_level_fnf
 			patch("posnext_promotions.overrides.scoped_coupon._", new=lambda s: s),
 			patch(
 				"posnext_promotions.overrides.coupon_share._promotions_under",
@@ -204,6 +205,7 @@ class TestOfflineSyncKeepsTheSale(unittest.TestCase):
 			patch(MOD + ".db", new=db),
 			patch(MOD + ".get_cached_doc", return_value=coupon),
 			patch(MOD + ".throw", new=throw),
+			patch("posnext_promotions.overrides.coupon_split.check_coupon_split"),  # real data: test_coupon_line_level_fnf
 			patch(MOD + ".log_error") as log_error,
 			patch("posnext_promotions.overrides.scoped_coupon._", new=lambda s: s),
 			patch(

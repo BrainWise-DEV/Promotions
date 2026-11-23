@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+from unittest.mock import patch
 
 import frappe
 from frappe.tests.utils import FrappeTestCase
@@ -28,7 +29,8 @@ from posnext_promotions.posnext_promotions.doctype.friends_and_family_settings.t
 	PaidInvoiceFixture,
 )
 from posnext_promotions.promotions import best_discount as bd
-from posnext_promotions.promotions import ff_money, ff_paid
+from posnext_promotions.promotions import ff_constants, ff_money, ff_paid
+from posnext_promotions.promotions.friends_and_family_testing import set_coupon_combination
 from posnext_promotions.promotions.best_discount_coupon import decide_coupon_vs_fnf
 from posnext_promotions.promotions.friends_and_family_apply import apply_friends_and_family_on_invoice
 from posnext_promotions.promotions.friends_and_family_log import (
@@ -170,6 +172,10 @@ class TestFFCouponIntegrity(PaidInvoiceFixture, FrappeTestCase):
 			)
 			return frappe._dict(items=[row], coupon_code="FFCI-M-INV")
 
+		# Scope only: these rows carry no prices for the split check to re-split.
+		split = patch("posnext_promotions.overrides.coupon_split.check_coupon_split")
+		split.start()
+		self.addCleanup(split.stop)
 		validate_scoped_coupon_lines(doc(ITEM_A, None))  # covered by its Item's brand
 		with self.assertRaises(frappe.ValidationError):
 			validate_scoped_coupon_lines(doc(ITEM_B, BRAND))  # the row's brand is not trusted
@@ -273,8 +279,9 @@ class TestFFCouponIntegrity(PaidInvoiceFixture, FrappeTestCase):
 		validated = self._validate("FFCI-GTE", lines, _exclusive_tax())
 		calculated = self._calculate("FFCI-GTE", lines, _exclusive_tax())
 		self.assertTrue(validated["valid"] and calculated["valid"])
-		self.assertEqual(flt(validated["total_discount"]), 11)
-		self.assertEqual(flt(calculated["discount"]), 11)
+		# K1 M-2: the coupon's money is its line discount (10), before the tax it also saves.
+		self.assertEqual(flt(validated["total_discount"]), 10)
+		self.assertEqual(flt(calculated["discount"]), 10)
 
 	def test_grand_total_coupon_compared_with_tax_on_both_sides(self):
 		# Ruling 56: 10 % exclusive VAT, F&F 10 % saves 11.00 with its tax share.
@@ -288,7 +295,8 @@ class TestFFCouponIntegrity(PaidInvoiceFixture, FrappeTestCase):
 				calculated = self._calculate(code, lines, _exclusive_tax())
 				self.assertEqual(bool(validated["valid"]), coupon_wins)
 				self.assertEqual(bool(calculated["valid"]), coupon_wins)
-				self.assertEqual(flt(calculated["coupon_value"]), flt(pct * 1.1, 2))
+				# The comparison counts the tax (pct x 1.1 vs 11); the coupon's money is pct (M-2).
+				self.assertEqual(flt(calculated["coupon_value"]), flt(pct, 2))
 
 	def test_invoice_grand_total_coupon_compared_with_tax_on_both_sides(self):
 		self._settings(discount_percentage=10)
@@ -569,24 +577,32 @@ class TestFFCouponIntegrity(PaidInvoiceFixture, FrappeTestCase):
 			[log.reason for log in self._logs(doc, LOG_OFFLINE_DISAGREEMENT)], [ff_paid.HEADER_DISCOUNT]
 		)
 
-	def test_resolver_granularity_is_shared(self):
-		# Uncapped % → per line; fixed amount or capped % → whole order. One rule for both endpoints.
+	def test_every_coupon_is_compared_per_line(self):
+		# K1: uncapped %, capped % and fixed amount are all applied per line; set per line,
+		# they are compared per line too.
+		set_coupon_combination(ff_constants.COUPON_PER_LINE)
+		self.addCleanup(set_coupon_combination, None)
 		lines = self._lines((ITEM_A, 1, 50, None))
-		for fields, granularity in (
-			({"discount_percentage": 10}, bd.GRANULARITY_LINE),
-			({"discount_percentage": 10, "max_amount": 3}, bd.GRANULARITY_ORDER),
-			({"discount_type": "Amount", "discount_amount": 3}, bd.GRANULARITY_ORDER),
-		):
-			coupon = frappe._dict(
-				{"coupon_code": "X", "discount_type": "Percentage", "apply_on": "Net Total", **fields}
+		for n, fields in enumerate(
+			(
+				{"discount_percentage": 40},
+				{"discount_percentage": 40, "max_amount": 18},
+				{"discount_type": "Amount", "discount_amount": 18},
 			)
-			decision = decide_coupon_vs_fnf({"items": lines}, coupon, customer=self.ctx.customer)
-			self.assertEqual(decision.granularity, granularity)
+		):
+			with self.subTest(fields=fields):
+				code = f"FFCI-GRAN-{n}"
+				self._coupon(code, **fields)
+				calculated = self._calculate(code, lines)
+				self.assertTrue(calculated["valid"], calculated.get("message"))
+				self.assertEqual(calculated["granularity"], bd.GRANULARITY_LINE)
+				self.assertEqual(calculated["best_discount"]["granularity"], bd.GRANULARITY_LINE)
+				self.assertEqual([u["line_key"] for u in calculated["line_updates"]], [0])
 
 	# ---- cart / invoice parity ---------------------------------------------------
 
 	def test_calculated_coupon_header_kept_by_invoice(self):
-		"""The header the POS takes from calculate_coupon_discount is what the invoice accepts."""
+		"""A header coupon (an older POS's offline sale, or the desk) is held to its value."""
 		from posnext_promotions.test_promotions import _make_rule
 
 		self._excluded(ITEM_A, ITEM_B)  # no F&F: only the coupon's own value matters
@@ -604,12 +620,20 @@ class TestFFCouponIntegrity(PaidInvoiceFixture, FrappeTestCase):
 		)
 		# Ruling 93: a "Better of the two" order coupon only tops up the promoted line
 		# (its share on ITEM_A less the 5 the line keeps): 60 → 55, 26 → 21.
-		expected = {"FFCI-PAR-BETT-0": 55, "FFCI-PAR-BETT-1": 21}
+		# Skip: ITEM_B alone (60; 16). Add on top: 60 over rooms 45 : 80; 9 + 16 = 25.
+		expected = {
+			"FFCI-PAR-SKIP-0": 60,
+			"FFCI-PAR-SKIP-1": 16,
+			"FFCI-PAR-BETT-0": 55,
+			"FFCI-PAR-BETT-1": 21,
+			"FFCI-PAR-ADD -0": 60,
+			"FFCI-PAR-ADD -1": 25,
+		}
 		for conflict in ("Skip the line", "Better of the two", "Add on top"):
 			for n, fields in enumerate(coupons):
 				code = f"FFCI-PAR-{conflict[:4].upper()}-{n}"
 				self._coupon(code, promotion_conflict=conflict, **fields)
-				self._check_header_parity(code, rule, expected.get(code))
+				self._check_header_limit(code, rule, expected[code])
 
 	def _price_rule(self, percentage):
 		from posnext_promotions.test_promotions import _make_rule
@@ -625,12 +649,12 @@ class TestFFCouponIntegrity(PaidInvoiceFixture, FrappeTestCase):
 
 	def test_better_order_coupon_line_discount_above_its_share_adds_nothing(self):
 		"""A 20% order coupon (10 on ITEM_A) next to ITEM_A's own 30% (15): that line adds 0,
-		so the header is the 16 on ITEM_B alone, at the cart and on the paid invoice."""
+		so the header is the 16 on ITEM_B alone, on the unpaid and the paid invoice."""
 		self._excluded(ITEM_A, ITEM_B)
 		self._coupon(
 			"FFCI-BETTER-ZERO", discount_percentage=20, max_amount=100, promotion_conflict="Better of the two"
 		)
-		self._check_header_parity("FFCI-BETTER-ZERO", self._price_rule(30), expected=16, promoted_pct=30)
+		self._check_header_limit("FFCI-BETTER-ZERO", self._price_rule(30), 16, promoted_pct=30)
 
 	def test_better_order_coupon_mixed_lines_paid_header_capped(self):
 		"""Promoted ITEM_A (10%: 5) tops up to the coupon's 10; plain ITEM_B gives 16: 21.
@@ -640,7 +664,7 @@ class TestFFCouponIntegrity(PaidInvoiceFixture, FrappeTestCase):
 			"FFCI-BETTER-MIX", discount_percentage=20, max_amount=100, promotion_conflict="Better of the two"
 		)
 		rule = self._price_rule(10)
-		self._check_header_parity("FFCI-BETTER-MIX", rule, expected=21)
+		self._check_header_limit("FFCI-BETTER-MIX", rule, 21)
 		doc = self._invoice(
 			[self._row(ITEM_A, pct=10, rules=rule), self._row(ITEM_B)],
 			coupon_code="FFCI-BETTER-MIX",
@@ -652,7 +676,7 @@ class TestFFCouponIntegrity(PaidInvoiceFixture, FrappeTestCase):
 
 	def test_calculated_coupon_header_kept_by_invoice_qty_two(self):
 		"""Ruling 96: at qty 2 the saved row's discount_amount is per unit; the invoice values
-		the line's own discount from its rate, so cart and invoice still agree. The 20%
+		the line's own discount from its rate, so the header's value still holds. The 20%
 		"Better of the two" coupon: ITEM_A ×2 tops up 20 − 10 = 10, ITEM_B 16: 26."""
 		self._excluded(ITEM_A, ITEM_B)
 		rule = self._price_rule(10)
@@ -660,12 +684,20 @@ class TestFFCouponIntegrity(PaidInvoiceFixture, FrappeTestCase):
 			{"discount_type": "Amount", "discount_amount": 60},
 			{"discount_percentage": 20, "max_amount": 100},
 		)
-		expected = {"FFCI-PQ2-BETT-1": 26, "FFCI-PQ2-ADD -1": 34}
+		# ITEM_A x2 at 45. Better of the two, Amount: 33.33 - 10 + 26.67 = 50.
+		expected = {
+			"FFCI-PQ2-SKIP-0": 60,
+			"FFCI-PQ2-SKIP-1": 16,
+			"FFCI-PQ2-BETT-0": 50,
+			"FFCI-PQ2-BETT-1": 26,
+			"FFCI-PQ2-ADD -0": 60,
+			"FFCI-PQ2-ADD -1": 34,
+		}
 		for conflict in ("Skip the line", "Better of the two", "Add on top"):
 			for n, fields in enumerate(coupons):
 				code = f"FFCI-PQ2-{conflict[:4].upper()}-{n}"
 				self._coupon(code, promotion_conflict=conflict, **fields)
-				self._check_header_parity(code, rule, expected.get(code), qty=2)
+				self._check_header_limit(code, rule, expected[code], qty=2)
 
 	def test_better_order_coupon_forged_row_discount_amount_ignored(self):
 		"""Ruling 96: a row that understates discount_amount (0.01) while charging rate 45
@@ -692,24 +724,10 @@ class TestFFCouponIntegrity(PaidInvoiceFixture, FrappeTestCase):
 					apply_friends_and_family_on_invoice(doc)
 					self.assertEqual(flt(doc.discount_amount), header)
 
-	def _check_header_parity(self, code, rule, expected=None, promoted_pct=10, qty=1):
+	def _check_header_limit(self, code, rule, header, promoted_pct=10, qty=1):
+		"""A header coupon (an older POS's offline sale, or the desk) is held to ``header``,
+		the coupon's value worked out by hand: kept at it, capped or refused above it."""
 		with self.subTest(code=code, qty=qty):
-			promoted = _line(self.ctx, ITEM_A, qty=qty)
-			promoted_off = flt(50 * promoted_pct / 100, 2)
-			promoted.update(
-				{
-					"discount_percentage": promoted_pct,
-					"discount_amount": promoted_off * qty,  # the cart sends the line total
-					"rate": 50 - promoted_off,
-					"pricing_rules": rule,
-				}
-			)
-			plain = _line(self.ctx, ITEM_B, qty=1)
-			calculated = self._calculate(code, [promoted, plain])
-			header = flt(calculated["discount"])
-			if expected is not None:
-				self.assertAlmostEqual(header, expected, places=2)
-
 			row_a = self._row(ITEM_A, qty=qty, pct=promoted_pct, rules=rule)  # saved row: per unit
 
 			def invoice(paid, amount):
@@ -723,7 +741,7 @@ class TestFFCouponIntegrity(PaidInvoiceFixture, FrappeTestCase):
 				self.assertEqual(flt(doc.discount_amount), header)
 			if header <= 0:
 				return
-			# The cart's header is also the invoice's limit: unpaid caps at it, paid refuses above it.
+			# The coupon's value is the invoice's limit: unpaid caps at it, paid refuses above it.
 			doc = invoice(False, header + 5)
 			apply_friends_and_family_on_invoice(doc)
 			self.assertAlmostEqual(flt(doc.discount_amount), header, places=2)

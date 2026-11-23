@@ -11,7 +11,8 @@ import importlib
 import frappe
 
 # app -> (minimum FF_CONTRACT, release that provides it)
-REQUIREMENTS = {"pos_next": (2, "2.6.0")}
+# pos_next 3: the line coupon path strips F&F from the whole cart when the coupon holds it (K1).
+REQUIREMENTS = {"pos_next": (3, "2.7.0")}
 
 
 def check(app_requirements, installed_apps, importer=importlib.import_module):

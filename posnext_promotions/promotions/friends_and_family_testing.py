@@ -198,3 +198,26 @@ def ensure_test_pos_profile() -> str:
 	)
 	profile.insert(ignore_permissions=True)
 	return profile.name
+
+
+def set_coupon_combination(mode: str | None) -> None:
+	"""Friends and Family Settings "F&F and a Coupon on One Cart" (``None``: unset, the default).
+
+	A Single keeps it as a key in ``tabSingles``, so no migrate is needed to set or read
+	it; a Settings save rewrites the Single from its DB meta, so set it after any save.
+	"""
+	frappe.db.delete("Singles", {"doctype": FF_SETTINGS, "field": "coupon_combination"})
+	if mode:
+		frappe.db.set_single_value(FF_SETTINGS, "coupon_combination", mode)
+	# ff_config.resolve() reads the cached Settings document (J1): drop it.
+	frappe.clear_document_cache(FF_SETTINGS, FF_SETTINGS)
+
+
+@contextmanager
+def coupon_combination(mode: str):
+	"""The mode for the body only; unset again after it."""
+	set_coupon_combination(mode)
+	try:
+		yield
+	finally:
+		set_coupon_combination(None)

@@ -7,14 +7,21 @@
 :func:`resolve_coupon_best_discount` so a coupon is only granted where it is
 the single best discount:
 
-* **Percentage coupon without a cap** → compared **per line** (money saved):
-  coupon vs F&F (if the customer is eligible and the line is covered) vs the
-  discount already on the line (promotion / manual). The coupon keeps only the
-  lines it strictly wins; F&F wins ties; an existing promotion also keeps a tie
-  (no churn).
-* **Fixed-amount coupon, or percentage coupon with ``max_amount``** → its value
-  is a cart total, so it is compared **as a whole**: coupon total vs the best
-  non-coupon saving on the same lines. All-or-nothing.
+* The coupon is always a line discount, before tax, for every customer (K1, D-R4-05):
+  its share of each line is what :func:`coupon_engine.apply_coupon_to_items` allocates.
+  Against the discount already on a line (promotion / manual) it is judged per line;
+  an existing promotion keeps a tie (no churn).
+* Against F&F, Friends and Family Settings **F&F and a Coupon on One Cart** decides
+  (``ff_config.resolve().coupon_combination``):
+
+  - "Better of the two for the whole cart" (default): F&F on the cart vs the coupon on
+    the cart, F&F on a tie. The winner takes the whole cart; the two never mix.
+  - "Better per line (unused coupon share is not used)": each line takes F&F or its
+    coupon share, F&F on a tie; the share of a line F&F keeps is lost.
+  - "Better per line, coupon fully used": as above, then a fixed or capped coupon is
+    spread again over the lines it took, up to each line's room.
+
+  A coupon's minimum purchase is judged on its eligible cart, before F&F splits it.
 
 The F&F side is the saving the customer would really get, **after** the
 PN-129 caps (per order / monthly), so a cap-reduced F&F can lose to a coupon.
@@ -37,7 +44,7 @@ from frappe import _
 from frappe.utils import cstr, flt
 
 from posnext_promotions.promotions import best_discount as bd
-from posnext_promotions.promotions import ff_money, ff_non_invoice
+from posnext_promotions.promotions import ff_config, ff_constants, ff_money, ff_non_invoice
 from posnext_promotions.promotions.friends_and_family_apply import (
 	_is_fnf_stamped,
 	_restore_replaced_discount,
@@ -151,35 +158,34 @@ def _coupon_line_amount(update: dict, item) -> float:
 	return flt(update.get("discount_amount") or 0)
 
 
-def is_line_level_coupon(coupon) -> bool:
-	return cstr(coupon.get("discount_type")) == "Percentage" and not flt(coupon.get("max_amount"))
-
-
 def _coupon_percentage(coupon) -> float | None:
 	return flt(coupon.get("discount_percentage")) if cstr(coupon.get("discount_type")) == "Percentage" else None
 
 
 def _tops_up_line_discounts(coupon) -> bool:
-	"""An order-level "Better of the two" coupon: a line keeps its own discount and the
-	coupon only tops it up to the coupon's amount, so the two are never combined (Ruling 93)."""
+	"""A header "Better of the two" coupon, other than an uncapped %: a line keeps its own
+	discount and the coupon only tops it up to the coupon's amount, so the two are never
+	combined (Ruling 93)."""
 	from posnext_promotions.api.coupon_engine import PROMOTION_CONFLICT_BETTER, get_promotion_conflict_mode
 
-	return not is_line_level_coupon(coupon) and get_promotion_conflict_mode(coupon) == PROMOTION_CONFLICT_BETTER
+	uncapped_percentage = _coupon_percentage(coupon) is not None and not flt(coupon.get("max_amount"))
+	return not uncapped_percentage and get_promotion_conflict_mode(coupon) == PROMOTION_CONFLICT_BETTER
 
 
-def _coupon_amounts(coupon, rows, tax_rate: float, top_up: bool = True) -> list[float]:
-	"""Coupon money per row. A "Grand Total" % coupon also saves the exclusive tax on it.
+def _coupon_amounts(coupon, rows, tax_rate: float) -> list[float]:
+	"""Coupon money per row of a coupon carried as an invoice **header** discount.
 
-	An order-level "Better of the two" coupon gives each line only what it adds to the
-	line's own discount: ``max(0, coupon amount on the line - the line's discount)``
-	(``top_up``; without it, the coupon's whole share, the saving its scenario gives).
-	The one value rule for ``calculate_coupon_discount``, the unpaid header cap and the
-	paid check. ``max_amount`` caps the total after the tax, as :func:`apply_coupon_discount` does.
+	The cart never sends one (every coupon is a line discount, K1); an invoice queued
+	offline by an older POS, or made on the desk, may. A "Grand Total" % coupon also
+	saves the exclusive tax on it. A header "Better of the two" coupon gives each line
+	only what it adds to the line's own discount: ``max(0, coupon amount on the line -
+	the line's discount)``. The value rule for the unpaid header cap and the paid check.
+	``max_amount`` caps the total after the tax, as :func:`apply_coupon_discount` does.
 	"""
 	pct = _coupon_percentage(coupon)
 	scale = 1.0 + tax_rate if pct is not None else 1.0
 	amounts = [_coupon_line_amount(update, item) * scale for update, item in rows]
-	if top_up and _tops_up_line_discounts(coupon):
+	if _tops_up_line_discounts(coupon):
 		amounts = [
 			max(0.0, amount - flt(update.get("existing_discount")) * (1.0 + tax_rate))
 			if not update.get("stacked")
@@ -212,7 +218,7 @@ def _line_updates(result: dict, items) -> list:
 def coupon_value_on(
 	coupon, lines, tax_rate: float = 0.0, amount_basis: str = bd.AMOUNT_BASIS_LINE, pos_profile=None
 ) -> float:
-	"""The coupon's money on ``lines`` — the one value rule for the cart and the invoice.
+	"""The coupon's money on ``lines`` as an invoice header (:func:`_coupon_amounts`).
 
 	``amount_basis``: :data:`best_discount.AMOUNT_BASIS_UNIT` for saved invoice rows, whose
 	own discount is then read from what they charge, never from ``discount_amount``.
@@ -237,15 +243,15 @@ class CouponDecision:
 	"""
 
 	coupon_code: str
-	granularity: str
 	result: dict  # apply_coupon_to_items on the lines without their F&F stamp
 	items: list
-	coupon_value: float = 0.0  # what the coupon gives on every line it can take
+	coupon_value: float = 0.0  # the coupon's own money on every line it can take (pre-tax)
 	line_decisions: list = field(default_factory=list)
-	order_decision: bd.Decision | None = None
+	order_decision: bd.Decision | None = None  # "whole cart": coupon vs F&F on the cart
 	kept: list = field(default_factory=list)  # line updates the coupon keeps ("replaces" set)
-	kept_total: float = 0.0
+	kept_total: float = 0.0  # the coupon's own money on the kept lines (pre-tax)
 	fnf_lines: int = 0  # lines where the customer has F&F without the coupon
+	replaces_fnf_on_cart: bool = False  # "whole cart" and the coupon won: no F&F on any line
 	rejection: dict | None = None  # reason + messages when the coupon keeps nothing
 
 	@property
@@ -263,6 +269,12 @@ def _rejection(decision: CouponDecision) -> dict:
 	)
 	summary = decision.summary
 	msgs = headline.messages() if headline else {"message": summary["message"], "en": "", "ar": ""}
+	rival = headline.best_other if headline else None
+	if rival is not None and rival.source == bd.SOURCE_COUPON and rival.percentage is None:
+		# A fixed or capped coupon is named by its value, never by its share of one line
+		# (or by a whole-cart scenario total).
+		whole = replace(rival, amount=flt(decision.result.get("total_discount")))
+		msgs = bd.build_messages(headline.outcome, headline.fnf, whole)
 	return {
 		"reason": REASON_BETTER_DISCOUNT_EXISTS,
 		"message": msgs["message"],
@@ -279,9 +291,9 @@ def decide_coupon_vs_fnf(cart, coupon, customer=None, pos_profile=None) -> Coupo
 	``cart``: ``items``, optional ``posting_date``, ``taxes`` (the cart's tax rows;
 	without them the POS Profile's tax template decides which taxes are exclusive) and
 	``doctype`` (on a Sales Order / Quotation F&F never applies, so it is no rival).
-	Granularity: an uncapped % coupon is compared per line, any other coupon on the
-	order total. On the order the rival is every F&F line (an order coupon replaces
-	F&F on the whole cart) plus the best other discount on the coupon's lines.
+	The coupon is priced per line (``apply_coupon_to_items``) and set against F&F as
+	the Settings' ``coupon_combination`` says (module docstring). With no F&F rival
+	every mode is the same per-line rule.
 	"""
 	from posnext_promotions.api.coupon_engine import (
 		apply_coupon_to_items,
@@ -294,13 +306,12 @@ def decide_coupon_vs_fnf(cart, coupon, customer=None, pos_profile=None) -> Coupo
 	posting_date = cart.get("posting_date")
 	code = cstr(coupon.get("coupon_code")).upper()
 	items = enrich_items_with_catalog([frappe._dict(dict(i)) for i in cart.get("items") or []])
-	granularity = bd.GRANULARITY_LINE if is_line_level_coupon(coupon) else bd.GRANULARITY_ORDER
 
 	ctx = restore_context(customer, posting_date, pos_profile)
-	result = apply_coupon_to_items(
-		coupon, [_neutral_copy(i, ctx, code) for i in items], max_discount_pct=max_discount_allowed(pos_profile)
-	)
-	decision = CouponDecision(coupon_code=code, granularity=granularity, result=result, items=items)
+	neutral = [_neutral_copy(i, ctx, code) for i in items]
+	max_pct = max_discount_allowed(pos_profile)
+	result = apply_coupon_to_items(coupon, neutral, max_discount_pct=max_pct)
+	decision = CouponDecision(coupon_code=code, result=result, items=items)
 	if not result.get("valid"):
 		return decision
 
@@ -316,24 +327,28 @@ def decide_coupon_vs_fnf(cart, coupon, customer=None, pos_profile=None) -> Coupo
 	)
 	if tax_rate:
 		# Ruling 56: one unit for every candidate — what the customer saves including the
-		# exclusive tax. A line discount also lowers the tax charged on that line.
+		# exclusive tax. A line discount also lowers the tax charged on that line, so the
+		# coupon's line money is scaled the same way, whatever the coupon type.
 		fnf_by_line = {idx: _with_tax(c, tax_rate) for idx, c in fnf_by_line.items()}
-	updates = _line_updates(result, items)
-	amounts = _coupon_amounts(coupon, updates, tax_rate)
-	decision.coupon_value = sum(amounts)
-	# What the coupon's scenario saves: a topped-up line also keeps its own discount.
-	scenario_value = sum(_coupon_amounts(coupon, updates, tax_rate, top_up=False))
-	pct = _coupon_percentage(coupon)
-	rows = [
-		(
-			update,
-			item,
-			bd.Candidate(source=bd.SOURCE_COUPON, amount=amount, percentage=pct, code=code),
-			fnf_by_line.get(update.get("line_key")),
-			_with_tax(_existing_candidate(item, code), tax_rate),
-		)
-		for (update, item), amount in zip(updates, amounts, strict=True)
-	]
+	# Named by its % only while the % is what it gives (a capped coupon by its money, M-1).
+	pct = _coupon_percentage(coupon) if not flt(coupon.get("max_amount")) else None
+
+	def rows_of(result) -> list:
+		return [
+			(
+				update,
+				item,
+				bd.Candidate(
+					source=bd.SOURCE_COUPON,
+					amount=_coupon_line_amount(update, item) * (1.0 + tax_rate),
+					percentage=pct,
+					code=code,
+				),
+				fnf_by_line.get(update.get("line_key")),
+				_with_tax(_existing_candidate(item, code), tax_rate),
+			)
+			for update, item in _line_updates(result, items)
+		]
 
 	def stacked(row) -> bool:
 		"""An "Add on top" line: it keeps its own discount, so that discount is no rival."""
@@ -363,69 +378,96 @@ def decide_coupon_vs_fnf(cart, coupon, customer=None, pos_profile=None) -> Coupo
 		best = bd.pick_best(rivals(row))
 		return best.source if best else None
 
-	kept_rows = []
-	if granularity == bd.GRANULARITY_LINE:
-		for row in rows:
-			line = bd.decide(
-				[*rivals(row), line_scenario(row)], idx=row[0].get("line_key"), item_code=row[1].get("item_code")
-			)
-			decision.line_decisions.append(line)
-			if line.winner_source == bd.SOURCE_COUPON:
-				kept_rows.append(row)
+	def judge(rows) -> list:
+		return [
+			bd.decide([*rivals(row), line_scenario(row)], idx=row[0].get("line_key"), item_code=row[1].get("item_code"))
+			for row in rows
+		]
+
+	def won(rows, lines) -> list:
+		return [row for row, line in zip(rows, lines, strict=True) if line.winner_source == bd.SOURCE_COUPON]
+
+	rows = rows_of(result)
+	decision.coupon_value = sum(_coupon_line_amount(row[0], row[1]) for row in rows)
+	lines = judge(rows)
+	mode = ff_config.resolve().coupon_combination.value
+	if fnf_by_line and mode == ff_constants.COUPON_WHOLE_CART:
+		# The coupon's lines without F&F: where it beats the line's own discount.
+		beats_own = [
+			row for row in rows if bd.decide([*rivals(row)[1:], line_scenario(row)]).winner_source == bd.SOURCE_COUPON
+		]
+		kept_rows = _whole_cart(decision, beats_own, neutral, fnf_by_line, program, pct, tax_rate, line_scenario)
 	else:
-		row_keys = {row[0].get("line_key") for row in rows}
-		# F&F on lines the coupon cannot take is lost too when the order coupon wins.
-		fnf_part = sum(c.amount for idx, c in fnf_by_line.items() if idx not in row_keys)
-		fnf_capped = any(c.percentage is None for c in fnf_by_line.values())
-		other_part = 0.0
-		other_source = None
-		for row in rows:
-			best = bd.pick_best([row[3], row[4]])
-			if best is None:
-				continue
-			if best.source == bd.SOURCE_FRIENDS_AND_FAMILY:
-				fnf_part += best.amount
-			else:
-				other_part += best.amount
-				other_source = other_source or best.source
-		rival_source = bd.SOURCE_FRIENDS_AND_FAMILY if fnf_part else (other_source or bd.SOURCE_NONE)
-		rival = (
-			bd.Candidate(
-				source=rival_source,
-				amount=fnf_part + other_part,
-				percentage=flt(program.discount_percentage) if fnf_part and program and not fnf_capped else None,
-			)
-			if rival_source != bd.SOURCE_NONE
-			else None
-		)
-		# A stacked line keeps its own discount in the coupon's scenario too.
-		scenario_value += sum(stacked_own(row) for row in rows)
-		decision.order_decision = bd.decide(
-			[rival, bd.Candidate(source=bd.SOURCE_COUPON, amount=scenario_value, percentage=pct, code=code)],
-			granularity=bd.GRANULARITY_ORDER,
-		)
-		if decision.order_decision.winner_source == bd.SOURCE_COUPON:
-			kept_rows = list(rows)
+		# Per line. The minimum was met on the eligible cart before F&F split it (review I-1).
+		kept_rows = won(rows, lines)
+		if (
+			mode == ff_constants.COUPON_PER_LINE_FULL
+			and kept_rows
+			and len(kept_rows) < len(rows)
+			and _allocated(coupon)
+		):
+			# The lines F&F keeps hand their share to the lines the coupon takes, up to
+			# each line's room (one pass: the shares only grow, so those lines still win).
+			keys = {row[0].get("line_key") for row in kept_rows}
+			subset = [line if k in keys else frappe._dict(line, is_free_item=1) for k, line in enumerate(neutral)]
+			spread = apply_coupon_to_items(coupon, subset, max_discount_pct=max_pct, check_minimum=False)
+			if spread.get("valid"):
+				respread = rows_of(spread)
+				relines = judge(respread)
+				by_key = {line.idx: line for line in relines}
+				lines = [by_key.get(line.idx, line) for line in lines]
+				kept_rows = won(respread, relines)
+	decision.line_decisions = lines
 
 	if not kept_rows:
 		decision.rejection = _rejection(decision)
 		return decision
 
-	if len(kept_rows) != len(rows):
-		kept_base = sum(bd.line_gross(row[1]) for row in kept_rows)
-		min_amount = flt(coupon.get("min_amount"))
-		if min_amount and kept_base < min_amount:
-			decision.rejection = {
-				"reason": REASON_BETTER_DISCOUNT_EXISTS,
-				"message": _(
-					"Coupon {0} only beats other discounts on items worth {1}, below its minimum of {2}."
-				).format(code, ff_money.fmt(kept_base), ff_money.fmt(min_amount)),
-			}
-			return decision
-
 	decision.kept = [{**row[0], "replaces": replaced(row)} for row in kept_rows]
-	decision.kept_total = sum(row[2].amount for row in kept_rows)
+	decision.kept_total = sum(_coupon_line_amount(row[0], row[1]) for row in kept_rows)
 	return decision
+
+
+def _allocated(coupon) -> bool:
+	"""A coupon whose money is a cart total split over its lines (fixed amount or capped %)."""
+	return _coupon_percentage(coupon) is None or bool(flt(coupon.get("max_amount")))
+
+
+def _whole_cart(decision, coupon_rows, neutral, fnf_by_line, program, pct, tax_rate, line_scenario) -> list:
+	""""Better of the two for the whole cart": F&F on the cart vs the coupon on the cart.
+
+	F&F side: F&F on each line it takes, every other line keeps its own discount. Coupon
+	side: the coupon on each of its lines where it beats the line's own discount, every
+	other line keeps its own discount (and gets no F&F). One unit on both sides (the
+	exclusive tax too); F&F wins a tie. The coupon that wins takes all those lines.
+	"""
+	code = decision.coupon_code
+	own = [_with_tax(_existing_candidate(line, code), tax_rate) for line in neutral]
+
+	def money(candidate) -> float:
+		return candidate.amount if candidate else 0.0
+
+	coupon_keys = {row[0].get("line_key") for row in coupon_rows}
+	fnf_total = sum(money(fnf_by_line.get(k) or own[k]) for k in range(len(neutral)))
+	coupon_total = sum(money(line_scenario(row)) for row in coupon_rows) + sum(
+		money(own[k]) for k in range(len(neutral)) if k not in coupon_keys
+	)
+	capped = any(c.percentage is None for c in fnf_by_line.values())
+	decision.order_decision = bd.decide(
+		[
+			bd.Candidate(
+				source=bd.SOURCE_FRIENDS_AND_FAMILY,
+				amount=fnf_total,
+				percentage=None if capped else (flt(program.discount_percentage) or None),
+			),
+			bd.Candidate(source=bd.SOURCE_COUPON, amount=coupon_total, percentage=pct, code=code),
+		],
+		granularity=bd.GRANULARITY_ORDER,
+	)
+	if decision.order_decision.winner_source != bd.SOURCE_COUPON:
+		return []
+	decision.replaces_fnf_on_cart = True
+	return coupon_rows
 
 
 @ff_money.in_cart_currency
@@ -442,6 +484,7 @@ def resolve_coupon_best_discount(
 	result = dict(decision.result)
 	result["coupon_value"] = flt(decision.coupon_value, 6)
 	result["best_discount"] = decision.summary
+	result["replaces_friends_and_family_on_cart"] = decision.replaces_fnf_on_cart
 	if not result.get("valid"):
 		result["best_discount"] = bd.summarize([])
 		return result

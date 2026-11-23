@@ -649,7 +649,9 @@ def get_offers(pos_profile: str) -> list[dict]:
 
 	except Exception as e:
 		frappe.log_error(f"Error fetching offers: {e!s}", "Offers API")
-		return []
+		# Not answered as "no offers": the POS clears its offline offer cache on an empty
+		# list, and keeps it when the request fails (D-R4-01 review I-2).
+		raise
 
 
 @frappe.whitelist()
@@ -1195,6 +1197,7 @@ def _validate_coupon(
 			"best_discount": apply_result.get("best_discount"),
 			"customer_message": apply_result.get("customer_message"),
 			"coupon_value": apply_result.get("coupon_value") or 0,
+			"replaces_friends_and_family_on_cart": bool(apply_result.get("replaces_friends_and_family_on_cart")),
 		}
 	)
 
@@ -1215,11 +1218,12 @@ def calculate_coupon_discount(
 
 	PN-128: :func:`best_discount_coupon.decide_coupon_vs_fnf` compares the coupon with
 	F&F (lines offered without their F&F stamp) and the discounts already on the lines,
-	per line for an uncapped % coupon and on the total otherwise. Larger saving wins;
-	tie → F&F. ``discount`` is what the coupon keeps; when it wins over F&F the
-	response sets ``suppress_friends_and_family`` so the POS drops the F&F line stamps
-	(the invoice validate hook enforces the same rule server-side). ``line_updates``
-	and ``granularity`` say where the coupon won. ``invoice_data.taxes`` (optional)
+	as Friends and Family Settings' ``coupon_combination`` says (K1). Larger saving
+	wins; tie → F&F. ``discount`` is what
+	the coupon keeps; when it wins over F&F the response sets
+	``suppress_friends_and_family`` so the POS drops the F&F line stamps (the invoice
+	validate hook enforces the same rule server-side). ``line_updates`` are the lines
+	the coupon won; ``granularity`` is always ``"line"``. ``invoice_data.taxes`` (optional)
 	tells which taxes are exclusive for a "Grand Total" coupon. ``target_doctype``
 	(default ``invoice_data.doctype``): on a Sales Order / Quotation F&F is no rival.
 	"""
@@ -1260,7 +1264,7 @@ def calculate_coupon_discount(
 		"eligible_subtotal": eligible_subtotal,
 		"excluded_subtotal": max(gross - eligible_subtotal, 0.0),
 		"coupon": coupon_dict,
-		"granularity": decision.granularity,
+		"granularity": bd.GRANULARITY_LINE,
 		"line_updates": decision.kept,
 	}
 	if not result.get("valid"):
@@ -1282,6 +1286,9 @@ def calculate_coupon_discount(
 		)
 	if decision.fnf_lines:
 		response["suppress_friends_and_family"] = True
+	# "Better of the two for the whole cart" and the coupon won: F&F comes off every line,
+	# not only the coupon's (the POS strips it from the whole cart).
+	response["replaces_friends_and_family_on_cart"] = decision.replaces_fnf_on_cart
 	return response
 
 

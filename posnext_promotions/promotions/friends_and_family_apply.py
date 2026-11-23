@@ -1266,6 +1266,14 @@ def _invoice_state(doc, items) -> tuple:
 RETURN_WARNINGS_FLAG = "ff_return_warnings"
 
 
+def _coupon_holds_the_cart(doc) -> bool:
+	"""The coupon split check found this invoice's coupon holds the whole cart."""
+	from posnext_promotions.overrides.coupon_split import HOLDS_CART_FLAG
+
+	flags = getattr(doc, "flags", None) or {}
+	return bool(flags.get(HOLDS_CART_FLAG))
+
+
 def _claims_fnf(row) -> bool:
 	"""The client sent F&F markers on this row (not trusted, only used to decide on a warning)."""
 	return (
@@ -1890,6 +1898,10 @@ def apply_friends_and_family_on_invoice(doc, method=None):
 	# Caps are company currency (ledger base_amount); this invoice may be in another.
 	conversion_rate = flt(doc.get("conversion_rate")) or 1.0
 	eligibility = get_customer_eligibility(doc.get("customer"), posting_date, pos_profile)
+	if eligibility.eligible and _coupon_holds_the_cart(doc):
+		# "Better of the two for the whole cart": the server's split (validate_scoped_coupon_lines)
+		# gave the coupon the whole cart, so no line gets F&F next to it (K1).
+		eligibility = replace(eligibility, eligible=False)
 	program = eligibility.program if eligibility.eligible else None
 	b_line_values = []
 	fnf_like = []

@@ -11,7 +11,7 @@ import posnext_promotions
 from posnext_promotions import contract_gate
 
 GATE = "posnext_promotions.contract_gate.before_migrate"
-MSG = "Update pos_next to >= 2.6.0 before migrating (an older version is installed)."
+MSG = "Update pos_next to >= 2.7.0 before migrating (an older version is installed)."
 
 
 def _importer(**mods):
@@ -24,21 +24,21 @@ def _importer(**mods):
 
 
 class TestContractGate(FrappeTestCase):
-	def test_contract_is_4(self):
-		# 4: the one-time lookup ignores the validated invoice's own redemption (D-R3-04 b),
-		# which pos_next's stacked-line redemption needs. pos_next itself still needs only 2.
-		self.assertEqual(posnext_promotions.FF_CONTRACT, 4)
-		self.assertEqual(posnext_promotions.__version__, "0.4.0")
-		self.assertEqual(contract_gate.REQUIREMENTS, {"pos_next": (2, "2.6.0")})
+	def test_contract_is_5(self):
+		# 5: a coupon that holds the whole cart answers replaces_friends_and_family_on_cart,
+		# and pos_next 3 strips F&F from every line then (K1).
+		self.assertEqual(posnext_promotions.FF_CONTRACT, 5)
+		self.assertEqual(posnext_promotions.__version__, "0.5.0")
+		self.assertEqual(contract_gate.REQUIREMENTS, {"pos_next": (3, "2.7.0")})
 
 	def test_old_pos_next_reported(self):
-		for module in (SimpleNamespace(), SimpleNamespace(FF_CONTRACT=1), SimpleNamespace(FF_CONTRACT="2")):
+		for module in (SimpleNamespace(), SimpleNamespace(FF_CONTRACT=2), SimpleNamespace(FF_CONTRACT="3")):
 			with self.subTest(module=module):
 				msgs = contract_gate.check(contract_gate.REQUIREMENTS, ["pos_next"], _importer(pos_next=module))
 				self.assertEqual(msgs, [MSG])
 
 	def test_current_pos_next_or_none_passes(self):
-		imp = _importer(pos_next=SimpleNamespace(FF_CONTRACT=2))
+		imp = _importer(pos_next=SimpleNamespace(FF_CONTRACT=3))
 		self.assertEqual(contract_gate.check(contract_gate.REQUIREMENTS, ["pos_next"], imp), [])
 		self.assertEqual(contract_gate.check(contract_gate.REQUIREMENTS, ["frappe"], _importer()), [])
 

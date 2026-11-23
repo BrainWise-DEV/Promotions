@@ -16,3 +16,12 @@ COMPAT_POLICIES = ("Compete", "Block F&F on line", "Both apply", "F&F wins, remo
 
 # A rule the classifier cannot place: gift policies make no sense for it.
 UNCLASSIFIED_POLICIES = ("Compete", "Block F&F on line")
+
+# How F&F and a POS Coupon combine on one cart (K1 round 1); the first is the default.
+# The coupon itself is always a line discount, before tax.
+COUPON_COMBINATIONS = (
+	"Better of the two for the whole cart",
+	"Better per line (unused coupon share is not used)",
+	"Better per line, coupon fully used",
+)
+COUPON_WHOLE_CART, COUPON_PER_LINE, COUPON_PER_LINE_FULL = COUPON_COMBINATIONS

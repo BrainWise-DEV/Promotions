@@ -29,6 +29,8 @@ class EffectiveConfig:
 	allow_free_gift_with_ff: Value
 	on_cap_breach_at_submit: Value
 	unclassified_promotion_policy: Value
+	# Defaulted so a config built without it (an older caller) reads the default mode.
+	coupon_combination: Value = Value(const.COUPON_COMBINATIONS[0], "default")
 
 
 def _select(settings, fieldname: str, allowed: tuple, default: str) -> Value:
@@ -48,6 +50,9 @@ def _build() -> EffectiveConfig:
 		),
 		unclassified_promotion_policy=_select(
 			settings, "unclassified_promotion_policy", const.UNCLASSIFIED_POLICIES, const.UNCLASSIFIED_POLICIES[0]
+		),
+		coupon_combination=_select(
+			settings, "coupon_combination", const.COUPON_COMBINATIONS, const.COUPON_COMBINATIONS[0]
 		),
 	)
 
