@@ -40,7 +40,11 @@ def validate_scoped_coupon_lines(doc, method=None):
 	route (D-18).
 	"""
 	from posnext_promotions.overrides.coupon_share import set_coupon_shares
+	from posnext_promotions.overrides.coupon_split import UNDER_APPLIED_FLAG
 
+	flags = getattr(doc, "flags", None)
+	if flags is not None:
+		flags[UNDER_APPLIED_FLAG] = None  # this validate's finding only (R1-M3)
 	tagged = [
 		row
 		for row in doc.get("items") or []
@@ -89,7 +93,11 @@ def validate_scoped_coupon_lines(doc, method=None):
 				if promotion > 0 and flt(row.price_list_rate) > promotion
 				else flt(row.discount_percentage)
 			)
-			if percentage > flt(coupon.discount_percentage) + TOLERANCE:
+			# A row holds its rate to the cent: on a stacked line that moves the share by up to
+			# half a cent a unit, a visible % of a cheap line (0.08% of 7.77 under 33.33%).
+			room = flt(row.price_list_rate) - promotion if promotion > 0 else 0.0
+			rounding = 50.0 / 10 ** _row_precision(row) / room if room > 0 else 0.0
+			if percentage > flt(coupon.discount_percentage) + TOLERANCE + rounding:
 				refuse(
 					_("Row {0}: discount {1}% exceeds POS Coupon {2} ({3}%)").format(
 						row.idx, percentage, code, flt(coupon.discount_percentage)
@@ -120,6 +128,10 @@ def validate_scoped_coupon_lines(doc, method=None):
 	from posnext_promotions.overrides.coupon_split import check_coupon_split
 
 	check_coupon_split(doc, tagged, coupons, shares, refuse)
+
+
+def _row_precision(row) -> int:
+	return row.precision("discount_amount") if callable(getattr(row, "precision", None)) else 2
 
 
 def _refuser(doc):

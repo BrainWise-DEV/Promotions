@@ -60,7 +60,7 @@ This module is pure (no DB writes); callers own mutation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from frappe import _
 from frappe.utils import cstr, flt
@@ -272,6 +272,9 @@ class Decision:
 	candidates: list[Candidate] = field(default_factory=list)
 	idx: int | None = None
 	item_code: str | None = None
+	# F&F and the other side as the note names them, by their own money before tax
+	# (a coupon vs F&F on the cart, D-R5-07). The outcome still comes from ``candidates``.
+	shown: tuple[Candidate | None, Candidate | None] | None = None
 
 	@property
 	def fnf(self) -> Candidate | None:
@@ -322,6 +325,8 @@ class Decision:
 		return OUTCOME_OTHER_BETTER
 
 	def messages(self) -> dict:
+		if self.shown:
+			return build_cart_messages(self.outcome, *self.shown)
 		return build_messages(self.outcome, self.fnf, self.best_other or self.skipped_other)
 
 	def to_payload(self) -> dict:
@@ -423,6 +428,51 @@ def build_messages(outcome: str, fnf: Candidate | None, other: Candidate | None)
 		"en": _cap(en.format(fnf_v, o_label["en"], other_v)),
 		"ar": ar.format(fnf_v, o_label["ar"], other_v),
 		"message": _cap(_(en).format(fnf_v, _(o_label["en"]), other_v)),
+		"customer": customer_message_for(outcome, other),
+	}
+
+
+# A coupon vs F&F on one cart (D-R5-07). Each side is named by its own money before tax,
+# never by a %: "20%" against "30%" reads wrong when the 20% saves more on this cart.
+# The sentence says which one the cart saves more with, which is what was compared.
+CART_MESSAGES = {
+	OUTCOME_OTHER_BETTER: (
+		"{1} ({2}) applied instead of the Friends & Family discount ({0}): this cart saves more with {1}.",
+		"تم تطبيق {1} ({2}) بدلاً من خصم الأصدقاء والعائلة ({0}): التوفير في هذه السلة أكبر مع {1}.",
+	),
+	OUTCOME_FNF_BETTER: (
+		"Friends & Family discount ({0}) applied instead of {1} ({2}): this cart saves more with Friends & Family.",
+		"تم تطبيق خصم الأصدقاء والعائلة ({0}) بدلاً من {1} ({2}): التوفير في هذه السلة أكبر مع خصم الأصدقاء والعائلة.",
+	),
+	OUTCOME_TIE_FNF: (
+		"Friends & Family discount ({0}) applied instead of {1} ({2}): this cart saves the same with either, and Friends & Family wins a tie.",
+		"تم تطبيق خصم الأصدقاء والعائلة ({0}) بدلاً من {1} ({2}): التوفير في هذه السلة واحد مع أي منهما، وعند التساوي يُطبَّق خصم الأصدقاء والعائلة.",
+	),
+}
+
+
+def build_cart_messages(outcome: str, fnf: Candidate | None, other: Candidate | None) -> dict:
+	"""A coupon vs F&F on the cart: both named by money (``Candidate.amount``, before tax)."""
+	fnf = replace(fnf, percentage=None) if fnf else None
+	other = replace(other, percentage=None) if other else None
+	if outcome not in CART_MESSAGES:
+		return build_messages(outcome, fnf, other)
+	en, ar = CART_MESSAGES[outcome]
+	o_label = source_label(other.source, other.code) if other else source_label(SOURCE_NONE)
+	o_message = _(o_label["en"])
+	if other is not None and other.source in _COUPON_SOURCES and other.code:
+		# The coupon in ar.csv's word for it, and translatable for the desk (review M7).
+		o_label = {"en": o_label["en"], "ar": f"القسيمة {other.code}"}
+		o_message = _("coupon {0}").format(other.code)
+	fnf_v, other_v = _value_text(fnf), _value_text(other)
+
+	def _cap(text: str) -> str:
+		return text[:1].upper() + text[1:]
+
+	return {
+		"en": _cap(en.format(fnf_v, o_label["en"], other_v)),
+		"ar": ar.format(fnf_v, o_label["ar"], other_v),
+		"message": _cap(_(en).format(fnf_v, o_message, other_v)),
 		"customer": customer_message_for(outcome, other),
 	}
 

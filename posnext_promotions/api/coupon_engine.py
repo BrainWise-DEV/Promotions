@@ -1,6 +1,8 @@
 # Copyright (c) 2026, BrainWise and contributors
 """Coupon eligibility/discount helpers. Independent of the POS Coupon DocType class."""
 
+import math
+
 import frappe
 from frappe import _
 from frappe.utils import cint, cstr, flt, getdate, today
@@ -377,8 +379,62 @@ def _coupon_rejection_message(coupon, items) -> str:
 	return _("No eligible items for this coupon")
 
 
+def _whole_cents_per_unit(lines, parts, limits) -> tuple[list[float], float]:
+	"""Coupon shares a saved row can hold as they are; and the most the cut can lose.
+
+	An invoice row keeps its discount per unit at the currency's precision, and the POS
+	cuts each fixed coupon line down to that (``couponLines.fixedCouponLineDiscount``), so
+	40 split 22.2222 + 17.7778 was sold as 22.22 + 17.77 (D-R5-06). Each share is cut
+	the same way here, and what the cut lost goes, whole, to one line: the one that lost
+	the most (to a hundredth of a cent; the lowest line on a tie) among those whose units
+	split it evenly and that have room for it (``limits``). When no line can take all of
+	it, it goes in whole units a unit, in the same order, as far as it goes.
+
+	The shares never add up to more than ``parts``. They add up to all of it when some
+	line's quantity divides what the cut lost; otherwise up to that remainder is not
+	given (3 x 50 cannot hold 40: 13.33 x 3 = 39.99), as the POS sold it before.
+
+	The second value is the most the cut can lose over these lines, a smallest unit per
+	unit sold. Which line gets the lost money, and how much is lost, depend on sub-cent
+	figures the cart and the invoice see differently (the cart's promotion is to the
+	cent, the server's exact), so the invoice check allows any one line that much more
+	and holds the lines together to the split (review I1).
+	"""
+	from posnext_promotions.promotions import ff_money
+
+	scale = 10 ** ff_money.precision_for(ff_money.current_currency() or ff_money.default_currency())
+	qtys = [flt(item.get("qty") or item.get("quantity") or 0) or 1 for item in lines]
+	units = [math.floor(max(part, 0) / qty * scale + 1e-6) for part, qty in zip(parts, qtys, strict=True)]
+	left = math.floor(sum(parts) * scale - sum(u * q for u, q in zip(units, qtys, strict=True)) + 1e-6)
+	order = sorted(range(len(parts)), key=lambda k: (-round(parts[k] * scale - units[k] * qtys[k], 2), k))
+
+	def room(k):
+		"""Whole units a unit line ``k`` may still take."""
+		return math.floor((flt(limits[k]) * scale - units[k] * qtys[k]) / qtys[k] + 1e-6)
+
+	def fits(k, amount):
+		per_unit = amount / qtys[k]
+		return abs(per_unit - round(per_unit)) < 1e-6 and round(per_unit) <= room(k)
+
+	whole = next((k for k in order if left > 0 and fits(k, left)), None)
+	if whole is not None:
+		units[whole] += round(left / qtys[whole])
+	else:
+		for k in order:
+			step = min(math.floor(left / qtys[k] + 1e-6), room(k))
+			if step > 0:
+				units[k] += step
+				left -= step * qtys[k]
+	return [flt(u * q / scale, 6) for u, q in zip(units, qtys, strict=True)], flt(sum(qtys) / scale, 6)
+
+
 def apply_coupon_to_items(
-	coupon, items, amount_basis: str = "line", max_discount_pct: float = 0, check_minimum: bool = True
+	coupon,
+	items,
+	amount_basis: str = "line",
+	max_discount_pct: float = 0,
+	check_minimum: bool = True,
+	whole_cents: bool = True,
 ):
 	"""
 	Calculate per-line coupon discounts for matrix-eligible items only.
@@ -399,6 +455,10 @@ def apply_coupon_to_items(
 
 	``check_minimum``: False re-spreads a coupon whose minimum was already met on the
 	whole eligible cart over some of its lines (F&F "coupon fully used", K1).
+
+	``whole_cents``: a fixed or capped coupon's line shares are whole cents a unit, as a
+	row holds them (:func:`_whole_cents_per_unit`). False keeps the exact split, for a
+	coupon valued as an invoice header (``best_discount_coupon.coupon_value_on``).
 
 	Returns dict with valid, message, eligible_item_codes, line_updates, total_discount.
 	"""
@@ -479,6 +539,28 @@ def apply_coupon_to_items(
 			parts = [part for item, part in zip(chosen, parts) if item not in lost]
 			chosen = [item for item in chosen if item not in lost]
 
+	slack = 0.0
+	exact = list(parts)  # before the cut: what the invoice holds the coupon's rows to (R1-M1)
+	if whole_cents and chosen and not (is_percentage and not coupon.max_amount):
+		# A fixed or capped coupon: whole cents a unit, up to the coupon (D-R5-06). A
+		# capped-% line takes at most the coupon's % of it: the POS clamps it there too.
+		limits = [
+			min(most(item), room(item) * pct / 100.0) if is_percentage else most(item) for item in chosen
+		]
+		parts, slack = _whole_cents_per_unit(chosen, parts, limits)
+	elif whole_cents and chosen and mode == PROMOTION_CONFLICT_BETTER:
+		# An uncapped % stays a % on a plain line; on a line it takes from a promotion ("Better
+		# of the two") it becomes a fixed amount, cut to whole cents a unit as the row holds it
+		# (review M3). A stacked ("Add on top") line is not cut: the POS prices it at the
+		# server's unit rate, and its room depends on the promotion, which the cart holds to
+		# the cent and the server exact, so the two cuts could differ by a cent a unit (R1-I1).
+		parts = [
+			_whole_cents_per_unit([item], [part], [part])[0][0]
+			if flt(item["_existing_discount"]) > 0
+			else part
+			for item, part in zip(chosen, parts, strict=True)
+		]
+
 	kept_codes = [item.get("item_code") for item in kept]
 	if not chosen:
 		return {
@@ -497,7 +579,7 @@ def apply_coupon_to_items(
 		}
 
 	line_updates = []
-	for item, part in zip(chosen, parts):
+	for item, part, exact_part in zip(chosen, parts, exact, strict=True):
 		base = flt(item["_base_amount"])
 		qty = flt(item.get("qty") or item.get("quantity") or 0) or 1
 		existing = flt(item["_existing_discount"])
@@ -523,6 +605,10 @@ def apply_coupon_to_items(
 			# The line's own discount before the coupon (a "Better of the two" order coupon tops it up).
 			"existing_discount": flt(existing, 6),
 			"pre_coupon_discount_fraction": flt(existing / base, 6) if stacked and base else 0,
+			# The most the whole-cents cut can lose over this split's lines (review I1).
+			"whole_cents_slack": slack,
+			# The share before that cut (review R1-M1).
+			"coupon_exact_share": flt(exact_part, 6),
 		}
 		if stacked:
 			update["stacked"] = True

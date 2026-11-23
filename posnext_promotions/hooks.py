@@ -79,6 +79,7 @@ doc_events = {
 			"posnext_promotions.api.one_time_usage.record_one_time_offer_usage",
 			"posnext_promotions.promotions.ff_ledger.on_submit",
 			"posnext_promotions.promotions.friends_and_family_log.log_invoice_submit",
+			"posnext_promotions.overrides.coupon_split.log_under_applied",
 		],
 		"on_cancel": [
 			"posnext_promotions.api.one_time_usage.release_one_time_offer_usage",

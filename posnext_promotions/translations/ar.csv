@@ -24,3 +24,8 @@
 "Row {0}: coupon {1} does not give the best discount on item {2}","السطر {0}: القسيمة {1} لا تعطي أفضل خصم على الصنف {2}",""
 "Row {0}: coupon {1} gives {2} on item {3}, more than its share of {4}","السطر {0}: القسيمة {1} تعطي {2} على الصنف {3}، أكثر من حصتها البالغة {4}",""
 "Row {0}: the Friends & Family discount cannot be combined with coupon {1} on this invoice","السطر {0}: لا يمكن الجمع بين خصم الأصدقاء والعائلة والقسيمة {1} في هذه الفاتورة",""
+"{1} ({2}) applied instead of the Friends & Family discount ({0}): this cart saves more with {1}.","تم تطبيق {1} ({2}) بدلاً من خصم الأصدقاء والعائلة ({0}): التوفير في هذه السلة أكبر مع {1}.",""
+"Friends & Family discount ({0}) applied instead of {1} ({2}): this cart saves more with Friends & Family.","تم تطبيق خصم الأصدقاء والعائلة ({0}) بدلاً من {1} ({2}): التوفير في هذه السلة أكبر مع خصم الأصدقاء والعائلة.",""
+"Friends & Family discount ({0}) applied instead of {1} ({2}): this cart saves the same with either, and Friends & Family wins a tie.","تم تطبيق خصم الأصدقاء والعائلة ({0}) بدلاً من {1} ({2}): التوفير في هذه السلة واحد مع أي منهما، وعند التساوي يُطبَّق خصم الأصدقاء والعائلة.",""
+"Coupon {0} gives {1} on this invoice, more than its split of {2}","القسيمة {0} تعطي {1} في هذه الفاتورة، أكثر من حصتها البالغة {2}",""
+"coupon {0}","القسيمة {0}",""

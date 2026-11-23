@@ -27,14 +27,22 @@ from frappe.utils import cint, flt
 
 from posnext_promotions.promotions.friends_and_family_apply import _claims_fnf
 
-def _tolerance(qty: float) -> float:
+def _tolerance(qty: float, stacked: bool = False) -> float:
 	"""Slack on a line's coupon money: a cent, plus the per-unit rounding of the saved row
-	(at most half a cent a unit). Judged on the line, never per unit (re-review R1-M1)."""
-	return 0.01 + 0.005 * abs(qty)
+	(at most half a cent a unit). Judged on the line, never per unit (re-review R1-M1).
+
+	A stacked line's share is its rate to the cent less the promotion, which the cart also
+	holds to the cent: half a cent a unit more (re-review R2-m1, 8 of 101 real carts at qty
+	5-24 were refused without it)."""
+	return 0.01 + (0.01 if stacked else 0.005) * abs(qty)
 
 
 # Error Log title of an unpaid coupon line "Allow and log" brought down to its share (R2-M1).
 REPRICED_LOG_TITLE = "POS Coupon line re-priced to its share"
+# Error Log title of a paid whole-cart sale that left a line of the coupon without it (review M4).
+UNDER_APPLIED_LOG_TITLE = "POS Coupon line sold without its share"
+# doc.flags: what that log will say, found at validate and written once, at submit (R1-M3).
+UNDER_APPLIED_FLAG = "posnext_coupon_under_applied"
 # doc.flags: the server's split gave this invoice's coupon the whole cart (no F&F on it).
 HOLDS_CART_FLAG = "posnext_coupon_holds_cart"
 
@@ -109,6 +117,82 @@ def _reprice_to_share(row, promotion: float, share_per_unit: float) -> None:
 			row.set(field, value)
 
 
+def _check_split_total(doc, code, held, reprice, refuse) -> None:
+	"""The coupon money on the rows it holds is at most the server's split of it (review I1).
+
+	Each row may carry the cents the cut loses (the cart may have put them on another line),
+	so the rows together are held to the split before the cut, with the rows' own rounding:
+	the cart's cut only floors and hands back what it lost, so its rows never add up to more
+	than its own uncut split, which differs from this one by far less than a cent (R1-M1).
+	Over it: "Allow and log" brings an unpaid invoice's rows back to the server's split and
+	logs it; otherwise it is refused.
+	"""
+	from posnext_promotions.promotions import ff_money
+
+	units = sum(qty for *_rest, qty in held)
+	stacked_units = sum(qty for _row, _share, promotion, _limit, _exact, qty in held if promotion > 0)
+	claimed = sum(share * qty for _row, share, _promotion, _limit, _exact, qty in held)
+	limited = sum(exact for *_rest, exact, _qty in held)
+	if not held or claimed <= limited + _tolerance(units) + 0.005 * stacked_units:
+		return
+	if reprice:
+		frappe.log_error(
+			title=REPRICED_LOG_TITLE,
+			message=(
+				f"Invoice {doc.get('name') or doc.get('offline_id') or 'new'}: coupon {code} gave "
+				f"{flt(claimed, 2)} on its rows, the server's split is {flt(limited, 2)}\n"
+				+ json.dumps({"coupon": code, "client_total": claimed, "server_total": limited}, default=str)
+			),
+		)
+		for row, _share, promotion, limit, _exact, qty in held:
+			_reprice_to_share(row, promotion, limit / qty)
+		return
+	refuse(
+		_("Coupon {0} gives {1} on this invoice, more than its split of {2}").format(
+			code, ff_money.fmt(claimed), ff_money.fmt(limited)
+		),
+		coupon=code,
+		share=claimed,
+		limit=limited,
+	)
+
+
+def _under_applied(doc, code, tagged, allowed, position) -> dict | None:
+	"""A paid sale where the coupon held the whole cart but some of its lines went out
+	without it (added after the coupon, or offline): kept as paid, logged (review M4).
+
+	The customer is owed no F&F on this invoice, so the F&F audit says nothing here.
+	Returns the log's details, for :func:`log_under_applied` at submit; None when none.
+	"""
+	held = {position.get(id(row)) for row in tagged}
+	items = doc.get("items") or []
+	missing = [
+		{"row": key + 1, "item": items[key].get("item_code"), "server_share": flt(allowed[key], 2)}
+		for key in sorted(k for k in allowed if k not in held and k is not None and k < len(items))
+	]
+	if not missing:
+		return None
+	return {"invoice": doc.get("name") or doc.get("offline_id") or "new", "coupon": code, "rows": missing}
+
+
+def log_under_applied(doc, method=None) -> None:
+	"""Sales Invoice ``on_submit``: the under-applied coupon found at validate, logged once a
+	sale. Validate runs on every save of a paid draft and again on submit (review R1-M3)."""
+	flags = getattr(doc, "flags", None) or {}
+	details = flags.get(UNDER_APPLIED_FLAG)
+	if not details:
+		return
+	frappe.log_error(
+		title=UNDER_APPLIED_LOG_TITLE,
+		message=(
+			f"Invoice {details['invoice']}: coupon {details['coupon']} holds the cart but "
+			+ ", ".join(f"row {m['row']} ({m['item']})" for m in details["rows"])
+			+ " went out without its share\n"
+			+ json.dumps(details, default=str, sort_keys=True)
+		),
+	)
+
+
 def check_coupon_split(doc, tagged, coupons, shares, refuse) -> None:
 	"""Hold the invoice's coupon lines to the server's own split (module docstring)."""
 	from posnext_promotions.promotions import ff_config, ff_constants, ff_money, ff_paid
@@ -130,12 +214,20 @@ def check_coupon_split(doc, tagged, coupons, shares, refuse) -> None:
 		pos_profile=doc.get("pos_profile"),
 	)
 	allowed = {u.get("line_key"): flt(u.get("coupon_only_discount")) for u in decision.kept}
+	exact = {
+		u.get("line_key"): flt(u.get("coupon_exact_share", u.get("coupon_only_discount"))) for u in decision.kept
+	}
+	# The cents the whole-cents cut loses land on a line chosen by sub-cent figures, which the
+	# cart and this re-split see differently (the cart's promotion is to the cent): any one
+	# line may carry them, and the rows together are held to the split (review I1).
+	slack = max((flt(u.get("whole_cents_slack")) for u in decision.kept), default=0.0)
 	position = {id(row): key for key, row in enumerate(doc.get("items") or [])}
 	paid = ff_paid.is_paid(doc)
 	reprice = not paid and (
 		ff_config.resolve().on_cap_breach_at_submit.value != ff_constants.CAP_BREACH_POLICIES[1]
 	)
 	kept = 0
+	held = []  # (row, share, promotion, limit, exact share, qty) of the rows the split gives the coupon
 	for row in tagged:
 		share, promotion = shares.get(id(row), (flt(row.get("discount_amount")), 0.0))
 		limit = allowed.get(position.get(id(row)))
@@ -153,7 +245,9 @@ def check_coupon_split(doc, tagged, coupons, shares, refuse) -> None:
 				row=row.idx,
 				share=share,
 			)
-		elif share * qty > limit + _tolerance(qty):
+		elif share * qty <= limit + slack + _tolerance(qty, stacked=promotion > 0):
+			held.append((row, share, promotion, limit, exact[position.get(id(row))], qty))
+		else:
 			if reprice:
 				# "Allow and log": the correction is logged, as the offline-kept checks are.
 				details = {
@@ -183,9 +277,15 @@ def check_coupon_split(doc, tagged, coupons, shares, refuse) -> None:
 				share=share,
 				limit=limit / qty,
 			)
+	_check_split_total(doc, code, held, reprice, refuse)
 	flags = getattr(doc, "flags", None)
 	if flags is not None:
 		flags[HOLDS_CART_FLAG] = bool(decision.replaces_fnf_on_cart and kept)
+		flags[UNDER_APPLIED_FLAG] = (
+			_under_applied(doc, code, tagged, allowed, position)
+			if paid and decision.replaces_fnf_on_cart
+			else None
+		)
 	if decision.replaces_fnf_on_cart and paid:
 		for row in doc.get("items") or []:
 			if _claims_fnf(row) and not row.get("posnext_coupon_code"):

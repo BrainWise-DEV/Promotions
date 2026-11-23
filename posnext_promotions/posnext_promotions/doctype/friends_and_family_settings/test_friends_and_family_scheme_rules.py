@@ -234,6 +234,64 @@ class TestFriendsAndFamilySchemeRules(FrappeTestCase):
 		self.assertAlmostEqual(flt(line.get("rate")), 35, places=2, msg="allow=1 qty=4")
 		self.assertEqual(self._item(resp, ITEM_B).get("discount_source"), FNF, "allow=1 qty=4")
 
+	def _monthly_cap_left(self, remaining):
+		"""Monthly cap = the customer's usage this month (one row recorded here) + ``remaining``."""
+		from frappe.utils import nowdate
+
+		from posnext_promotions.promotions import ff_ledger
+
+		period = ff_ledger.period_key(nowdate())
+		invoice = f"_PNXT_L2_{frappe.generate_hash(length=8)}"
+		ff_ledger.record_rows(
+			[
+				{
+					"customer": self.ctx.customer,
+					"company": self.ctx.company,
+					"invoice_doctype": "POS Invoice",
+					"invoice": invoice,
+					"invoice_item": f"{invoice}-1",
+					"posting_date": nowdate(),
+					"period_key": period,
+					"amount": 10,
+					"base_amount": 10,
+				}
+			]
+		)
+		used = flt(ff_ledger.get_usage(self.ctx.customer, self.ctx.company, period))
+		self._settings(allow_free_gift_with_ff=1, max_discount_per_customer_month=used + remaining)
+
+	def test_d_r5_10_buy_one_beats_fnf_with_the_box_on_whatever_the_cap_left(self):
+		# Run 5 (D-R5-10): UIT-Verified got F&F 30% on UIT-A x 2 and x 3 under UIT-PR-BUY1 with
+		# the box on. Same rule shape (Max, mixed conditions, POS only, min qty 2, limit 1,
+		# 100%), cap states: none, 155.50 left (that sale), 0.01 left (after the suite). The
+		# promotion wins at qty 2 (50%) and qty 3 (33%) in every state; F&F 30% never does.
+		rule = _make_rule(
+			"_PNXT_FF_BUY_ONE_R510",
+			apply_on="Item Code",
+			items=[{"item_code": ITEM_A}],
+			price_or_product_discount="Price",
+			rate_or_discount="Discount Percentage",
+			discount_percentage=100,
+			min_qty=2,
+			apply_discount_on_price="Max",
+			min_or_max_discount_qty_limit=1,
+			mixed_conditions=1,
+			pos_only=1,
+		)
+		for remaining in (None, 155.5, 0.01):
+			if remaining is None:
+				self._settings(allow_free_gift_with_ff=1)
+			else:
+				self._monthly_cap_left(remaining)
+			for qty in (2, 3):
+				msg = f"cap left {remaining}, qty {qty}"
+				resp = self._apply([(ITEM_A, qty)], [rule])
+				line = self._item(resp, ITEM_A)
+				self.assertNotEqual(line.get("discount_source"), FNF, msg)
+				# One unit free (at qty 3 the row holds 33.33% a unit: 50.01).
+				self.assertAlmostEqual(self._line_saving(line), 50.0, delta=0.02, msg=msg)
+				self.assertIn(rule, resp["applied_pricing_rules"], msg)
+
 	def test_buy_one_labelled_item_level_or_auto_is_still_bxgy(self):
 		for label in (gifts.PROMOTION_TYPE_ITEM_LEVEL, "Auto Discount", ""):
 			rule = self._buy_one("_PNXT_FF_BUY_ONE_LBL", promotion_type=label)

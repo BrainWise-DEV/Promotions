@@ -821,17 +821,19 @@ def compute_friends_and_family_discounts(
 	conversion_rate: float | None = None,
 	company: str | None = None,
 	ignore_caps: bool = False,
+	eligibility=None,
 ) -> dict:
 	"""Per-line F&F decision for ``customer`` + cart ``items`` on ``posting_date``.
 
 	Does not mutate ``items``. The returned ``discount_percentage`` (header and
 	per applying line) always comes from Settings — never from the request.
-	``ignore_caps``: the entitlement before PN-129 caps.
+	``ignore_caps``: the entitlement before PN-129 caps. ``eligibility``: the
+	caller's :func:`get_customer_eligibility` for the same customer, date and profile.
 	"""
 	posting_date = posting_date or nowdate()
 	signed_for = restore_context(customer, posting_date, pos_profile)
 	items = enrich_items_with_catalog([_restored_copy(i, signed_for) for i in items or []])
-	eligibility = get_customer_eligibility(customer, posting_date, pos_profile)
+	eligibility = eligibility or get_customer_eligibility(customer, posting_date, pos_profile)
 	program = eligibility.program if eligibility.eligible else None
 	payload = _base_payload(eligibility, program)
 
@@ -1274,6 +1276,19 @@ def _coupon_holds_the_cart(doc) -> bool:
 	return bool(flags.get(HOLDS_CART_FLAG))
 
 
+def _invoice_eligibility(doc, posting_date, pos_profile):
+	"""The customer's F&F eligibility on this invoice, paid or not (review M9).
+
+	"Better of the two for the whole cart": when the server's split
+	(``validate_scoped_coupon_lines``) gave the coupon the whole cart, no line gets F&F
+	next to it and none is owed, so the customer counts as not eligible here (K1).
+	"""
+	eligibility = get_customer_eligibility(doc.get("customer"), posting_date, pos_profile)
+	if eligibility.eligible and _coupon_holds_the_cart(doc):
+		return replace(eligibility, eligible=False)
+	return eligibility
+
+
 def _claims_fnf(row) -> bool:
 	"""The client sent F&F markers on this row (not trusted, only used to decide on a warning)."""
 	return (
@@ -1653,6 +1668,7 @@ def _freeze_paid_invoice(doc, items) -> None:
 	  row. F&F above the capped entitlement is a cap breach: logged, and the
 	  ledger applies ``on_cap_breach_at_submit`` at submit. Less F&F than the
 	  entitlement is kept and logged (``paid_under_discount``).
+	* A coupon that holds the whole cart (``coupon_split``) leaves no entitlement.
 	"""
 	offline = ff_paid.is_offline(doc)
 	# Copies only: a paid invoice keeps its rows; scope comes from Item.
@@ -1669,6 +1685,8 @@ def _freeze_paid_invoice(doc, items) -> None:
 		"conversion_rate": flt(doc.get("conversion_rate")) or 1.0,
 		"company": doc.get("company"),
 	}
+	# A coupon that holds the whole cart leaves the customer owed no F&F (D-R5-05).
+	kwargs["eligibility"] = _invoice_eligibility(doc, posting_date, doc.get("pos_profile"))
 	uncapped = compute_friends_and_family_discounts(ignore_caps=True, **kwargs)
 	capped = compute_friends_and_family_discounts(**kwargs)
 	percentage = flt(uncapped.get("discount_percentage"))
@@ -1897,11 +1915,7 @@ def apply_friends_and_family_on_invoice(doc, method=None):
 	pos_profile = doc.get("pos_profile")
 	# Caps are company currency (ledger base_amount); this invoice may be in another.
 	conversion_rate = flt(doc.get("conversion_rate")) or 1.0
-	eligibility = get_customer_eligibility(doc.get("customer"), posting_date, pos_profile)
-	if eligibility.eligible and _coupon_holds_the_cart(doc):
-		# "Better of the two for the whole cart": the server's split (validate_scoped_coupon_lines)
-		# gave the coupon the whole cart, so no line gets F&F next to it (K1).
-		eligibility = replace(eligibility, eligible=False)
+	eligibility = _invoice_eligibility(doc, posting_date, pos_profile)
 	program = eligibility.program if eligibility.eligible else None
 	b_line_values = []
 	fnf_like = []

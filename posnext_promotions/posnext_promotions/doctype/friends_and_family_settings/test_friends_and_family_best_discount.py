@@ -321,8 +321,11 @@ class TestFriendsAndFamilyBestDiscount(FrappeTestCase):
 		self.assertFalse(result["valid"])
 		self.assertEqual(result["reason"], REASON_BETTER_DISCOUNT_EXISTS)
 		self.assertEqual(result["line_updates"], [])
-		self.assertIn("Friends & Family discount (30%) is better than coupon FFBEST (15%)", result["message_en"])
-		self.assertIn("الكوبون FFBEST", result["message_ar"])
+		# D-R5-07: the cart's note names both sides by money, never "30%" against "15%".
+		self.assertIn("Friends & Family discount (", result["message_en"])
+		self.assertIn("applied instead of coupon FFBEST (", result["message_en"])
+		self.assertNotIn("%", result["message_en"])
+		self.assertIn("القسيمة FFBEST", result["message_ar"])  # ar.csv's word for a coupon (M7)
 		self.assertEqual(result["best_discount"]["lines"][0]["winner"], bd.SOURCE_FRIENDS_AND_FAMILY)
 
 	def test_coupon_40_vs_fnf_30_applies_coupon(self):
@@ -337,7 +340,8 @@ class TestFriendsAndFamilyBestDiscount(FrappeTestCase):
 		decision = result["best_discount"]["lines"][0]
 		self.assertEqual(decision["winner"], bd.SOURCE_COUPON)
 		self.assertEqual(decision["suppressed"], [bd.SOURCE_FRIENDS_AND_FAMILY])
-		self.assertIn("instead of Friends & Family", result["message_en"])
+		self.assertIn("applied instead of the Friends & Family discount", result["message_en"])
+		self.assertNotIn("%", result["message_en"])  # by money (D-R5-07)
 
 	def test_coupon_equal_to_fnf_keeps_fnf(self):
 		line = self._line()
