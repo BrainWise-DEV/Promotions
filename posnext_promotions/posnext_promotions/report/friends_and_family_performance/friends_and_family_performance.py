@@ -36,6 +36,7 @@ import frappe
 from frappe import _
 from frappe.utils import add_days, cint, flt, getdate
 
+from posnext_promotions.promotions import ff_money
 from posnext_promotions.promotions.friends_and_family_caps import FIELD_DISCOUNT_SOURCE, FIELD_FNF_AMOUNT
 
 FNF = "friends_and_family"
@@ -73,7 +74,7 @@ def execute(filters=None):
 	total = _total_row(view, rows, decisions, columns)
 	if total and data:
 		data.append(total)
-	return columns, data, None, chart, get_report_summary(rows, decisions)
+	return columns, data, None, chart, get_report_summary(rows, decisions, filters)
 
 
 def _total_row(view, rows, decisions, columns) -> dict | None:
@@ -382,12 +383,13 @@ def _summary_view(filters, rows, decisions):
 		_int("fnf_won_promotion", _("F&F Won vs Promotion")),
 		_int("promotion_won", _("Promotion Won vs F&F")),
 	]
+	currency = _currency(filters)
 	chart = {
 		"data": {
 			"labels": [d["period"] for d in data],
 			"datasets": [
-				{"name": _("F&F Discount"), "values": [flt(d["discount"], 2) for d in data]},
-				{"name": _("Net Sales"), "values": [flt(d["net"], 2) for d in data]},
+				{"name": _("F&F Discount"), "values": [ff_money.money(d["discount"], currency) for d in data]},
+				{"name": _("Net Sales"), "values": [ff_money.money(d["net"], currency) for d in data]},
 			],
 		},
 		"type": "bar",
@@ -480,7 +482,9 @@ def _items_view(filters, rows, decisions):
 	chart = {
 		"data": {
 			"labels": [d["item_code"] for d in top],
-			"datasets": [{"name": _("F&F Discount"), "values": [flt(d["discount"], 2) for d in top]}],
+			"datasets": [
+				{"name": _("F&F Discount"), "values": [ff_money.money(d["discount"], _currency(filters)) for d in top]}
+			],
 		},
 		"type": "bar",
 		"fieldtype": "Currency",
@@ -564,13 +568,18 @@ def _comparisons_view(filters, rows, decisions):
 	return columns, data, chart
 
 
-def get_report_summary(rows, decisions) -> list[dict]:
+def _currency(filters) -> str | None:
+	"""Amounts are company currency: the filtered company's, else the default company's."""
+	return ff_money.company_currency((filters or {}).get("company")) or ff_money.default_currency()
+
+
+def get_report_summary(rows, decisions, filters=None) -> list[dict]:
 	bucket = _blank()
 	for row in rows:
 		_add(bucket, row)
 	values = _sales_values(bucket)
 	counts = _decision_counts(decisions)
-	currency = frappe.db.get_default("currency")
+	currency = _currency(filters)
 	return [
 		{"label": _("F&F Orders"), "value": values["orders"], "datatype": "Int", "indicator": "Blue"},
 		{"label": _("Returns"), "value": values["returns"], "datatype": "Int", "indicator": "Orange"},

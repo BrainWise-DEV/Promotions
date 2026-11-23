@@ -8,12 +8,14 @@ from __future__ import annotations
 import json
 
 import frappe
-from frappe.utils import cstr
+from frappe import _
+from frappe.utils import cstr, nowdate
 
 from posnext_promotions.promotions.friends_and_family import get_active_program, profile_allows_ff
 from posnext_promotions.promotions.friends_and_family_apply import (
 	apply_friends_and_family_to_items,
 	compute_friends_and_family_discounts,
+	enrich_items_with_catalog,
 )
 from posnext_promotions.promotions.friends_and_family_eligibility import (
 	get_customer_eligibility,
@@ -32,6 +34,32 @@ def _parse_items(items):
 	return list(items or [])
 
 
+def _require_seller(pos_profile: str | None = None) -> None:
+	"""Raise PermissionError unless the user may create a Sales Invoice or is a user of an
+	enabled POS Profile (``pos_profile`` when given)."""
+	if frappe.has_permission("Sales Invoice", "create"):
+		return
+	profile = frappe.qb.DocType("POS Profile")
+	profile_user = frappe.qb.DocType("POS Profile User")
+	query = (
+		frappe.qb.from_(profile_user)
+		.join(profile)
+		.on(profile.name == profile_user.parent)
+		.select(profile_user.name)
+		.where(
+			(profile_user.parenttype == "POS Profile")
+			& (profile_user.user == frappe.session.user)
+			& (profile.disabled == 0)
+		)
+		.limit(1)
+	)
+	if pos_profile:
+		query = query.where(profile.name == pos_profile)
+	if query.run():
+		return
+	frappe.throw(_("Not permitted to read the Friends & Family program"), frappe.PermissionError)
+
+
 @frappe.whitelist()
 def get_friends_and_family_program(posting_date: str | None = None, pos_profile: str | None = None) -> dict:
 	"""The live program for ``posting_date`` (today when omitted).
@@ -40,7 +68,11 @@ def get_friends_and_family_program(posting_date: str | None = None, pos_profile:
 	dates, or has nothing in scope. Clients should re-fetch rather than cache
 	indefinitely so admin changes take effect on the next recalculation.
 	A ``pos_profile`` with **Allow F&F** off always gets ``{"active": False}``.
+
+	Only for users who sell: a POS Profile user, or anyone who may create a
+	Sales Invoice (DocPerm decides which roles).
 	"""
+	_require_seller(pos_profile)
 	program = get_active_program(posting_date) if profile_allows_ff(pos_profile) else None
 	if program is None:
 		return {"active": False}
@@ -136,6 +168,20 @@ def apply_friends_and_family_discount(
 	lines = [frappe._dict(row) if not isinstance(row, frappe._dict) else row for row in parsed]
 
 	from frappe.utils import cint
+
+	from posnext_promotions.api.apply_offers import _compat_doc
+	from posnext_promotions.promotions.friends_and_family_apply import judge_restored, restore_context
+
+	# Ruling 119: the server judges BXGY / Routine itself, as apply_offers and invoice
+	# validate do; a rule the client left on a line blocks only while it is eligible.
+	# Scope fields first: a rule's scope may be an Item Group or Brand. Judged as
+	# restored (Ruling 122): pricing puts a replaced discount back before F&F runs.
+	enrich_items_with_catalog(lines)
+	judge_restored(
+		lines,
+		_compat_doc({"pos_profile": pos_profile, "posting_date": posting_date}, customer),
+		restore_context(customer, posting_date or nowdate(), pos_profile),
+	)
 
 	if cint(mutate):
 		return apply_friends_and_family_to_items(

@@ -1,9 +1,11 @@
 # Copyright (c) 2026, BrainWise and contributors
 """Coupon eligibility/discount helpers. Independent of the POS Coupon DocType class."""
 
+import math
+
 import frappe
 from frappe import _
-from frappe.utils import cint, flt, getdate, today
+from frappe.utils import cint, cstr, flt, getdate, today
 
 # What a coupon does on a line that already carries a discount (promotion or manual)
 PROMOTION_CONFLICT_SKIP = "Skip the line"
@@ -18,11 +20,52 @@ def get_promotion_conflict_mode(coupon) -> str:
 	return mode if mode in PROMOTION_CONFLICT_OPTIONS else PROMOTION_CONFLICT_SKIP
 
 
-def _line_existing_discount(item) -> float:
-	"""Discount a line already carries before the coupon (the payload sends pre-coupon values)."""
+def max_discount_allowed(pos_profile) -> float:
+	"""POS Settings **Max Discount Percentage Allowed** of ``pos_profile`` (0 = no limit).
+
+	An "Add on top" coupon never takes a line past it: the promotion plus the coupon
+	stay within this share of the line's list price.
+	"""
+	if not pos_profile or not frappe.db.table_exists("POS Settings"):
+		return 0.0
+	if not frappe.get_meta("POS Settings").has_field("max_discount_allowed"):
+		return 0.0
+	return flt(frappe.db.get_value("POS Settings", {"pos_profile": pos_profile}, "max_discount_allowed"))
+
+
+def with_item_master_scope(items) -> list:
+	"""Copies of ``items`` whose ``brand`` / ``item_group`` come from the Item master.
+
+	Coupon scope and brand exclusions never trust the client line. These are the
+	Item's own values with no template fallback (that fallback is F&F scope only);
+	an unknown item code gets none.
+	"""
+	from posnext_promotions.promotions import ff_scope
+
+	rows = [frappe._dict(row) for row in items or []]
+	catalog = ff_scope.item_scope_fields(row.get("item_code") for row in rows)
+	for row in rows:
+		master = catalog.get(cstr(row.get("item_code"))) or {}
+		row.brand = master.get("brand")
+		row.item_group = master.get("item_group")
+	return rows
+
+
+def _line_existing_discount(item, amount_basis: str = "line") -> float:
+	"""Discount a line already carries before the coupon (the payload sends pre-coupon values).
+
+	``amount_basis="unit"`` is a saved invoice row (Ruling 96): its ``discount_amount`` is
+	per unit and the client wrote it, so the line is valued from what it charges against
+	the server-set ``price_list_rate`` (:func:`best_discount.line_discount_value`), never
+	from that field. Cart payloads (``"line"``) keep their line totals.
+	"""
 	if cint(item.get("is_free_item") or 0):
 		return 0.0
 	base = _item_base_amount(item)
+	if amount_basis == "unit":
+		from posnext_promotions.promotions import best_discount as bd
+
+		return min(max(bd.line_discount_value(item, bd.AMOUNT_BASIS_UNIT), 0.0), base)
 	amount = flt(item.get("discount_amount") or 0)
 	if amount <= 0 and flt(item.get("discount_percentage") or 0) > 0:
 		amount = base * flt(item.get("discount_percentage")) / 100.0
@@ -124,7 +167,7 @@ def _get_customer_coupon_usage_count(customer, coupon_code):
 	return used_count
 
 
-def get_coupon_eligible_items(coupon, items):
+def get_coupon_eligible_items(coupon, items, amount_basis: str = "line"):
 	"""
 	Return cart items that pass the Promotion Interaction Matrix for coupons.
 
@@ -155,7 +198,7 @@ def get_coupon_eligible_items(coupon, items):
 	)
 
 	mode = get_promotion_conflict_mode(coupon)
-	prepared_items = [frappe._dict(row) for row in items]
+	prepared_items = with_item_master_scope(items)
 	all_rule_names: list[str] = []
 	for item in prepared_items:
 		all_rule_names.extend(_parse_pricing_rules(item.get("pricing_rules")))
@@ -170,7 +213,7 @@ def get_coupon_eligible_items(coupon, items):
 		item = raw if isinstance(raw, dict) else dict(raw)
 		if cint(item.get("is_free_item") or 0):
 			continue
-		existing_discount = _line_existing_discount(item)
+		existing_discount = _line_existing_discount(item, amount_basis)
 		if mode != PROMOTION_CONFLICT_SKIP:
 			# The coupon's setting, not the matrix, decides lines that already carry a discount
 			allowed = (
@@ -306,7 +349,7 @@ def _coupon_rejection_message(coupon, items) -> str:
 	excluded_brands = _get_excluded_brands(coupon)
 	reasons: list[str] = []
 
-	for item in items or []:
+	for item in with_item_master_scope(items):
 		if cint(item.get("is_free_item") or 0):
 			continue
 		code = item.get("item_code") or _("Item")
@@ -336,7 +379,63 @@ def _coupon_rejection_message(coupon, items) -> str:
 	return _("No eligible items for this coupon")
 
 
-def apply_coupon_to_items(coupon, items):
+def _whole_cents_per_unit(lines, parts, limits) -> tuple[list[float], float]:
+	"""Coupon shares a saved row can hold as they are; and the most the cut can lose.
+
+	An invoice row keeps its discount per unit at the currency's precision, and the POS
+	cuts each fixed coupon line down to that (``couponLines.fixedCouponLineDiscount``), so
+	40 split 22.2222 + 17.7778 was sold as 22.22 + 17.77 (D-R5-06). Each share is cut
+	the same way here, and what the cut lost goes, whole, to one line: the one that lost
+	the most (to a hundredth of a cent; the lowest line on a tie) among those whose units
+	split it evenly and that have room for it (``limits``). When no line can take all of
+	it, it goes in whole units a unit, in the same order, as far as it goes.
+
+	The shares never add up to more than ``parts``. They add up to all of it when some
+	line's quantity divides what the cut lost; otherwise up to that remainder is not
+	given (3 x 50 cannot hold 40: 13.33 x 3 = 39.99), as the POS sold it before.
+
+	The second value is the most the cut can lose over these lines, a smallest unit per
+	unit sold. Which line gets the lost money, and how much is lost, depend on sub-cent
+	figures the cart and the invoice see differently (the cart's promotion is to the
+	cent, the server's exact), so the invoice check allows any one line that much more
+	and holds the lines together to the split (review I1).
+	"""
+	from posnext_promotions.promotions import ff_money
+
+	scale = 10 ** ff_money.precision_for(ff_money.current_currency() or ff_money.default_currency())
+	qtys = [flt(item.get("qty") or item.get("quantity") or 0) or 1 for item in lines]
+	units = [math.floor(max(part, 0) / qty * scale + 1e-6) for part, qty in zip(parts, qtys, strict=True)]
+	left = math.floor(sum(parts) * scale - sum(u * q for u, q in zip(units, qtys, strict=True)) + 1e-6)
+	order = sorted(range(len(parts)), key=lambda k: (-round(parts[k] * scale - units[k] * qtys[k], 2), k))
+
+	def room(k):
+		"""Whole units a unit line ``k`` may still take."""
+		return math.floor((flt(limits[k]) * scale - units[k] * qtys[k]) / qtys[k] + 1e-6)
+
+	def fits(k, amount):
+		per_unit = amount / qtys[k]
+		return abs(per_unit - round(per_unit)) < 1e-6 and round(per_unit) <= room(k)
+
+	whole = next((k for k in order if left > 0 and fits(k, left)), None)
+	if whole is not None:
+		units[whole] += round(left / qtys[whole])
+	else:
+		for k in order:
+			step = min(math.floor(left / qtys[k] + 1e-6), room(k))
+			if step > 0:
+				units[k] += step
+				left -= step * qtys[k]
+	return [flt(u * q / scale, 6) for u, q in zip(units, qtys, strict=True)], flt(sum(qtys) / scale, 6)
+
+
+def apply_coupon_to_items(
+	coupon,
+	items,
+	amount_basis: str = "line",
+	max_discount_pct: float = 0,
+	check_minimum: bool = True,
+	whole_cents: bool = True,
+):
 	"""
 	Calculate per-line coupon discounts for matrix-eligible items only.
 
@@ -344,9 +443,26 @@ def apply_coupon_to_items(coupon, items):
 	reach this path (see get_coupon_eligible_items). Other promotional types
 	remain eligible.
 
+	``amount_basis``: ``"line"`` for cart payloads, ``"unit"`` for saved invoice rows
+	(see :func:`_line_existing_discount`).
+
+	``max_discount_pct`` (POS Settings Max Discount, :func:`max_discount_allowed`; 0 = no
+	limit): an "Add on top" coupon tops a discounted line up to that share of its list
+	price at most, and leaves a line already there alone. A fixed or capped coupon is
+	then spread by what each line may still take (its headroom under the limit, not its
+	room after the promotion), so a promoted line near the limit takes a small share and
+	the other lines take the rest.
+
+	``check_minimum``: False re-spreads a coupon whose minimum was already met on the
+	whole eligible cart over some of its lines (F&F "coupon fully used", K1).
+
+	``whole_cents``: a fixed or capped coupon's line shares are whole cents a unit, as a
+	row holds them (:func:`_whole_cents_per_unit`). False keeps the exact split, for a
+	coupon valued as an invoice header (``best_discount_coupon.coupon_value_on``).
+
 	Returns dict with valid, message, eligible_item_codes, line_updates, total_discount.
 	"""
-	eligible = get_coupon_eligible_items(coupon, items)
+	eligible = get_coupon_eligible_items(coupon, items, amount_basis)
 	if not eligible:
 		return {
 			"valid": False,
@@ -358,7 +474,7 @@ def apply_coupon_to_items(coupon, items):
 
 	eligible_subtotal = sum(flt(i["_base_amount"]) for i in eligible)
 
-	if coupon.min_amount and flt(eligible_subtotal) < flt(coupon.min_amount):
+	if check_minimum and coupon.min_amount and flt(eligible_subtotal) < flt(coupon.min_amount):
 		return {
 			"valid": False,
 			"message": _("Minimum eligible amount of {0} is required").format(
@@ -378,11 +494,18 @@ def apply_coupon_to_items(coupon, items):
 		existing = flt(item["_existing_discount"]) if mode == PROMOTION_CONFLICT_ADD else 0.0
 		return max(flt(item["_base_amount"]) - existing, 0.0)
 
+	def most(item):
+		"""Most the coupon may add to the line: up to the POS max discount when stacking."""
+		existing = flt(item["_existing_discount"]) if mode == PROMOTION_CONFLICT_ADD else 0.0
+		if existing <= 0 or flt(max_discount_pct) <= 0:
+			return room(item)
+		return max(min(room(item), flt(item["_base_amount"]) * flt(max_discount_pct) / 100.0 - existing), 0.0)
+
 	def coupon_parts(lines):
 		"""Coupon share per line before the cap: % of its room, or a fixed amount split by room."""
 		if is_percentage:
-			return [room(item) * pct / 100.0 for item in lines]
-		rooms = [room(item) for item in lines]
+			return [min(room(item) * pct / 100.0, most(item)) for item in lines]
+		rooms = [most(item) for item in lines]
 		total = flt(coupon.discount_amount)
 		if coupon.max_amount and total > flt(coupon.max_amount):
 			total = flt(coupon.max_amount)
@@ -397,9 +520,10 @@ def apply_coupon_to_items(coupon, items):
 	def better_than_promotion(item, part):
 		return flt(item["_existing_discount"]) <= 0 or part > flt(item["_existing_discount"])
 
-	chosen = list(eligible)
+	# A stacked line already at the POS max discount takes nothing more.
+	chosen = [item for item in eligible if flt(most(item), 6) > 0]
+	kept = [item for item in eligible if flt(most(item), 6) <= 0]
 	parts = coupon_parts(chosen)
-	kept = []
 	if mode == PROMOTION_CONFLICT_BETTER:
 		kept = [item for item, part in zip(chosen, parts) if not better_than_promotion(item, part)]
 		chosen = [item for item in chosen if item not in kept]
@@ -415,11 +539,37 @@ def apply_coupon_to_items(coupon, items):
 			parts = [part for item, part in zip(chosen, parts) if item not in lost]
 			chosen = [item for item in chosen if item not in lost]
 
+	slack = 0.0
+	exact = list(parts)  # before the cut: what the invoice holds the coupon's rows to (R1-M1)
+	if whole_cents and chosen and not (is_percentage and not coupon.max_amount):
+		# A fixed or capped coupon: whole cents a unit, up to the coupon (D-R5-06). A
+		# capped-% line takes at most the coupon's % of it: the POS clamps it there too.
+		limits = [
+			min(most(item), room(item) * pct / 100.0) if is_percentage else most(item) for item in chosen
+		]
+		parts, slack = _whole_cents_per_unit(chosen, parts, limits)
+	elif whole_cents and chosen and mode == PROMOTION_CONFLICT_BETTER:
+		# An uncapped % stays a % on a plain line; on a line it takes from a promotion ("Better
+		# of the two") it becomes a fixed amount, cut to whole cents a unit as the row holds it
+		# (review M3). A stacked ("Add on top") line is not cut: the POS prices it at the
+		# server's unit rate, and its room depends on the promotion, which the cart holds to
+		# the cent and the server exact, so the two cuts could differ by a cent a unit (R1-I1).
+		parts = [
+			_whole_cents_per_unit([item], [part], [part])[0][0]
+			if flt(item["_existing_discount"]) > 0
+			else part
+			for item, part in zip(chosen, parts, strict=True)
+		]
+
 	kept_codes = [item.get("item_code") for item in kept]
 	if not chosen:
 		return {
 			"valid": False,
-			"message": _("The promotion already gives more on these items")
+			"message": (
+				_("These items already have the maximum discount allowed")
+				if mode == PROMOTION_CONFLICT_ADD
+				else _("The promotion already gives more on these items")
+			)
 			if kept
 			else _coupon_rejection_message(coupon, items),
 			"eligible_item_codes": [],
@@ -429,7 +579,7 @@ def apply_coupon_to_items(coupon, items):
 		}
 
 	line_updates = []
-	for item, part in zip(chosen, parts):
+	for item, part, exact_part in zip(chosen, parts, exact, strict=True):
 		base = flt(item["_base_amount"])
 		qty = flt(item.get("qty") or item.get("quantity") or 0) or 1
 		existing = flt(item["_existing_discount"])
@@ -452,7 +602,13 @@ def apply_coupon_to_items(coupon, items):
 			"amount": flt(new_rate * qty, 6),
 			"coupon_code": coupon.coupon_code,
 			"coupon_only_discount": flt(part, 6),
+			# The line's own discount before the coupon (a "Better of the two" order coupon tops it up).
+			"existing_discount": flt(existing, 6),
 			"pre_coupon_discount_fraction": flt(existing / base, 6) if stacked and base else 0,
+			# The most the whole-cents cut can lose over this split's lines (review I1).
+			"whole_cents_slack": slack,
+			# The share before that cut (review R1-M1).
+			"coupon_exact_share": flt(exact_part, 6),
 		}
 		if stacked:
 			update["stacked"] = True
@@ -471,16 +627,51 @@ def apply_coupon_to_items(coupon, items):
 	}
 
 
-def apply_coupon_discount(coupon, cart_total, net_total=None, items=None, tax_amount=0):
-	"""Calculate discount amount based on coupon configuration (legacy cart-level helper)."""
+def exclusive_tax_rate(taxes=None, pos_profile=None) -> float:
+	"""Fraction the exclusive "On Net Total" tax rows add on top of the line amounts.
+
+	Taxes with ``included_in_print_rate`` are already inside the line amounts, so they
+	add nothing to a "Grand Total" coupon's base. ``taxes`` are the document's (or the
+	cart's) tax rows; ``None`` (a cart that sent none) reads the POS Profile's tax
+	template. Other charge types (Actual, On Previous Row …) are not added.
+	"""
+	if taxes is None:
+		template = frappe.db.get_value("POS Profile", pos_profile, "taxes_and_charges") if pos_profile else None
+		taxes = (
+			frappe.get_all(
+				"Sales Taxes and Charges",
+				filters={"parent": template, "parenttype": "Sales Taxes and Charges Template"},
+				fields=["charge_type", "rate", "included_in_print_rate"],
+			)
+			if template
+			else []
+		)
+	return (
+		sum(
+			flt(row.get("rate"))
+			for row in taxes or []
+			if row.get("charge_type") == "On Net Total" and not cint(row.get("included_in_print_rate"))
+		)
+		/ 100.0
+	)
+
+
+def apply_coupon_discount(coupon, cart_total, net_total=None, items=None, tax_amount=0, tax_rate=0):
+	"""Calculate discount amount based on coupon configuration (legacy cart-level helper).
+
+	With ``items`` the base is the coupon's in-scope, matrix-eligible lines (same scope
+	rule as :func:`apply_coupon_to_items`); a "Grand Total" coupon adds ``tax_rate``
+	(:func:`exclusive_tax_rate`) of that base, plus any ``tax_amount`` passed in.
+	"""
 	from posnext_promotions.api.promotion_exclusions import (
 		PROMOTION_TARGET_COUPON,
 		get_eligible_subtotal,
 		get_excluded_subtotal,
+		get_line_net_amount,
 		mark_item_discount_flags,
 	)
 
-	prepared_items = [frappe._dict(row) for row in (items or [])]
+	prepared_items = with_item_master_scope(items)
 	excluded_brands = _get_excluded_brands(coupon)
 	if prepared_items:
 		mark_item_discount_flags(prepared_items)
@@ -493,13 +684,17 @@ def apply_coupon_discount(coupon, cart_total, net_total=None, items=None, tax_am
 			"promotion_target": PROMOTION_TARGET_COUPON,
 			"excluded_brands": excluded_brands,
 		}
+		in_scope = [item for item in prepared_items if _item_matches_scope(coupon, item)]
+		out_of_scope = sum(
+			get_line_net_amount(item)
+			for item in prepared_items
+			if not cint(item.get("is_free_item")) and not _item_matches_scope(coupon, item)
+		)
+		eligible_base = get_eligible_subtotal(in_scope, **subtotal_kwargs)
+		excluded_base = get_excluded_subtotal(in_scope, **subtotal_kwargs) + out_of_scope
 		if coupon.apply_on == "Grand Total":
-			eligible_base = get_eligible_subtotal(prepared_items, **subtotal_kwargs)
+			eligible_base += eligible_base * flt(tax_rate)
 			eligible_base += flt(tax_amount) if flt(tax_amount) > 0 else 0
-			excluded_base = get_excluded_subtotal(prepared_items, **subtotal_kwargs)
-		else:
-			eligible_base = get_eligible_subtotal(prepared_items, **subtotal_kwargs)
-			excluded_base = get_excluded_subtotal(prepared_items, **subtotal_kwargs)
 		base_amount = eligible_base
 	else:
 		base_amount = cart_total if coupon.apply_on == "Grand Total" else (net_total or cart_total)

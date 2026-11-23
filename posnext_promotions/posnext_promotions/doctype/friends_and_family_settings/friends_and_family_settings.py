@@ -20,23 +20,40 @@ class FriendsandFamilySettings(Document):
 		self._validate_eligibility()
 		self._validate_caps()
 		self._validate_approved_domains()
+		self._validate_snapshot_hours()
 
 	def on_update(self):
 		# get_cached_doc is cleared by Document.save; document for callers that
 		# the next apply_offers / apply_friends_and_family_discount call reloads
-		# inclusions and exclusions without a restart.
+		# inclusions and exclusions without a restart. ff_config reads that document.
 		frappe.clear_cache(doctype=friends_and_family.SETTINGS_DOCTYPE)
 		# PN-131: audit row with the field-by-field diff (Version keeps the full history).
 		log_settings_change(self)
 
 	def _validate_percentage(self):
 		percentage = self.discount_percentage
+		if not cint(self.enabled):
+			# The kill switch always saves: a blank rate is stored as 0 (the field is mandatory).
+			if percentage in (None, ""):
+				self.discount_percentage = 0
+			return
 		if percentage is None:
 			frappe.throw(_("Discount Percentage is required"))
 		if percentage < 0 or percentage > 100:
 			frappe.throw(_("Discount Percentage must be between 0 and 100"))
+		# Below 100: a 100 % line is a free item, and a free good must come from an offer.
+		# Only a change to 100 is refused, so a site already at 100 can still save Settings.
+		if percentage >= 100 and (self.is_new() or self.has_value_changed("discount_percentage")):
+			frappe.throw(_("Discount Percentage must be below 100"))
 		if cint(self.enabled) and percentage <= 0:
 			frappe.throw(_("Discount Percentage must be greater than 0 while the program is enabled"))
+
+	def _validate_snapshot_hours(self):
+		# An Int field reads blank as 0, so below 1 means unset: store the DocType
+		# default and the saved value is always >= 1.
+		field = "replaced_discount_snapshot_hours"
+		if cint(self.get(field)) < 1:
+			self.set(field, cint(self.meta.get_field(field).default))
 
 	def _validate_dates(self):
 		if self.start_date and self.end_date and getdate(self.start_date) > getdate(self.end_date):

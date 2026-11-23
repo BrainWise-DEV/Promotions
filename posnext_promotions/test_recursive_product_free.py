@@ -250,7 +250,10 @@ class TestRecursiveSameItemFree(FrappeTestCase):
 		self.assertEqual(resp.get("free_items"), [])
 
 	def test_item_group_recursive_other_item_aggregates(self):
-		"""1+1 in group with other free item → 1 free gift (additional), not per-SKU."""
+		"""1+1 in group with other free item, selected: ERPNext's own selection does not pick
+		it (min 2 per line), and the selected-offers gate sums only GWP / Gift Pool, as
+		pos_next's free-row check does (Ruling 154, m-1 a): no gift the server would refuse.
+		2+2 meets the minimum on a line, so the gift is given."""
 		item_group = _resolve_item_group()
 		frappe.db.set_value("Item", ITEM_A, "item_group", item_group)
 		frappe.db.set_value("Item", ITEM_B, "item_group", item_group)
@@ -280,10 +283,16 @@ class TestRecursiveSameItemFree(FrappeTestCase):
 			),
 			selected_offers=json.dumps([rule]),
 		)
+		self.assertEqual(resp.get("free_items") or [], [])
+		resp = apply_offers(
+			invoice_data=json.dumps(
+				_cart_payload(ctx, [_line(ctx, ITEM_A, qty=2), _line(ctx, ITEM_B, qty=2)])
+			),
+			selected_offers=json.dumps([rule]),
+		)
 		free_items = resp.get("free_items") or []
-		self.assertEqual(len(free_items), 1)
-		self.assertEqual(free_items[0].get("item_code"), ITEM_C)
-		self.assertEqual(flt(free_items[0].get("qty")), 1)
+		self.assertTrue(free_items, resp)
+		self.assertEqual({row.get("item_code") for row in free_items}, {ITEM_C})
 
 	def test_item_code_recursive_other_item_per_sku(self):
 		"""Multi Item Code: each SKU earns its own free gift (3+3 → 2, not 3)."""

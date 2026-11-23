@@ -5,6 +5,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import frappe
+
 from posnext_promotions.api.coupon_engine import (
 	_get_customer_coupon_usage_count,
 	_get_per_customer_use_limit,
@@ -36,6 +38,16 @@ def _coupon(**kwargs):
 
 
 class TestPOSCoupon(unittest.TestCase):
+	def setUp(self):
+		# Unit tests: each line's brand / item_group stand in for its Item master
+		# (the coupon engine reads them from Item; covered in test_ff_coupon_integrity).
+		patcher = patch(
+			"posnext_promotions.api.coupon_engine.with_item_master_scope",
+			side_effect=lambda items: [frappe._dict(row) for row in items or []],
+		)
+		patcher.start()
+		self.addCleanup(patcher.stop)
+
 	@patch("posnext_promotions.api.coupon_engine.frappe.get_meta")
 	@patch("posnext_promotions.api.coupon_engine.frappe.db")
 	def test_one_use_coupon_counts_sales_invoice_and_pos_invoice(self, mock_db, mock_get_meta):

@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      pos_next_ref:
+        description: pos_next branch, tag or commit to test against
+        default: develop
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: F&F and promotions tests
+    # Pinned like pos_next: newer runners ship a mariadb-client that cannot talk to the 10.6 service.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    env:
+      # Dispatch input, else repo variable POS_NEXT_REF, else the paired F&F branch
+      # (set back to develop when the three F&F PRs merge).
+      POS_NEXT_REF: ${{ inputs.pos_next_ref || vars.POS_NEXT_REF || 'feature/ff-generic-redesign' }}
+
+    services:
+      mariadb:
+        image: mariadb:10.6
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mariadb-admin ping"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+      redis:
+        image: redis:6.2
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+      - name: Check out this app
+        uses: actions/checkout@v4.2.2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5.3.0
+        with:
+          python-version: "3.10"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4.1.0
+        with:
+          node-version: 22
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mariadb-client libmariadb-dev pkg-config
+
+      - name: Install bench
+        run: pip install frappe-bench
+
+      - name: Create the bench
+        run: |
+          bench init --skip-redis-config-generation --skip-assets \
+            --frappe-branch version-15 --python "$(which python)" ~/frappe-bench
+          cd ~/frappe-bench
+          # A service container cannot take server args: set utf8mb4 globally (as pos_next's CI does).
+          mariadb --host 127.0.0.1 --port 3306 -u root -proot -e "SET GLOBAL character_set_server = 'utf8mb4'"
+          mariadb --host 127.0.0.1 --port 3306 -u root -proot -e "SET GLOBAL collation_server = 'utf8mb4_unicode_ci'"
+          bench set-config -g db_host 127.0.0.1
+          bench set-config -g redis_cache redis://127.0.0.1:6379
+          bench set-config -g redis_queue redis://127.0.0.1:6379
+          bench set-config -g redis_socketio redis://127.0.0.1:6379
+
+      - name: Get the apps
+        run: |
+          cd ~/frappe-bench
+          bench get-app erpnext --branch version-15 --skip-assets https://github.com/frappe/erpnext
+          bench get-app pos_next --branch "$POS_NEXT_REF" --skip-assets https://github.com/BrainWise-DEV/POSNext
+          bench get-app posnext_promotions --skip-assets "$GITHUB_WORKSPACE"
+          bench setup requirements --dev
+          env/bin/python -m pip install 'setuptools>=71,<82'
+
+      - name: Create the site and install the apps
+        run: |
+          cd ~/frappe-bench
+          bench new-site test_site --db-root-password root --admin-password admin --mariadb-user-host-login-scope='%'
+          bench --site test_site install-app erpnext pos_next posnext_promotions
+
+      # Twice: the first run exercises the rollout gate and the patches, the second proves they are idempotent.
+      - name: Migrate (first run)
+        run: cd ~/frappe-bench && bench --site test_site migrate
+
+      - name: Migrate (second run, idempotency)
+        run: cd ~/frappe-bench && bench --site test_site migrate
+
+      # `bench execute` skips the before_tests hook that `bench run-tests` runs: it creates the
+      # Company, Fiscal Year, selling Price List and groups the tests need.
+      - name: Prepare ERPNext test data
+        run: cd ~/frappe-bench && bench --site test_site execute erpnext.setup.utils.before_tests
+
+      - name: Run the tests
+        run: |
+          cd ~/frappe-bench
+          # Every test_*.py in the app, so a new test module cannot be left out of CI.
+          MODULES=$(cd apps/posnext_promotions && find posnext_promotions -name 'test_*.py' | sort \
+            | sed -e 's/\.py$//' -e 's#/#.#g' | python -c 'import json, sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')
+          echo "modules: $MODULES"
+          bench --site test_site execute posnext_promotions.dev_tests.run_ci \
+            --kwargs "{'modules': $MODULES}"

@@ -7,31 +7,55 @@ client (or an offline invoice synced later) from tagging lines the coupon does
 not cover, so the invoice is checked here before it is saved.
 """
 
+import json
+
 import frappe
 from frappe import _
+from frappe.query_builder.functions import Upper
 from frappe.utils import cint, flt
 
-from posnext_promotions.api.coupon_engine import (
-	PROMOTION_CONFLICT_ADD,
-	_item_matches_scope,
-	get_promotion_conflict_mode,
-)
+from posnext_promotions.api.coupon_engine import _item_matches_scope, with_item_master_scope
 
 SCOPED = ("Item Code", "Item Group", "Brand")
 # Currency rounding on the client can leave a line a few cents above its allocation.
 TOLERANCE = 0.05
-# Per-line currency rounding allowance for the coupon share (amounts, not percent).
-AMOUNT_TOLERANCE = 0.01
+
+
+# Error Log title of a coupon check an offline sync keeps instead of refusing (G5 review I-1).
+OFFLINE_KEPT_LOG_TITLE = "POS Coupon check kept on offline sync"
 
 
 def validate_scoped_coupon_lines(doc, method=None):
+	"""Each tagged line is checked against its coupon; only the coupon's own share of a
+	line's discount (``coupon_share``) counts against the coupon's limits (G5).
+
+	Online a coupon over its limit (its % or its cap / fixed amount) refuses the save. On
+	an offline sync (the server-set ``flags.pos_offline_sync``, never a client field) the
+	sale already happened and the customer has left, and the server may no longer see the
+	promotion under a stacked line: the limit is not enforced, the conservative share is
+	kept and each breach is written to an Error Log (``OFFLINE_KEPT_LOG_TITLE``) with the
+	coupon, the row, the share, the promotion under it and the limit, as pos_next keeps and
+	logs an offline sale's unexplained discount (G5 review I-1). The coupon's identity and
+	scope (it exists, is enabled, is the invoice's, covers the item) stay strict on every
+	route (D-18).
+	"""
+	from posnext_promotions.overrides.coupon_share import set_coupon_shares
+	from posnext_promotions.overrides.coupon_split import UNDER_APPLIED_FLAG
+
+	flags = getattr(doc, "flags", None)
+	if flags is not None:
+		flags[UNDER_APPLIED_FLAG] = None  # this validate's finding only (R1-M3)
 	tagged = [
 		row
 		for row in doc.get("items") or []
 		if row.get("posnext_coupon_code") and not cint(row.get("is_free_item"))
 	]
 	if not tagged:
+		set_coupon_shares(doc, [], {})
 		return
+
+	refuse = _refuser(doc)
+	_restore_offline_header_coupon(doc, tagged)
 
 	coupons = {}
 	for code in {row.posnext_coupon_code.upper() for row in tagged}:
@@ -39,9 +63,13 @@ def validate_scoped_coupon_lines(doc, method=None):
 		if not name:
 			frappe.throw(_("POS Coupon {0} does not exist").format(code))
 		coupons[code] = frappe.get_cached_doc("POS Coupon", name)
+	shares = set_coupon_shares(doc, tagged, coupons)
 
 	spent = {code: 0.0 for code in coupons}
-	for row in tagged:
+	rows_of = {code: [] for code in coupons}
+	# Scope is judged on the Item master's brand / group, never the row's (one query).
+	scope_lines = with_item_master_scope({"item_code": row.item_code} for row in tagged)
+	for row, scope_line in zip(tagged, scope_lines, strict=True):
 		code = row.posnext_coupon_code.upper()
 		coupon = coupons[code]
 		if cint(coupon.get("disabled")):
@@ -51,34 +79,36 @@ def validate_scoped_coupon_lines(doc, method=None):
 
 		scope = coupon.get("apply_scope") or "All Eligible Items"
 		if scope in SCOPED:
-			item = {
-				"item_code": row.item_code,
-				"brand": row.get("brand")
-				or frappe.db.get_value("Item", row.item_code, "brand"),
-				"item_group": row.get("item_group")
-				or frappe.db.get_value("Item", row.item_code, "item_group"),
-			}
-			if not _item_matches_scope(coupon, item):
+			if not _item_matches_scope(coupon, scope_line):
 				frappe.throw(
 					_("Row {0}: item {1} is not covered by POS Coupon {2}").format(row.idx, row.item_code, code)
 				)
 
-		share, room = coupon_share(row, coupon)
+		share, promotion = shares.get(id(row), (flt(row.discount_amount), 0.0))
+		details = {"coupon": code, "row": row.idx, "share": share, "promotion": promotion}
 		if coupon.discount_type == "Percentage":
-			pct = flt(coupon.discount_percentage)
-			if room > 0:
-				# Only the coupon's own share counts; a promotion under it is not the coupon's.
-				over = share > room * pct / 100.0 + max(room * TOLERANCE / 100.0, AMOUNT_TOLERANCE)
-				shown = flt(share * 100.0 / room, 2)
-			else:
-				# No price on the row to split the discount: check its percentage as before.
-				shown = flt(row.discount_percentage)
-				over = shown > pct + TOLERANCE
-			if over:
-				frappe.throw(
-					_("Row {0}: discount {1}% exceeds POS Coupon {2} ({3}%)").format(row.idx, shown, code, pct)
+			# A stacked line: the coupon's % of what the promotion leaves.
+			percentage = (
+				flt(share / (flt(row.price_list_rate) - promotion) * 100, 2)
+				if promotion > 0 and flt(row.price_list_rate) > promotion
+				else flt(row.discount_percentage)
+			)
+			# A row holds its rate to the cent: on a stacked line that moves the share by up to
+			# half a cent a unit, a visible % of a cheap line (0.08% of 7.77 under 33.33%).
+			room = flt(row.price_list_rate) - promotion if promotion > 0 else 0.0
+			rounding = 50.0 / 10 ** _row_precision(row) / room if room > 0 else 0.0
+			if percentage > flt(coupon.discount_percentage) + TOLERANCE + rounding:
+				refuse(
+					_("Row {0}: discount {1}% exceeds POS Coupon {2} ({3}%)").format(
+						row.idx, percentage, code, flt(coupon.discount_percentage)
+					),
+					**details,
+					limit=f"{flt(coupon.discount_percentage)}%",
 				)
-		spent[code] += share
+		spent[code] += share * flt(row.qty)
+		rows_of[code].append(
+			{"row": row.idx, "item": row.item_code, "qty": flt(row.qty), "share": share, "promotion": promotion}
+		)
 
 	for code, total in spent.items():
 		coupon = coupons[code]
@@ -87,76 +117,78 @@ def validate_scoped_coupon_lines(doc, method=None):
 			cap = min(cap, flt(coupon.discount_amount)) if cap else flt(coupon.discount_amount)
 		# Percentage coupons without a cap are priced as a percentage, not an amount.
 		if cap and total > cap + TOLERANCE:
-			frappe.throw(_("POS Coupon {0} discount {1} exceeds its limit of {2}").format(code, total, cap))
+			refuse(
+				_("POS Coupon {0} discount {1} exceeds its limit of {2}").format(code, total, cap),
+				coupon=code,
+				rows=rows_of[code],
+				limit=cap,
+			)
+
+	# Each row at most its share of the server's own split (K1 review I-2).
+	from posnext_promotions.overrides.coupon_split import check_coupon_split
+
+	check_coupon_split(doc, tagged, coupons, shares, refuse)
 
 
-def _line_discount(row):
-	"""(line value before any discount, whole line discount) from the saved row fields.
+def _row_precision(row) -> int:
+	return row.precision("discount_amount") if callable(getattr(row, "precision", None)) else 2
 
-	``discount_amount`` on a Sales Invoice Item is per unit; ERPNext recomputes it as
-	``price_list_rate - rate``. Returns base 0 when the row has no price to measure against.
+
+def _refuser(doc):
+	"""``refuse(message, **details)`` for a coupon over its limit: throws online; on an
+	offline sync logs and keeps."""
+	from posnext_promotions.promotions.ff_paid import OFFLINE_SYNC_FLAG
+
+	flags = getattr(doc, "flags", None) or {}
+	if not flags.get(OFFLINE_SYNC_FLAG):
+
+		def refuse(message, **details):
+			frappe.throw(message)
+
+		return refuse
+
+	reference = doc.get("name") or doc.get("offline_id") or "new"
+
+	def keep(message, **details):
+		frappe.log_error(
+			title=OFFLINE_KEPT_LOG_TITLE,
+			message=f"Invoice {reference}: {message}\n{json.dumps(details, default=str, sort_keys=True)}",
+		)
+
+	return keep
+
+
+def _restore_offline_header_coupon(doc, tagged) -> None:
+	"""An offline sale being synced with tagged lines but no header coupon takes that coupon (D-18).
+
+	The POS offline checkout queues the sale without its header ``coupon_code``
+	while the lines keep ``posnext_coupon_code``. Restoring the header (only when
+	every tagged line names the same existing coupon) lets the coupon be counted
+	on submit, where POS Settings ``offline_coupon_overshoot`` decides an over-limit
+	sale: "Allow and log" keeps and logs it, "Reject" refuses it. Online sales and
+	mixed codes are left to the checks below.
+
+	``flags.pos_offline_sync`` only means the caller sent an ``offline_id``; it is
+	not proof the sale happened offline. The restore is safe on that basis alone
+	because it grants nothing a header ``coupon_code`` would not (the coupon is
+	still checked per line here and re-checked and counted on submit).
 	"""
-	qty = flt(row.get("qty"))
-	price = flt(row.get("price_list_rate"))
-	unit_discount = flt(row.get("discount_amount"))
-	if price > 0 and row.get("rate") is not None and flt(row.get("rate")) < price:
-		unit_discount = max(unit_discount, price - flt(row.get("rate")))
-	if price > 0:
-		unit_discount = max(unit_discount, price * flt(row.get("discount_percentage")) / 100.0)
-		return price * qty, min(unit_discount, price) * qty
-	return 0.0, unit_discount * qty
-
-
-def coupon_share(row, coupon):
-	"""(coupon's own discount on the line, line value the coupon was taken from).
-
-	Only "Add on top" leaves a promotion under the coupon (the coupon takes its % of
-	what the promotion left, see ``coupon_engine.apply_coupon_to_items``). "Skip the
-	line" never prices discounted lines and "Better of the two" replaces the promotion,
-	so on those lines the whole discount is the coupon's.
-
-	The share is ``posnext_coupon_discount`` when the POS stored it. When that field is
-	empty, the fallback subtracts only the percentage of Pricing Rules still named on
-	the row (see ``_promotion_percentage``). A cashier's discount has no Pricing Rule,
-	so the fallback cannot see it and the whole line discount is checked against the
-	coupon. Invoices saved before this field existed, and offline invoices from an
-	older POS build, have no stored share: a cashier discount plus an "Add on top"
-	coupon on those is still refused. That strict default is intentional.
-	"""
-	base, total = _line_discount(row)
-	if base <= 0:
-		return total, 0.0
-
-	promo = 0.0
-	if get_promotion_conflict_mode(coupon) == PROMOTION_CONFLICT_ADD:
-		sent = flt(row.get("posnext_coupon_discount"))
-		if sent > 0:
-			# The POS sends the coupon's share of the line (whole line, not per unit).
-			promo = total - min(sent, total)
-		else:
-			promo = min(base * _promotion_percentage(row) / 100.0, total)
-	share = max(total - promo, 0.0)
-	return share, max(base - promo, 0.0)
-
-
-def _promotion_percentage(row) -> float:
-	"""Percentage of the Pricing Rules still named on the row, when it can be read (0 otherwise).
-
-	Only rules whose ``rate_or_discount`` is "Discount Percentage" are read. An
-	amount-type offer under the coupon is invisible to the ``coupon_share`` fallback,
-	the same as a cashier's discount, and that part of the line is checked as the coupon's.
-	"""
-	from posnext_promotions.api.promotion_exclusions import _parse_pricing_rules
-
-	names = _parse_pricing_rules(row.get("pricing_rules"))
-	if not names:
-		return 0.0
-	rules = frappe.get_all(
-		"Pricing Rule",
-		filters={"name": ["in", names], "rate_or_discount": "Discount Percentage"},
-		pluck="discount_percentage",
-	)
-	return max((flt(p) for p in rules), default=0.0)
+	flags = getattr(doc, "flags", None) or {}
+	if not flags.get("pos_offline_sync") or (doc.get("coupon_code") or "").strip():
+		return
+	codes = {row.posnext_coupon_code.strip().upper() for row in tagged}
+	if len(codes) != 1:
+		return
+	# Matched case-insensitively whatever the DB collation (this app never imports pos_next).
+	coupon = frappe.qb.DocType("POS Coupon")
+	rows = (
+		frappe.qb.from_(coupon)
+		.select(coupon.coupon_code)
+		.where(Upper(coupon.coupon_code) == codes.pop())
+		.limit(1)
+	).run()
+	if rows:
+		doc.coupon_code = rows[0][0]
 
 
 # Scope -> (child table, legacy single field or None, label for the message)

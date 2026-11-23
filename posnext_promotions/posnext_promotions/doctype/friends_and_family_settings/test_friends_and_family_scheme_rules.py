@@ -39,12 +39,10 @@ class TestFriendsAndFamilySchemeRules(FrappeTestCase):
 		frappe.db.savepoint("ff_scheme_rules")
 		for name in frappe.get_all("Pricing Rule", filters={"title": ["like", "_PNXT_FF_%"]}, pluck="name"):
 			frappe.delete_doc("Pricing Rule", name, force=True, ignore_permissions=True)
-		gifts.clear_rule_cache()
 		self._settings()
 
 	def tearDown(self):
 		frappe.db.rollback(save_point="ff_scheme_rules")
-		gifts.clear_rule_cache()
 
 	def _settings(self, **values):
 		doc = frappe.get_single("Friends and Family Settings")
@@ -163,8 +161,9 @@ class TestFriendsAndFamilySchemeRules(FrappeTestCase):
 		self.assertEqual(self._item(resp, ITEM_B).get("discount_source"), FNF)
 
 	# ------------------------------------------------------------------
-	# BXGY / Routine never get F&F, whatever "Allow Free Gift with F&F" says
-	# and whatever the promotion's % is vs F&F (30% here).
+	# Routine never gets F&F, whatever "Allow Free Gift with F&F" says and
+	# whatever its % is vs F&F (30% here). Buy X Get Y, Price "buy one"
+	# included, follows the checkbox (Task 8s): off → no F&F, on → F&F allowed.
 	# ------------------------------------------------------------------
 
 	def _buy_one(self, title, promotion_type=None):
@@ -184,7 +183,6 @@ class TestFriendsAndFamilySchemeRules(FrappeTestCase):
 		if promotion_type is not None and frappe.get_meta("Pricing Rule").has_field("promotion_type"):
 			frappe.db.set_value("Pricing Rule", rule, "promotion_type", promotion_type)
 			frappe.clear_document_cache("Pricing Rule", rule)
-		gifts.clear_rule_cache()
 		return rule
 
 	@staticmethod
@@ -199,25 +197,100 @@ class TestFriendsAndFamilySchemeRules(FrappeTestCase):
 		self.assertTrue(gifts.is_price_bxgy_rule(rule))
 		self.assertEqual(gifts.scheme_blocking_kind(rule), gifts.SCHEME_KIND_BXGY)
 
-	def test_buy_one_price_bxgy_never_gets_fnf_qty_2_and_4_setting_off_and_on(self):
-		for allow in (0, 1):
-			self._settings(allow_free_gift_with_ff=allow)
-			rule = self._buy_one("_PNXT_FF_BUY_ONE")
-			for qty in (2, 4):
-				# qty 2 → promo 50% > F&F 30%; qty 4 → promo 25% < F&F 30%.
-				# Either way the line keeps "buy one" and gets no F&F.
-				resp = self._apply([(ITEM_A, qty), (ITEM_B, 1)], [rule])
-				msg = f"allow={allow} qty={qty}"
+	def test_buy_one_price_bxgy_follows_setting_qty_2_and_4(self):
+		rule = self._buy_one("_PNXT_FF_BUY_ONE")
+		for qty in (2, 4):
+			# Off: whatever the % (qty 2 → promo 50% > F&F 30%; qty 4 → promo 25% < F&F 30%),
+			# the line keeps "buy one" and gets no F&F.
+			resp = self._apply([(ITEM_A, qty), (ITEM_B, 1)], [rule])
+			msg = f"allow=0 qty={qty}"
+			line = self._item(resp, ITEM_A)
+			ff = self._ff_line(resp, ITEM_A)
+			self.assertNotEqual(line.get("discount_source"), FNF, msg)
+			self.assertFalse(ff.get("applies"), msg)
+			self.assertEqual(ff.get("reason"), REASON_SCHEME_NOT_ELIGIBLE, msg)
+			# One unit (50) free — the promotion itself is untouched.
+			self.assertAlmostEqual(self._line_saving(line), 50.0, places=2, msg=msg)
+			self.assertIn(rule, resp["applied_pricing_rules"], msg)
+			# Other lines still get F&F.
+			self.assertEqual(self._item(resp, ITEM_B).get("discount_source"), FNF, msg)
+
+		# On: the line is not blocked and competes with F&F like any Price rule.
+		self._settings(allow_free_gift_with_ff=1)
+		self.assertIsNone(gifts.scheme_blocking_kind(rule))
+		resp = self._apply([(ITEM_A, 2), (ITEM_B, 1)], [rule])
+		line = self._item(resp, ITEM_A)
+		# qty 2: one free unit (50%) beats F&F 30%.
+		self.assertNotEqual(line.get("discount_source"), FNF, "allow=1 qty=2")
+		self.assertNotEqual(self._ff_line(resp, ITEM_A).get("reason"), REASON_SCHEME_NOT_ELIGIBLE, "allow=1 qty=2")
+		self.assertAlmostEqual(self._line_saving(line), 50.0, places=2, msg="allow=1 qty=2")
+		self.assertEqual(self._item(resp, ITEM_B).get("discount_source"), FNF, "allow=1 qty=2")
+		# qty 4: F&F 30% beats one free unit (25%).
+		resp = self._apply([(ITEM_A, 4), (ITEM_B, 1)], [rule])
+		line = self._item(resp, ITEM_A)
+		self.assertEqual(line.get("discount_source"), FNF, "allow=1 qty=4")
+		# F&F replaces "buy one", it does not stack on it: 50 at 30% off is 35.
+		self.assertAlmostEqual(flt(line.get("discount_percentage")), 30, places=2, msg="allow=1 qty=4")
+		self.assertAlmostEqual(flt(line.get("rate")), 35, places=2, msg="allow=1 qty=4")
+		self.assertEqual(self._item(resp, ITEM_B).get("discount_source"), FNF, "allow=1 qty=4")
+
+	def _monthly_cap_left(self, remaining):
+		"""Monthly cap = the customer's usage this month (one row recorded here) + ``remaining``."""
+		from frappe.utils import nowdate
+
+		from posnext_promotions.promotions import ff_ledger
+
+		period = ff_ledger.period_key(nowdate())
+		invoice = f"_PNXT_L2_{frappe.generate_hash(length=8)}"
+		ff_ledger.record_rows(
+			[
+				{
+					"customer": self.ctx.customer,
+					"company": self.ctx.company,
+					"invoice_doctype": "POS Invoice",
+					"invoice": invoice,
+					"invoice_item": f"{invoice}-1",
+					"posting_date": nowdate(),
+					"period_key": period,
+					"amount": 10,
+					"base_amount": 10,
+				}
+			]
+		)
+		used = flt(ff_ledger.get_usage(self.ctx.customer, self.ctx.company, period))
+		self._settings(allow_free_gift_with_ff=1, max_discount_per_customer_month=used + remaining)
+
+	def test_d_r5_10_buy_one_beats_fnf_with_the_box_on_whatever_the_cap_left(self):
+		# Run 5 (D-R5-10): UIT-Verified got F&F 30% on UIT-A x 2 and x 3 under UIT-PR-BUY1 with
+		# the box on. Same rule shape (Max, mixed conditions, POS only, min qty 2, limit 1,
+		# 100%), cap states: none, 155.50 left (that sale), 0.01 left (after the suite). The
+		# promotion wins at qty 2 (50%) and qty 3 (33%) in every state; F&F 30% never does.
+		rule = _make_rule(
+			"_PNXT_FF_BUY_ONE_R510",
+			apply_on="Item Code",
+			items=[{"item_code": ITEM_A}],
+			price_or_product_discount="Price",
+			rate_or_discount="Discount Percentage",
+			discount_percentage=100,
+			min_qty=2,
+			apply_discount_on_price="Max",
+			min_or_max_discount_qty_limit=1,
+			mixed_conditions=1,
+			pos_only=1,
+		)
+		for remaining in (None, 155.5, 0.01):
+			if remaining is None:
+				self._settings(allow_free_gift_with_ff=1)
+			else:
+				self._monthly_cap_left(remaining)
+			for qty in (2, 3):
+				msg = f"cap left {remaining}, qty {qty}"
+				resp = self._apply([(ITEM_A, qty)], [rule])
 				line = self._item(resp, ITEM_A)
-				ff = self._ff_line(resp, ITEM_A)
 				self.assertNotEqual(line.get("discount_source"), FNF, msg)
-				self.assertFalse(ff.get("applies"), msg)
-				self.assertEqual(ff.get("reason"), REASON_SCHEME_NOT_ELIGIBLE, msg)
-				# One unit (50) free — the promotion itself is untouched.
-				self.assertAlmostEqual(self._line_saving(line), 50.0, places=2, msg=msg)
+				# One unit free (at qty 3 the row holds 33.33% a unit: 50.01).
+				self.assertAlmostEqual(self._line_saving(line), 50.0, delta=0.02, msg=msg)
 				self.assertIn(rule, resp["applied_pricing_rules"], msg)
-				# Other lines still get F&F.
-				self.assertEqual(self._item(resp, ITEM_B).get("discount_source"), FNF, msg)
 
 	def test_buy_one_labelled_item_level_or_auto_is_still_bxgy(self):
 		for label in (gifts.PROMOTION_TYPE_ITEM_LEVEL, "Auto Discount", ""):
@@ -227,12 +300,13 @@ class TestFriendsAndFamilySchemeRules(FrappeTestCase):
 			self.assertNotEqual(self._item(resp, ITEM_A).get("discount_source"), FNF, label)
 			self.assertEqual(self._item(resp, ITEM_B).get("discount_source"), FNF, label)
 
-	def test_product_bxgy_never_gets_fnf_when_setting_on(self):
+	def test_product_bxgy_gets_fnf_and_keeps_free_rows_when_setting_on(self):
 		self._settings(allow_free_gift_with_ff=1)
 		rule = self._bxgy("_PNXT_FF_BXGY_ON", min_qty=2, is_recursive=1, recurse_for=2, apply_recursion_over=0)
 		for qty in range(1, 7):
 			resp = self._apply([(ITEM_A, qty), (ITEM_B, 1)], [rule])
-			self._assert_bxgy_keeps_line(resp, qty, min_qty=2)
+			# Task 8s: the BXGY line gets F&F at every qty and keeps its free rows.
+			self.assertEqual(self._item(resp, ITEM_A).get("discount_source"), FNF, f"qty {qty}")
 			self.assertEqual(self._free_qty(resp, ITEM_A), qty // 2, f"qty {qty}: BXGY free units")
 			self.assertEqual(self._item(resp, ITEM_B).get("discount_source"), FNF, f"qty {qty}")
 
@@ -241,7 +315,6 @@ class TestFriendsAndFamilySchemeRules(FrappeTestCase):
 			self._settings(allow_free_gift_with_ff=allow)
 			# 10% < F&F 30%: best-discount would pick F&F, the rule must not.
 			rule = self._routine("_PNXT_FF_ROUTINE_ALLOW", 10)
-			gifts.clear_rule_cache()
 			resp = self._apply([(ITEM_A, 2), (ITEM_B, 1)], [rule])
 			msg = f"allow={allow}"
 			line = self._item(resp, ITEM_A)

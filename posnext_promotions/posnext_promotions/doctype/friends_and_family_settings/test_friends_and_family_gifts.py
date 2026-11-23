@@ -11,12 +11,19 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import flt
 
+from posnext_promotions.promotions import ff_config
 from posnext_promotions.promotions import friends_and_family_gifts as gifts
 from posnext_promotions.promotions.friends_and_family_testing import approved_domain_rows
 
 
 def _rule(**values):
 	return frappe._dict(values)
+
+
+def _allow_free_gift(allow):
+	"""Pin "Allow Free Gift with F&F" for ``scheme_blocking_kind`` (it reads ``ff_config``)."""
+	config = frappe._dict(allow_free_gift_with_ff=frappe._dict(value=bool(allow)))
+	return patch.object(ff_config, "resolve", return_value=config)
 
 
 class TestFriendsAndFamilyGiftClassification(FrappeTestCase):
@@ -135,7 +142,7 @@ class TestFriendsAndFamilyGiftClassification(FrappeTestCase):
 			)
 		)
 
-	def test_price_bxgy_buy_one_is_blocked_regardless_of_label(self):
+	def test_price_bxgy_buy_one_is_bxgy_regardless_of_label(self):
 		base = dict(
 			price_or_product_discount="Price",
 			rate_or_discount="Discount Percentage",
@@ -149,7 +156,9 @@ class TestFriendsAndFamilyGiftClassification(FrappeTestCase):
 		for label in ("", "Item Level Discount", "Auto Discount", "GWP"):
 			rule = _rule(promotion_type=label, **base)
 			self.assertTrue(gifts.is_price_bxgy_rule(rule), label)
-			self.assertEqual(gifts.scheme_blocking_kind(rule), gifts.SCHEME_KIND_BXGY, label)
+			self.assertEqual(gifts.classify_gift_rule(rule), gifts.GIFT_KIND_BXGY, label)
+			with _allow_free_gift(False):
+				self.assertEqual(gifts.scheme_blocking_kind(rule), gifts.SCHEME_KIND_BXGY, label)
 		# Free via Rate 0 on Max-priced units is BXGY too.
 		self.assertTrue(
 			gifts.is_price_bxgy_rule(
@@ -164,9 +173,11 @@ class TestFriendsAndFamilyGiftClassification(FrappeTestCase):
 		):
 			rule = _rule(**{**base, **extra})
 			self.assertFalse(gifts.is_price_bxgy_rule(rule), extra)
-			self.assertIsNone(gifts.scheme_blocking_kind(rule), extra)
+			with _allow_free_gift(False):
+				self.assertIsNone(gifts.scheme_blocking_kind(rule), extra)
 
-	def test_blocking_ignores_allow_free_gift_setting(self):
+	def test_bxgy_blocking_follows_allow_free_gift_setting(self):
+		# Task 8s: the checkbox covers Buy X Get Y, Price "buy one" included. Routine always blocks.
 		bxgy = _rule(price_or_product_discount="Product", same_item=1, apply_on="Item Code")
 		buy_one = _rule(
 			price_or_product_discount="Price",
@@ -177,10 +188,11 @@ class TestFriendsAndFamilyGiftClassification(FrappeTestCase):
 		)
 		routine = _rule(promotion_type="Item Level Discount", price_or_product_discount="Price", apply_on="Item Code")
 		for allow in (False, True):
-			with patch.object(gifts, "allow_free_gift_with_ff", return_value=allow):
-				self.assertEqual(gifts.scheme_blocking_kind(bxgy), gifts.SCHEME_KIND_BXGY)
-				self.assertEqual(gifts.scheme_blocking_kind(buy_one), gifts.SCHEME_KIND_BXGY)
-				self.assertEqual(gifts.scheme_blocking_kind(routine), gifts.SCHEME_KIND_ITEM_LEVEL)
+			expected = None if allow else gifts.SCHEME_KIND_BXGY
+			with _allow_free_gift(allow):
+				self.assertEqual(gifts.scheme_blocking_kind(bxgy), expected, allow)
+				self.assertEqual(gifts.scheme_blocking_kind(buy_one), expected, allow)
+				self.assertEqual(gifts.scheme_blocking_kind(routine), gifts.SCHEME_KIND_ITEM_LEVEL, allow)
 
 	def _rule_map(self):
 		return {
@@ -323,3 +335,35 @@ class TestFriendsAndFamilyGiftSettings(FrappeTestCase):
 		program = get_active_program()
 		self.assertFalse(program.allow_free_gift_with_ff)
 		self.assertFalse(gifts.allow_free_gift_with_ff())
+
+
+class TestRuleScopeMatches(FrappeTestCase):
+	"""`_rule_scope_matches` reads the Pricing Rule and matches the line by its apply_on scope."""
+
+	def _matches(self, item, rule):
+		with patch.object(frappe, "get_cached_doc", return_value=frappe._dict(rule)):
+			return gifts._rule_scope_matches(frappe._dict(item), "_Test Scope Rule")
+
+	def test_item_code_scope(self):
+		rule = {"apply_on": "Item Code", "items": [frappe._dict(item_code="_A")]}
+		self.assertTrue(self._matches({"item_code": "_A"}, rule))
+		self.assertFalse(self._matches({"item_code": "_B"}, rule))
+
+	def test_brand_scope(self):
+		rule = {"apply_on": "Brand", "brands": [frappe._dict(brand="_Brand A")]}
+		self.assertTrue(self._matches({"item_code": "_X", "brand": "_Brand A"}, rule))
+		self.assertFalse(self._matches({"item_code": "_X", "brand": "_Brand B"}, rule))
+		self.assertFalse(self._matches({"item_code": "_X"}, rule))
+
+	def test_item_group_scope_includes_descendants(self):
+		rule = {"apply_on": "Item Group", "item_groups": [frappe._dict(item_group="_Parent")]}
+		with patch(
+			"posnext_promotions.api.gwp.get_child_item_groups", return_value=["_Parent", "_Child"]
+		):
+			self.assertTrue(self._matches({"item_code": "_X", "item_group": "_Child"}, rule))
+			self.assertTrue(self._matches({"item_code": "_X", "item_group": "_Parent"}, rule))
+			self.assertFalse(self._matches({"item_code": "_X", "item_group": "_Other"}, rule))
+
+	def test_missing_rule_does_not_match(self):
+		with patch.object(frappe, "get_cached_doc", side_effect=frappe.DoesNotExistError):
+			self.assertFalse(gifts._rule_scope_matches(frappe._dict(item_code="_A"), "_Gone"))

@@ -40,12 +40,11 @@ amounts, suppressed sources, English + Arabic message) for the POS UI.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, replace
 
 import frappe
 from frappe import _
-from frappe.utils import cint, cstr, flt, nowdate
+from frappe.utils import cint, cstr, flt, get_datetime, getdate, nowdate
 
 from posnext_promotions.promotions import best_discount as bd
 from posnext_promotions.promotions.friends_and_family import (
@@ -56,18 +55,32 @@ from posnext_promotions.promotions.friends_and_family import (
 	COVER_OK,
 	COVER_OUT_OF_SCOPE,
 	SCHEME_APPLY_WITH_FF_FIELD,
+	SETTINGS_DOCTYPE,
 )
 from posnext_promotions.promotions.friends_and_family_caps import (
 	FIELD_DISCOUNT_SOURCE,
 	FIELD_FNF_AMOUNT,
+	FIELD_FNF_PERCENTAGE,
+	FIELD_FNF_PROGRAM,
 	FIELD_FNF_REPLACED,
 	CapContext,
 	allocate,
 	build_cap_payload,
-	ceil_cents,
+	cart_cap_basis,
 	get_cap_context,
 )
+from posnext_promotions.promotions import (
+	ff_compatibility,
+	ff_config,
+	ff_ledger,
+	ff_money,
+	ff_paid,
+	ff_scope,
+	ff_snapshot,
+)
+from posnext_promotions.promotions import friends_and_family_gifts as gifts
 from posnext_promotions.promotions.friends_and_family_gifts import line_blocked_by_scheme
+from posnext_promotions.promotions.ff_paid import is_paid  # noqa: F401  (public: Task 6c interface)
 from posnext_promotions.promotions.friends_and_family_eligibility import (
 	REASON_PROFILE_NOT_ALLOWED,
 	get_customer_eligibility,
@@ -207,39 +220,20 @@ class FriendsAndFamilyLineResult:
 
 
 def enrich_items_with_catalog(items) -> list:
-	"""Backfill ``brand`` / ``item_group`` from Item when the cart payload omits them."""
+	"""Set ``item_group`` / ``brand`` / ``variant_of`` from Item on every line (one cached query).
+
+	Scope fields are always overwritten: a client-sent group or brand never decides
+	coverage (an unknown item code gets none). ``item_name`` is only backfilled.
+	"""
 	items = list(items or [])
-	codes = list({cstr(i.get("item_code")) for i in items if i.get("item_code")})
-	if not codes:
-		return items
-
-	details = {
-		r.name: r
-		for r in frappe.get_all(
-			"Item",
-			filters={"name": ["in", codes]},
-			fields=["name", "item_group", "brand", "item_name"],
-		)
-	}
-
-	def _set(item, key, value):
-		if isinstance(item, dict):
-			item[key] = value
-		elif hasattr(item, "set"):
-			item.set(key, value)
-		else:
-			setattr(item, key, value)
-
+	catalog = ff_scope.item_scope_fields(i.get("item_code") for i in items)
 	for item in items:
-		cached = details.get(cstr(item.get("item_code")))
-		if not cached:
-			continue
-		if not item.get("item_group"):
-			_set(item, "item_group", cached.item_group)
-		if not item.get("brand"):
-			_set(item, "brand", cached.brand)
-		if not item.get("item_name") and cached.item_name:
-			_set(item, "item_name", cached.item_name)
+		row = catalog.get(cstr(item.get("item_code"))) or {}
+		for field in ff_scope.SCOPE_FIELDS:
+			if item.get(field) != row.get(field):
+				_set_item_attr(item, field, row.get(field))
+		if not item.get("item_name") and row.get("item_name"):
+			_set_item_attr(item, "item_name", row["item_name"])
 	return items
 
 
@@ -298,6 +292,10 @@ def _clear_fnf_audit_fields(item) -> None:
 		_set_item_attr(item, FIELD_DISCOUNT_SOURCE, None)
 	if flt(item.get(FIELD_FNF_AMOUNT)):
 		_set_item_attr(item, FIELD_FNF_AMOUNT, 0)
+	if flt(item.get(FIELD_FNF_PERCENTAGE)):
+		_set_item_attr(item, FIELD_FNF_PERCENTAGE, 0)
+	if item.get(FIELD_FNF_PROGRAM):
+		_set_item_attr(item, FIELD_FNF_PROGRAM, None)
 
 
 # Line fields that describe the discount F&F replaced (restored on the next run).
@@ -314,17 +312,35 @@ _REPLACED_FIELDS = (
 )
 
 
-def _replaced_snapshot(item) -> str:
-	return json.dumps({key: item.get(key) for key in _REPLACED_FIELDS}, default=str)
+SNAPSHOT_HOURS_FIELD = "replaced_discount_snapshot_hours"
 
 
-def _restore_replaced_discount(item) -> bool:
+def _snapshot_ttl_seconds() -> int:
+	hours = cint(frappe.get_cached_doc(SETTINGS_DOCTYPE).get(SNAPSHOT_HOURS_FIELD))
+	if hours < 1:
+		# Settings not saved since the field was added (Settings.validate stores >= 1).
+		hours = cint(frappe.get_meta(SETTINGS_DOCTYPE).get_field(SNAPSHOT_HOURS_FIELD).default)
+	return hours * 3600
+
+
+def _replaced_snapshot(item, ctx) -> str | None:
+	data = {key: item.get(key) for key in _REPLACED_FIELDS}
+	return ff_snapshot.sign(item, data, ttl_seconds=_snapshot_ttl_seconds(), doc=ctx)
+
+
+def _restore_replaced_discount(item, doc) -> bool:
 	"""Put back the discount an earlier F&F stamp replaced (PN-133).
 
 	Saved invoices are validated more than once (save, then submit). Without
 	this, the second run sees an F&F line with no competitor — the promotion it
 	beat is gone — so the comparison (and its audit log) is lost, and a cap
 	that later reduces F&F could not hand the line back to its promotion.
+
+	The snapshot sits in a client-writable field, so only a server-signed one
+	for this line's values is used, and only while every Pricing Rule in it is
+	still applies to ``doc`` (the invoice, or :func:`restore_context` for a cart):
+	enabled, valid on its posting date, same company / profile / customer
+	(Ruling 24). Otherwise it is dropped and the line is priced from today's rules.
 	"""
 	raw = item.get(FIELD_FNF_REPLACED)
 	if not raw:
@@ -332,9 +348,9 @@ def _restore_replaced_discount(item) -> bool:
 	_set_item_attr(item, FIELD_FNF_REPLACED, None)
 	if not _is_fnf_stamped(item):
 		return False
-	try:
-		data = json.loads(raw) if isinstance(raw, str) else dict(raw)
-	except (TypeError, ValueError):
+	data = ff_snapshot.verify(item, raw, doc=doc)
+	# Signature first: a forged snapshot never reaches the rule lookups.
+	if data is None or not ff_snapshot.rules_apply_to(data, doc):
 		return False
 	_clear_fnf_audit_fields(item)
 	for key in _REPLACED_FIELDS:
@@ -343,13 +359,35 @@ def _restore_replaced_discount(item) -> bool:
 	return True
 
 
-def _restored_copy(item):
+def restore_context(customer, posting_date, pos_profile=None) -> frappe._dict:
+	"""Doc-like view of a cart for :func:`_restore_replaced_discount`."""
+	return frappe._dict(customer=customer, posting_date=posting_date, pos_profile=pos_profile)
+
+
+def _restored_copy(item, doc):
 	"""Non-mutating view of ``item`` with its replaced discount put back."""
 	if not item.get(FIELD_FNF_REPLACED):
 		return item
-	copy = frappe._dict(item.as_dict() if hasattr(item, "as_dict") else dict(item))
-	_restore_replaced_discount(copy)
+	copy = frappe._dict(item.as_dict() if callable(getattr(item, "as_dict", None)) else dict(item))
+	_restore_replaced_discount(copy, doc)
 	return copy
+
+
+def judge_restored(items, doc, ctx) -> None:
+	"""BXGY / Routine judge on each line as F&F will price it (Ruling 122).
+
+	F&F pricing first puts back a line's signed replaced discount
+	(:func:`_restored_copy` / :func:`_restore_replaced_discount` with ``ctx``), which
+	rewrites ``pricing_rules``. So the judge sees that restored view, and its signed
+	verdict is copied onto the line: after the same restore it still matches.
+	``doc``: the doc :func:`ff_compatibility.block_ineligible_lines` judges against.
+	"""
+	views = [_restored_copy(item, ctx) for item in items]
+	ff_compatibility.block_ineligible_lines(views, doc=doc)
+	for item, view in zip(items, views, strict=True):
+		if view is not item:
+			for key in (gifts.FIELD_FNF_BLOCKED_BY, ff_compatibility.FIELD_JUDGED):
+				_set_item_attr(item, key, view.get(key))
 
 
 def _clear_friends_and_family_stamp(item) -> None:
@@ -378,14 +416,16 @@ def _capped_line_values(price_list_rate: float, qty: float, line_amount: float, 
 	"""``(actual line saving, net rate, percentage, stored discount_amount)`` for a capped line.
 
 	Saved invoice rows hold a per-unit rate in currency precision, so the rate is
-	rounded **up** to the cent — the line never saves more than its allowance.
+	rounded **up** to the currency's smallest unit — the line never saves more
+	than its allowance.
 	"""
 	gross = price_list_rate * qty
 	if gross <= 0 or qty <= 0:
 		return 0.0, price_list_rate, 0.0, 0.0
 	line_amount = max(0.0, min(flt(line_amount), gross))
 	if amount_basis == bd.AMOUNT_BASIS_UNIT:
-		rate = min(price_list_rate, max(0.0, ceil_cents(price_list_rate - line_amount / qty)))
+		rate = ff_money.ceil_money(price_list_rate - line_amount / qty)
+		rate = min(price_list_rate, max(0.0, rate))
 		stored = bd.money(price_list_rate - rate)
 		actual = bd.money(stored * qty)
 	else:
@@ -405,6 +445,7 @@ def _stamp_friends_and_family(
 	expects; on cart payloads it is the line total, as ``apply_offers`` uses.
 	``line_amount`` (PN-129) stamps a cap-reduced saving instead of the full %.
 	"""
+	program_percentage = percentage
 	qty = _line_qty(item)
 	price_list_rate = _line_price_list_rate(item)
 	if line_amount is not None:
@@ -427,6 +468,10 @@ def _stamp_friends_and_family(
 	# Persisted audit trail (PN-129): drives the monthly cap and reporting.
 	_set_item_attr(item, FIELD_DISCOUNT_SOURCE, DISCOUNT_SOURCE_FRIENDS_AND_FAMILY)
 	_set_item_attr(item, FIELD_FNF_AMOUNT, bd.money(discount_amount))
+	# Line snapshot: the program's rate (the line's own, possibly capped, % is
+	# discount_percentage). Program names arrive in Phase 3; blank until then.
+	_set_item_attr(item, FIELD_FNF_PERCENTAGE, flt(program_percentage))
+	_set_item_attr(item, FIELD_FNF_PROGRAM, None)
 	return discount_amount, rate
 
 
@@ -457,10 +502,10 @@ def promotion_competes_with_ff(item) -> bool:
 	the check ticked, compete on money saved as before.
 	"""
 	for rule in _pricing_rule_names(item):
-		scheme = frappe.db.get_value("Pricing Rule", rule, "promotional_scheme")
+		scheme = frappe.get_cached_value("Pricing Rule", rule, "promotional_scheme")
 		if not scheme:
 			continue
-		flag = frappe.db.get_value("Promotional Scheme", scheme, SCHEME_APPLY_WITH_FF_FIELD)
+		flag = frappe.get_cached_value("Promotional Scheme", scheme, SCHEME_APPLY_WITH_FF_FIELD)
 		if not cint(flag):
 			return False
 	return True
@@ -492,17 +537,12 @@ def _drop_competing_tags(item, competing_source: str | None) -> list[str]:
 def _looks_like_fnf_stamp(item, program, amount_basis: str) -> bool:
 	"""Treat the line's current discount as our own earlier F&F stamp.
 
-	Cart payloads carry ``discount_source``. Saved invoice rows do not persist
-	it, so on the invoice path a percentage equal to the Settings rate with no
-	Pricing Rule / coupon behind it is our stamp (re-stamping is idempotent).
+	Only an explicit marker counts: the source tag (``discount_source`` on cart
+	payloads, ``posnext_discount_source`` on saved rows) or the stored F&F
+	percentage. A manual or legacy discount that merely equals the program's
+	percentage is a competitor, not our stamp.
 	"""
-	if _is_fnf_stamped(item):
-		return True
-	if amount_basis != bd.AMOUNT_BASIS_UNIT:
-		return False
-	if bd.has_pricing_rules(item) or bd.line_coupon_code(item):
-		return False
-	return abs(flt(item.get("discount_percentage")) - flt(program.discount_percentage)) < 0.0001
+	return _is_fnf_stamped(item) or flt(item.get(FIELD_FNF_PERCENTAGE)) > 0
 
 
 def _competing_candidate(item, program, amount_basis: str) -> bd.Candidate | None:
@@ -637,12 +677,42 @@ def _evaluate_line(
 	)
 
 
-def _plan_lines(items, program, customer, posting_date, amount_basis, exclude_invoice=None) -> tuple:
-	"""Per-line decisions with PN-129 caps applied. Returns ``(results, cap context, uncapped total)``."""
+def _plan_lines(
+	items,
+	program,
+	customer,
+	posting_date,
+	amount_basis,
+	exclude_invoice=None,
+	conversion_rate: float | None = None,
+	pos_profile: str | None = None,
+	company: str | None = None,
+	ignore_caps: bool = False,
+) -> tuple:
+	"""Per-line decisions with PN-129 caps applied. Returns ``(results, cap context, uncapped total)``.
+
+	Caps are company currency and per company; ``conversion_rate`` turns them into
+	this order's currency. ``None`` (cart) = the POS Profile's company and rate,
+	looked up only when caps are set. ``ignore_caps``: the full entitlement (paid
+	invoice check), no cap lookup.
+	"""
+	if ignore_caps:
+		results = [
+			_evaluate_line(item, program, idx=idx, amount_basis=amount_basis) for idx, item in enumerate(items)
+		]
+		return results, CapContext(), sum(r.discount_amount for r in results if r.applies)
+	if conversion_rate is None:
+		if program.has_caps:
+			profile_company, conversion_rate = cart_cap_basis(pos_profile, posting_date)
+			company = company or profile_company
+		else:
+			conversion_rate = 1.0
 	results = [
 		_evaluate_line(item, program, idx=idx, amount_basis=amount_basis) for idx, item in enumerate(items)
 	]
-	ctx = get_cap_context(program, customer, posting_date, exclude=exclude_invoice)
+	ctx = get_cap_context(
+		program, customer, posting_date, exclude=exclude_invoice, conversion_rate=conversion_rate, company=company
+	)
 	uncapped_total = sum(r.discount_amount for r in results if r.applies)
 	allowance = ctx.allowance
 	if allowance is None or bd.money(uncapped_total) <= bd.money(allowance):
@@ -740,6 +810,7 @@ def _base_payload(eligibility, program) -> dict:
 	}
 
 
+@ff_money.in_cart_currency
 def compute_friends_and_family_discounts(
 	customer=None,
 	items=None,
@@ -747,15 +818,22 @@ def compute_friends_and_family_discounts(
 	amount_basis: str = bd.AMOUNT_BASIS_LINE,
 	exclude_invoice: str | None = None,
 	pos_profile: str | None = None,
+	conversion_rate: float | None = None,
+	company: str | None = None,
+	ignore_caps: bool = False,
+	eligibility=None,
 ) -> dict:
 	"""Per-line F&F decision for ``customer`` + cart ``items`` on ``posting_date``.
 
 	Does not mutate ``items``. The returned ``discount_percentage`` (header and
 	per applying line) always comes from Settings — never from the request.
+	``ignore_caps``: the entitlement before PN-129 caps. ``eligibility``: the
+	caller's :func:`get_customer_eligibility` for the same customer, date and profile.
 	"""
 	posting_date = posting_date or nowdate()
-	items = enrich_items_with_catalog([_restored_copy(i) for i in items or []])
-	eligibility = get_customer_eligibility(customer, posting_date, pos_profile)
+	signed_for = restore_context(customer, posting_date, pos_profile)
+	items = enrich_items_with_catalog([_restored_copy(i, signed_for) for i in items or []])
+	eligibility = eligibility or get_customer_eligibility(customer, posting_date, pos_profile)
 	program = eligibility.program if eligibility.eligible else None
 	payload = _base_payload(eligibility, program)
 
@@ -779,7 +857,16 @@ def compute_friends_and_family_discounts(
 		return payload
 
 	results, ctx, uncapped_total = _plan_lines(
-		items, program, customer, posting_date, amount_basis, exclude_invoice
+		items,
+		program,
+		customer,
+		posting_date,
+		amount_basis,
+		exclude_invoice,
+		conversion_rate,
+		pos_profile,
+		company,
+		ignore_caps=ignore_caps,
 	)
 	caps = build_cap_payload(ctx, uncapped_total, _applied_total(results))
 	applied = sum(1 for r in results if r.applies)
@@ -791,6 +878,7 @@ def compute_friends_and_family_discounts(
 	return payload
 
 
+@ff_money.in_cart_currency
 def apply_friends_and_family_to_items(
 	items,
 	customer=None,
@@ -798,6 +886,9 @@ def apply_friends_and_family_to_items(
 	amount_basis: str = bd.AMOUNT_BASIS_LINE,
 	exclude_invoice: str | None = None,
 	pos_profile: str | None = None,
+	conversion_rate: float | None = None,
+	company: str | None = None,
+	eligibility=None,
 ) -> dict:
 	"""Mutate ``items``: stamp F&F where it wins, strip stale F&F stamps otherwise.
 
@@ -807,12 +898,14 @@ def apply_friends_and_family_to_items(
 
 	Safe to call repeatedly (idempotent). Returns the same payload shape as
 	:func:`compute_friends_and_family_discounts`, reflecting the post-mutation
-	state.
+	state. ``eligibility``: the caller's :func:`get_customer_eligibility` for the
+	same customer, date and profile (invoice validate computes it once).
 	"""
 	posting_date = posting_date or nowdate()
 	items = enrich_items_with_catalog(list(items or []))
-	restored = {idx for idx, item in enumerate(items) if _restore_replaced_discount(item)}
-	eligibility = get_customer_eligibility(customer, posting_date, pos_profile)
+	signed_for = restore_context(customer, posting_date, pos_profile)
+	restored = {idx for idx, item in enumerate(items) if _restore_replaced_discount(item, signed_for)}
+	eligibility = eligibility or get_customer_eligibility(customer, posting_date, pos_profile)
 	program = eligibility.program if eligibility.eligible else None
 	payload = _base_payload(eligibility, program)
 	payload["suppressed_pricing_rules"] = []
@@ -839,13 +932,13 @@ def apply_friends_and_family_to_items(
 		caps = build_cap_payload(CapContext(), 0, 0)
 	else:
 		planned, ctx, uncapped_total = _plan_lines(
-			items, program, customer, posting_date, amount_basis, exclude_invoice
+			items, program, customer, posting_date, amount_basis, exclude_invoice, conversion_rate, pos_profile, company
 		)
 		results = []
 		for item, result in zip(items, planned, strict=False):
 			if result.applies:
 				replaced = (
-					_replaced_snapshot(item)
+					_replaced_snapshot(item, signed_for)
 					if result.competing_source not in (None, bd.SOURCE_NONE) and flt(result.competing_amount) > 0
 					else None
 				)
@@ -874,7 +967,12 @@ def apply_friends_and_family_to_items(
 		caps = build_cap_payload(ctx, uncapped_total, _applied_total(results))
 
 	applied = sum(1 for r in results if r.applies)
-	payload["items"] = [r.to_client_payload() for r in results]
+	# Each F&F line hands the cart the snapshot its line was stamped with: the cart sends
+	# it back with an "Add on top" coupon line over that line (G5).
+	payload["items"] = [
+		{**r.to_client_payload(), FIELD_FNF_REPLACED: item.get(FIELD_FNF_REPLACED) if r.applies else None}
+		for item, r in zip(items, results, strict=False)
+	]
 	payload["applied_count"] = applied
 	payload["suppressed_pricing_rules"] = sorted(suppressed_rules)
 	if program is not None:
@@ -896,6 +994,8 @@ _LINE_SNAPSHOT_FIELDS = (
 	"is_already_discounted",
 	FIELD_DISCOUNT_SOURCE,
 	FIELD_FNF_AMOUNT,
+	FIELD_FNF_PERCENTAGE,
+	FIELD_FNF_PROGRAM,
 	FIELD_FNF_REPLACED,
 )
 
@@ -926,7 +1026,7 @@ def _scenario_b_lines(items, snapshots, fnf_like) -> list:
 	for item, snap, was_fnf in zip(items, snapshots, fnf_like, strict=False):
 		if item.get("is_free_item"):
 			continue
-		line = frappe._dict(item.as_dict() if hasattr(item, "as_dict") else dict(item))
+		line = frappe._dict(item.as_dict() if callable(getattr(item, "as_dict", None)) else dict(item))
 		line.update(snap or {})
 		if was_fnf or _is_fnf_stamped(line):
 			line.discount_source = None
@@ -943,14 +1043,15 @@ def _scenario_b_lines(items, snapshots, fnf_like) -> list:
 
 
 def _pos_coupon_value(
-	coupon_code: str, base_net: float, base_grand: float, lines=None, tax_amount: float = 0
+	coupon_code: str, base_net: float, base_grand: float, lines=None, tax_rate: float = 0, pos_profile=None
 ) -> tuple[float, float | None] | None:
 	"""``(value, percentage)`` of an order-level POS Coupon (``None`` if unknown).
 
-	With ``lines`` the value comes from the coupon engine, i.e. the same base the
-	POS used in ``calculate_coupon_discount``: already-discounted lines (a
-	promotion that beat F&F) and excluded brands do not count. Without lines it
-	falls back to the coupon % of the whole base.
+	With ``lines`` the value comes from :func:`best_discount_coupon.coupon_value_on`,
+	the rule ``calculate_coupon_discount`` uses: out-of-scope lines and excluded brands
+	do not count, already-discounted lines follow the coupon's ``promotion_conflict``,
+	and a "Grand Total" coupon adds only the exclusive taxes (``tax_rate``). Without
+	lines it falls back to the coupon % of the whole base.
 	"""
 	code = cstr(coupon_code).strip().upper()
 	if not code or not frappe.db.table_exists("POS Coupon"):
@@ -960,17 +1061,12 @@ def _pos_coupon_value(
 		return None
 	row = frappe.get_cached_doc("POS Coupon", name)
 	pct = flt(row.discount_percentage) if cstr(row.discount_type) == "Percentage" else None
-	if lines:
-		from posnext_promotions.api.coupon_engine import apply_coupon_discount
+	if lines is not None:
+		# Same value rule as validate_coupon / calculate_coupon_discount (cart = invoice);
+		# the lines are saved rows, so their own discount is read from their rate (Ruling 96).
+		from posnext_promotions.promotions.best_discount_coupon import coupon_value_on
 
-		result = apply_coupon_discount(
-			row,
-			cart_total=base_grand,
-			net_total=base_net,
-			items=[dict(line) for line in lines],
-			tax_amount=tax_amount,
-		)
-		value = flt(result.get("discount")) if result.get("valid") else 0.0
+		value = coupon_value_on(row, lines, tax_rate, amount_basis=bd.AMOUNT_BASIS_UNIT, pos_profile=pos_profile)
 	else:
 		base = base_grand if cstr(row.apply_on) == "Grand Total" else base_net
 		value = flt(base) * pct / 100.0 if pct is not None else flt(row.discount_amount)
@@ -981,23 +1077,45 @@ def _pos_coupon_value(
 	return max(0.0, min(value, flt(base))), pct
 
 
-def _order_candidate_without_fnf(doc, items, b_line_values, snapshots=None, fnf_like=None) -> bd.Candidate:
-	"""Header discount the invoice would carry if F&F did not apply (scenario B)."""
+def _scenario_b_bases(doc, items, b_line_values) -> tuple[float, float, float]:
+	"""``(net base, grand base, exclusive tax rate)`` of the invoice without F&F.
+
+	Taxes included in the print rate are already inside the lines: only the
+	exclusive tax rows are added (gap audit A I3).
+	"""
+	from posnext_promotions.api.coupon_engine import exclusive_tax_rate
+
 	gross = sum(bd.line_gross(i) for i in items if not i.get("is_free_item"))
 	base_net = max(0.0, gross - sum(b_line_values))
-	tax_amount = flt(doc.get("total_taxes_and_charges") or 0)
-	base_grand = base_net + tax_amount
+	tax_rate = exclusive_tax_rate(doc.get("taxes") or [])
+	return base_net, base_net * (1.0 + tax_rate), tax_rate
+
+
+def _coupon_without_fnf(doc, items, b_line_values, snapshots=None, fnf_like=None):
+	"""``(value, percentage)`` of the invoice's POS Coupon without F&F; ``None`` if not one."""
+	coupon_code = cstr(doc.get("coupon_code")).strip()
+	if not coupon_code:
+		return None
+	base_net, base_grand, tax_rate = _scenario_b_bases(doc, items, b_line_values)
+	lines = _scenario_b_lines(items, snapshots, fnf_like) if snapshots else None
+	return _pos_coupon_value(
+		coupon_code, base_net, base_grand, lines=lines, tax_rate=tax_rate, pos_profile=doc.get("pos_profile")
+	)
+
+
+def _order_candidate_without_fnf(doc, items, b_line_values, snapshots=None, fnf_like=None) -> bd.Candidate:
+	"""Header discount the invoice would carry if F&F did not apply (scenario B)."""
+	base_net, base_grand, _tax_rate = _scenario_b_bases(doc, items, b_line_values)
 	pct = flt(doc.get("additional_discount_percentage") or 0)
 	coupon_code = cstr(doc.get("coupon_code")).strip()
 	value = _header_discount_value(doc)
 	if coupon_code:
-		lines = _scenario_b_lines(items, snapshots, fnf_like) if snapshots else None
-		coupon = _pos_coupon_value(coupon_code, base_net, base_grand, lines=lines, tax_amount=tax_amount)
+		coupon = _coupon_without_fnf(doc, items, b_line_values, snapshots, fnf_like)
 		coupon_pct = None
 		if coupon is not None:
 			# The coupon engine is authoritative for a POS Coupon: it skips lines
 			# that already carry a promotion, so the coupon never stacks on them.
-			value = coupon[0] if lines else max(value, coupon[0])
+			value = coupon[0] if snapshots else max(value, coupon[0])
 			coupon_pct = coupon[1]
 		return bd.Candidate(
 			source=bd.SOURCE_ORDER_COUPON,
@@ -1011,13 +1129,70 @@ def _order_candidate_without_fnf(doc, items, b_line_values, snapshots=None, fnf_
 	return bd.Candidate(source=bd.SOURCE_ORDER_MANUAL, amount=value, percentage=pct or None)
 
 
+def _is_pos_coupon(code) -> bool:
+	code = cstr(code).strip().upper()
+	return bool(code) and bool(frappe.db.table_exists("POS Coupon")) and bool(
+		frappe.db.exists("POS Coupon", {"coupon_code": code})
+	)
+
+
+def _cap_header_at_coupon(doc, items, snapshots, b_line_values, fnf_like) -> bool:
+	"""An unpaid invoice's header discount never exceeds its POS Coupon's value.
+
+	Runs whether or not F&F applied: the client may send any header amount, the
+	server prices the coupon. Never raises the header. True when the invoice's
+	coupon is a POS Coupon. (Paid invoices never get here: see :func:`_freeze_paid_invoice`.)
+	"""
+	if not _is_pos_coupon(doc.get("coupon_code")):
+		return False
+	header = _header_discount_value(doc)
+	if header <= 0 and not flt(doc.get("additional_discount_percentage")):
+		return True
+	coupon = _coupon_without_fnf(doc, items, b_line_values, snapshots, fnf_like)
+	if coupon is not None and bd.money(header) > bd.money(coupon[0]):
+		value = bd.money(coupon[0])
+		doc.additional_discount_percentage = 0
+		doc.discount_amount = value
+		if doc.get("base_discount_amount"):
+			doc.base_discount_amount = bd.money(value * (flt(doc.get("conversion_rate")) or 1.0))
+	return True
+
+
+def _drop_unused_coupon(doc, items) -> None:
+	"""A POS Coupon that gives nothing (no header discount, no line tagged) is not used."""
+	if _header_discount_value(doc) or flt(doc.get("additional_discount_percentage")):
+		return
+	if any(i.get("posnext_coupon_code") for i in items):
+		return
+	doc.coupon_code = None
+
+
 def _resolve_order_level(doc, items, snapshots, b_line_values, ff_payload, fnf_like=None) -> dict | None:
 	"""F&F lines vs an invoice header discount → keep the scenario that saves more.
 
 	A = F&F (with per-line best-of) and **no** header discount.
 	B = no F&F (lines keep their non-F&F discounts) **plus** the header discount.
-	Tie → A (F&F).
+	Tie → A (F&F). A POS Coupon's header is first capped at the coupon's value,
+	and a POS Coupon left giving nothing is dropped (its usage must not count).
 	"""
+	pos_coupon = _cap_header_at_coupon(doc, items, snapshots, b_line_values, fnf_like)
+	decision = _order_level_decision(doc, items, snapshots, b_line_values, ff_payload, fnf_like)
+	if pos_coupon:
+		_drop_unused_coupon(doc, items)
+	return decision
+
+
+def _grand_total_coupon_factor(doc, items, b_line_values) -> float:
+	"""``1 + exclusive tax rate`` when the header is a "Grand Total" POS Coupon, else 1."""
+	code = cstr(doc.get("coupon_code")).strip().upper()
+	if not _is_pos_coupon(code):
+		return 1.0
+	if cstr(frappe.db.get_value("POS Coupon", {"coupon_code": code}, "apply_on")) != "Grand Total":
+		return 1.0
+	return 1.0 + _scenario_b_bases(doc, items, b_line_values)[2]
+
+
+def _order_level_decision(doc, items, snapshots, b_line_values, ff_payload, fnf_like=None) -> dict | None:
 	if not ff_payload.get("applied_count"):
 		return None
 	header_pct = flt(doc.get("additional_discount_percentage") or 0)
@@ -1025,16 +1200,21 @@ def _resolve_order_level(doc, items, snapshots, b_line_values, ff_payload, fnf_l
 	if not header_pct and not header_amt:
 		return None
 
-	a_total = sum(bd.line_discount_value(i, bd.AMOUNT_BASIS_UNIT) for i in items)
+	# Ruling 56: against a "Grand Total" POS Coupon (valued with its exclusive tax) the line
+	# discounts count with the exclusive tax they also save — one unit on both sides.
+	factor = _grand_total_coupon_factor(doc, items, b_line_values)
+	a_total = sum(bd.line_discount_value(i, bd.AMOUNT_BASIS_UNIT) for i in items) * factor
 	order_b = _order_candidate_without_fnf(doc, items, b_line_values, snapshots, fnf_like)
+	capped = bool((ff_payload.get("caps") or {}).get("capped"))
 	fnf_side = bd.Candidate(
 		source=bd.SOURCE_FRIENDS_AND_FAMILY,
 		amount=a_total,
-		percentage=flt(ff_payload.get("discount_percentage")) or None,
+		# A capped F&F is shown by its money value, not the program %.
+		percentage=None if capped else (flt(ff_payload.get("discount_percentage")) or None),
 	)
 	other_side = bd.Candidate(
 		source=order_b.source,
-		amount=sum(b_line_values) + order_b.amount,
+		amount=sum(b_line_values) * factor + order_b.amount,
 		percentage=order_b.percentage,
 		code=order_b.code,
 	)
@@ -1060,7 +1240,7 @@ def _resolve_order_level(doc, items, snapshots, b_line_values, ff_payload, fnf_l
 				# keeping whatever else the line carried (Pricing Rules, tags).
 				_strip_line_discount(item)
 		if order_b.source == bd.SOURCE_ORDER_COUPON and not header_pct:
-			doc.discount_amount = order_b.amount
+			doc.discount_amount = ff_money.money(order_b.amount, ff_money.document_currency(doc))
 		ff_payload["applied_count"] = 0
 		ff_payload["reason"] = REASON_ORDER_DISCOUNT_BETTER
 		if ff_payload.get("caps"):
@@ -1085,23 +1265,586 @@ def _invoice_state(doc, items) -> tuple:
 	)
 
 
-def _stamp_return_usage(items) -> None:
-	"""Credit-note rows give F&F allowance back: store the negative saving for the returned qty.
+RETURN_WARNINGS_FLAG = "ff_return_warnings"
 
-	The row copies ``posnext_discount_source`` / rate / price list rate from
-	the original line, so the per-unit saving is ``price_list_rate - rate``.
+
+def _coupon_holds_the_cart(doc) -> bool:
+	"""The coupon split check found this invoice's coupon holds the whole cart."""
+	from posnext_promotions.overrides.coupon_split import HOLDS_CART_FLAG
+
+	flags = getattr(doc, "flags", None) or {}
+	return bool(flags.get(HOLDS_CART_FLAG))
+
+
+def _invoice_eligibility(doc, posting_date, pos_profile):
+	"""The customer's F&F eligibility on this invoice, paid or not (review M9).
+
+	"Better of the two for the whole cart": when the server's split
+	(``validate_scoped_coupon_lines``) gave the coupon the whole cart, no line gets F&F
+	next to it and none is owed, so the customer counts as not eligible here (K1).
 	"""
-	for row in items:
-		if cstr(row.get(FIELD_DISCOUNT_SOURCE)) != DISCOUNT_SOURCE_FRIENDS_AND_FAMILY:
-			if flt(row.get(FIELD_FNF_AMOUNT)):
-				_set_item_attr(row, FIELD_FNF_AMOUNT, 0)
+	eligibility = get_customer_eligibility(doc.get("customer"), posting_date, pos_profile)
+	if eligibility.eligible and _coupon_holds_the_cart(doc):
+		return replace(eligibility, eligible=False)
+	return eligibility
+
+
+def _claims_fnf(row) -> bool:
+	"""The client sent F&F markers on this row (not trusted, only used to decide on a warning)."""
+	return (
+		cstr(row.get(FIELD_DISCOUNT_SOURCE)) == DISCOUNT_SOURCE_FRIENDS_AND_FAMILY
+		or bool(flt(row.get(FIELD_FNF_AMOUNT)))
+		or flt(row.get(FIELD_FNF_PERCENTAGE)) > 0
+	)
+
+
+def _fnf_items_on(doc) -> set:
+	"""Item codes that carried F&F on the invoice this return is against."""
+	against = doc.get("return_against")
+	doctype = cstr(doc.get("doctype"))
+	if not against or doctype not in ff_ledger.RETURN_LINK_FIELDS:
+		return set()
+	Item = frappe.qb.DocType(f"{doctype} Item")
+	return set(
+		(
+			frappe.qb.from_(Item)
+			.select(Item.item_code)
+			.where(
+				(Item.parent == against)
+				& (Item.parenttype == doctype)
+				& (Item[FIELD_DISCOUNT_SOURCE] == DISCOUNT_SOURCE_FRIENDS_AND_FAMILY)
+			)
+		).run(pluck=True)
+	)
+
+
+def _stamp_return_usage(doc, items) -> None:
+	"""Credit-note rows give F&F allowance back, derived from the ORIGINAL row only.
+
+	The amount comes from :func:`ff_ledger.return_credits` (the original row's
+	recorded F&F amount, pro rata to the returned qty). The F&F markers are
+	copied from the original row, so reports see the return; a row whose
+	original carried no F&F gets them cleared, whatever the client sent.
+	Rows that may have had F&F but have no usable original row are kept on
+	``doc.flags`` for a log warning at submit (drafts are never logged).
+	"""
+	warnings = []
+	fnf_items = None
+	for result in ff_ledger.return_credits(doc):
+		row, original = result.row, result.original
+		claims = _claims_fnf(row)
+		if original is not None:
+			_set_item_attr(row, FIELD_DISCOUNT_SOURCE, DISCOUNT_SOURCE_FRIENDS_AND_FAMILY)
+			_set_item_attr(row, FIELD_FNF_PERCENTAGE, flt(original.fnf_percentage))
+			_set_item_attr(row, FIELD_FNF_PROGRAM, original.fnf_program or None)
+		else:
+			if cstr(row.get(FIELD_DISCOUNT_SOURCE)) == DISCOUNT_SOURCE_FRIENDS_AND_FAMILY:
+				_set_item_attr(row, FIELD_DISCOUNT_SOURCE, None)
+			if flt(row.get(FIELD_FNF_PERCENTAGE)):
+				_set_item_attr(row, FIELD_FNF_PERCENTAGE, 0)
+			if row.get(FIELD_FNF_PROGRAM):
+				_set_item_attr(row, FIELD_FNF_PROGRAM, None)
+		_set_item_attr(row, FIELD_FNF_AMOUNT, flt(result.credit))
+		if result.warning:
+			if fnf_items is None:
+				fnf_items = _fnf_items_on(doc)
+			if claims or cstr(row.get("item_code")) in fnf_items:
+				warnings.append(
+					{
+						"invoice_row": row.get("name"),
+						"item_code": row.get("item_code"),
+						"qty": flt(row.get("qty")),
+						"reason": result.warning,
+					}
+				)
+	flags = getattr(doc, "flags", None)
+	if flags is not None:
+		flags[RETURN_WARNINGS_FLAG] = warnings
+
+
+def _remove_invoice_rows(doc, rows) -> None:
+	drop = {id(row) for row in rows}
+	kept = [row for row in doc.get("items") if id(row) not in drop]
+	if isinstance(doc, dict):
+		doc["items"] = kept
+		return
+	doc.set("items", kept)
+	for position, row in enumerate(doc.get("items"), start=1):
+		row.idx = position
+
+
+def _enforce_invoice_gift_policy(doc, items) -> bool:
+	"""Remove free rows the gift policy forbids. True when F&F should be re-run.
+
+	A removed gift's trigger rows lose that gift's rule tag (the policy detaches it).
+	A row whose discount came only from removed gift rules also loses that discount,
+	so F&F can reclaim it, like ``apply_offers`` does after it drops a gift. A row
+	that still carries other rules keeps its discount and those rules.
+	"""
+	free_rows = [row for row in items if cint(row.get("is_free_item"))]
+	if not free_rows:
+		return False
+	# Rules on paid rows that still carry a non-F&F discount, before the policy detaches them.
+	tagged = {
+		id(row): set(gifts._item_rule_names(row))
+		for row in items
+		if not cint(row.get("is_free_item"))
+		and not _is_fnf_stamped(row)
+		and (flt(row.get("discount_percentage")) or flt(row.get("discount_amount")))
+	}
+	kept = list(free_rows)
+	suppressed = set(ff_compatibility.enforce_gift_policy(items, kept, ff_config.resolve()))
+	removed = [row for row in free_rows if all(row is not k for k in kept)]
+	if not removed:
+		return False
+	_remove_invoice_rows(doc, removed)
+	for row in doc.get("items"):
+		if tagged.get(id(row), set()) & suppressed and not gifts._item_rule_names(row):
+			gifts._clear_line_gift_stamp(row)
+	return True
+
+
+# ---- paid invoices (Task 6c) ------------------------------------------------
+
+# Line reasons that mean "a scheme or gift owns this line": F&F on it is a compatibility breach.
+_COMPATIBILITY_LINE_REASONS = frozenset({REASON_SCHEME_NOT_ELIGIBLE, REASON_PROTECTED})
+
+
+def _row_copy(item) -> frappe._dict:
+	return frappe._dict(item.as_dict() if callable(getattr(item, "as_dict", None)) else dict(item))
+
+
+def _stored_creation(doc):
+	"""``creation`` as stored in the database for ``doc.name``; None for an unsaved doc.
+
+	Never the in-memory value: before ``insert()`` it is whatever the client sent.
+	"""
+	name = cstr(doc.get("name"))
+	if not name:
+		return None
+	creation = frappe.db.get_value(cstr(doc.get("doctype")) or "POS Invoice", name, "creation")
+	return get_datetime(creation) if creation else None
+
+
+def _on_server_day(doc, on, at=None) -> frappe._dict:
+	"""The doc as :func:`ff_compatibility.rule_applies_to_doc` reads it, dated ``on`` at ``at``.
+
+	``posting_date`` / ``posting_time`` are client-writable; ``on`` is a server day.
+	``at`` None: judged at now (``schedule.resolve_moment``).
+	"""
+	view = frappe._dict(
+		{
+			key: doc.get(key)
+			for key in (
+				"company",
+				"customer",
+				"customer_group",
+				"territory",
+				"pos_profile",
+				"selling_price_list",
+				"coupon_code",
+			)
+		}
+	)
+	view.posting_date = on
+	view.posting_time = cstr(at.time()) if at else None
+	return view
+
+
+def fnf_line_rates(doc) -> dict:
+	"""POS Next benefit-provider ``fnf_line_rates``: {row name: per-unit rate} F&F gives
+	each paid row of a POS invoice, on the row's ``price_list_rate`` (Ruling 120).
+
+	POS Next counts a row's F&F discount as explained only down to this rate, never
+	from the row's mark. Judged on server data only, read-only, on copies of the rows:
+	* the customer's eligibility, the program and its scope, now and at the invoice's
+	  ``creation`` as stored in the database (an unsaved doc: now only), never the
+	  caller's ``posting_date`` or in-memory ``creation``; the lower rate wins;
+	* the uncapped entitlement, since a cap breach is the ledger's (as in
+	  :func:`_freeze_paid_invoice`), and a scheme's line gets none
+	  (``block_ineligible_lines``) — left out if a scheme owns it now, or owned it
+	  at the stored creation *and* the invoice carries that scheme (its free row or
+	  its tag on the line) (Rulings 125, 127);
+	* ``offline_id`` and the offline / paid flags play no part.
+	A row F&F gives nothing is left out. A document that is not a POS invoice
+	(the program is a POS benefit), a return or a consolidated invoice gives {}.
+	"""
+	if cint(doc.get("is_return")) or cint(doc.get("is_consolidated")):
+		return {}
+	if not (cstr(doc.get("doctype")) == "POS Invoice" or cint(doc.get("is_pos"))):
+		return {}
+	items = list(doc.get("items") or [])
+	if not any(item.get("name") and not cint(item.get("is_free_item")) for item in items):
+		return {}
+	copies = enrich_items_with_catalog([_row_copy(i) for i in items])
+	# Server moments only (Ruling 125): now, and the stored creation (an unsaved doc: now only).
+	moments = [(nowdate(), None)]
+	stored = _stored_creation(doc)
+	if stored:
+		moments.append((cstr(getdate(stored)), stored))
+	# Schemes the invoice carries: a free row's rules (Ruling 127).
+	free_rules = {
+		name for item in items if cint(item.get("is_free_item")) for name in gifts._item_rule_names(item)
+	}
+	rates, blocked = {}, set()
+	for on, at in moments:
+		# The snapshot restore depends on the day: judge as restored for each moment, and
+		# BXGY / Routine validity at that moment too, never the caller's posting_date.
+		judge_restored(
+			copies, _on_server_day(doc, on, at), restore_context(doc.get("customer"), on, doc.get("pos_profile"))
+		)
+		result = compute_friends_and_family_discounts(
+			customer=doc.get("customer"),
+			items=copies,
+			posting_date=on,
+			amount_basis=bd.AMOUNT_BASIS_UNIT,
+			exclude_invoice=doc.get("name") or None,
+			pos_profile=doc.get("pos_profile"),
+			conversion_rate=flt(doc.get("conversion_rate")) or 1.0,
+			company=doc.get("company"),
+			ignore_caps=True,
+		)
+		for item, copy, line in zip(items, copies, result.get("items") or [], strict=False):
+			name, qty, price = item.get("name"), _line_qty(item), _line_price_list_rate(item)
+			if name and line.get("reason") == REASON_SCHEME_NOT_ELIGIBLE:
+				# Now always decides. The stored moment blocks only a scheme this invoice
+				# carries — its free row, or its tag on the line (Ruling 127): a draft held
+				# past a window end keeps F&F; a forged or old creation never unblocks.
+				owners = set(gifts._split_rule_names(copy.get(gifts.FIELD_FNF_BLOCKED_BY)))
+				carried = free_rules | set(gifts._item_rule_names(item)) | set(gifts._item_rule_names(copy))
+				if at is None or owners & carried:
+					blocked.add(name)
+			uncapped = flt(line.get("fnf_uncapped_amount"))
+			if not name or cint(item.get("is_free_item")) or uncapped <= 0 or qty <= 0 or price <= 0:
+				continue
+			rate = max(0.0, price - uncapped / qty)
+			rates[name] = min(rates.get(name, rate), rate)
+	return {name: rate for name, rate in rates.items() if name not in blocked}
+
+
+def _line_tolerance(item, unit: float) -> float:
+	"""One currency unit per unit sold: saved rows hold a per-unit rate rounded to the currency."""
+	return unit * max(1.0, abs(_line_qty(item)))
+
+
+def _carried_fnf(item, value: float, uncapped: float, capped: float, tolerance: float) -> float:
+	"""F&F the paid row carries, valued from its persisted prices (ERPNext order, as the ledger).
+
+	A row with an F&F marker carries its whole discount as F&F. The POS marks F&F
+	lines with ``posnext_discount_source``; a row without a marker (an older client, or
+	a row the POS left unmarked) counts as F&F only when it has no Pricing Rule or
+	coupon tag and its discount is what the program gives it (full or capped).
+	Any other unmarked discount is a competitor the unpaid path would keep too.
+	"""
+	if value <= 0:
+		return 0.0
+	if _looks_like_fnf_stamp(item, None, bd.AMOUNT_BASIS_UNIT):
+		return value
+	if bd.has_pricing_rules(item) or item.get("posnext_coupon_code") or uncapped <= 0:
+		return 0.0
+	if abs(value - uncapped) <= tolerance or (capped > 0 and abs(value - capped) <= tolerance):
+		return value
+	return 0.0
+
+
+def _stamp_paid_fnf_audit(item, amount: float, percentage: float) -> None:
+	"""Audit markers only (ledger, log, reports). Prices and discounts stay as paid."""
+	_set_item_attr(item, FIELD_DISCOUNT_SOURCE, DISCOUNT_SOURCE_FRIENDS_AND_FAMILY)
+	_set_item_attr(item, FIELD_FNF_AMOUNT, bd.money(amount))
+	_set_item_attr(item, FIELD_FNF_PERCENTAGE, flt(percentage))
+	_set_item_attr(item, FIELD_FNF_PROGRAM, None)
+
+
+def _over_reason(payload: dict, line: dict) -> str:
+	"""Why a row may not carry the F&F it carries."""
+	if not payload.get("eligible"):
+		return (
+			ff_paid.PROGRAM_INACTIVE if payload.get("reason") == REASON_PROGRAM_INACTIVE else ff_paid.NOT_ELIGIBLE
+		)
+	if line.get("reason") in _COMPATIBILITY_LINE_REASONS:
+		return ff_paid.COMPATIBILITY
+	return ff_paid.OVER_DISCOUNT
+
+
+def _disagreement(
+	reason: str, item=None, carried: float = 0.0, uncapped: float = 0.0, capped: float = 0.0, **extra
+) -> dict:
+	entry = {
+		"reason": reason,
+		"carried": bd.money(carried),
+		"entitled_uncapped": bd.money(uncapped),
+		"entitled_capped": bd.money(capped),
+		**extra,
+	}
+	if item is not None:
+		entry.update(
+			{"invoice_row": item.get("name"), "idx": item.get("idx"), "item_code": item.get("item_code")}
+		)
+	return entry
+
+
+def _paid_coupon_value(doc, items, fnf_ids=frozenset()) -> float | None:
+	"""What the invoice's POS Coupon may give as a header on a paid invoice (None if not one):
+	its scoped value (``coupon_value_on``) on the paid lines that carry no F&F.
+
+	A line that got F&F gets no coupon (6d, Ruling 98), so those lines (``fnf_ids``, the
+	``id()`` of each row carrying F&F) are left out; with none left the coupon gives 0.
+	"""
+	rows = [i for i in items if not i.get("is_free_item") and id(i) not in fnf_ids]
+	b_line_values = [bd.line_discount_value(i, bd.AMOUNT_BASIS_UNIT) for i in rows]
+	base_net, base_grand, tax_rate = _scenario_b_bases(doc, rows, b_line_values)
+	lines = _scenario_b_lines(rows, [_snapshot_line(i) for i in rows], [False] * len(rows))
+	coupon = _pos_coupon_value(
+		doc.get("coupon_code"), base_net, base_grand, lines=lines, tax_rate=tax_rate, pos_profile=doc.get("pos_profile")
+	)
+	return None if coupon is None else coupon[0]
+
+
+def _paid_header_disagreement(
+	doc, items, carried_total: float, unit: float, fnf_ids=frozenset()
+) -> dict | None:
+	"""Header discount on a paid invoice: never above the coupon's value, never stacked on F&F.
+
+	Above its POS Coupon's value on the lines without F&F it is a header disagreement
+	whether or not F&F applies (Rulings 92, 98: it blocks online). A header next to F&F
+	lines within that value, or with no POS Coupon, is the stacked case: logged.
+	"""
+	header_amt = _header_discount_value(doc)
+	header_pct = flt(doc.get("additional_discount_percentage") or 0)
+	if header_amt <= 0 and header_pct <= 0:
+		return None
+	code = cstr(doc.get("coupon_code")).strip().upper()
+	coupon_value = _paid_coupon_value(doc, items, fnf_ids) if code else None
+	if coupon_value is not None and header_amt > coupon_value + unit:
+		return _disagreement(
+			ff_paid.HEADER_DISCOUNT,
+			header=bd.money(header_amt),
+			coupon_code=code,
+			coupon_value=bd.money(coupon_value),
+		)
+	if carried_total > 0:
+		return _disagreement(ff_paid.HEADER_DISCOUNT, carried=carried_total, header=bd.money(header_amt), stacked=1)
+	return None
+
+
+def _paid_throw_message(entry: dict) -> str:
+	if entry["reason"] == ff_paid.HEADER_DISCOUNT:
+		if entry.get("stacked"):
+			return _(
+				"The invoice discount {0} cannot be combined with the Friends & Family discount on its lines."
+			).format(ff_money.fmt(entry["header"]))
+		return _("The invoice discount {0} is more than coupon {1} gives ({2}).").format(
+			ff_money.fmt(entry["header"]), entry.get("coupon_code"), ff_money.fmt(entry["coupon_value"])
+		)
+	if entry["reason"] == ff_paid.COMPATIBILITY:
+		return _(
+			"Row {0} ({1}): a promotion or gift on this line cannot be combined with Friends & Family, "
+			"but the line carries a Friends & Family discount of {2}."
+		).format(entry.get("idx"), entry.get("item_code"), ff_money.fmt(entry["carried"]))
+	return _(
+		"Row {0} ({1}): Friends & Family discount {2} is more than the {3} this customer is entitled to."
+	).format(
+		entry.get("idx"),
+		entry.get("item_code"),
+		ff_money.fmt(entry["carried"]),
+		ff_money.fmt(entry["entitled_uncapped"]),
+	)
+
+
+def _freeze_paid_invoice(doc, items) -> None:
+	"""Paid invoice: compare its F&F with the entitlement, never re-price it.
+
+	The entitlement is computed read-only, uncapped and capped, on copies of the
+	rows. Rows that carry F&F get the audit markers (for the usage ledger and the
+	log); prices, discounts, totals and the header discount are never changed.
+
+	* Offline (the customer has left): never throws; each disagreement goes to
+	  ``doc.flags`` and is logged at submit (``Offline Disagreement``).
+	* A stored paid draft pos_next re-saves within the header it held
+	  (``flags.pos_paid_draft``): its header discount never throws, it is logged at
+	  submit (``Paid Disagreement``); its rows are judged as online.
+	* Online: more F&F than the uncapped entitlement, F&F on a line a scheme owns,
+	  or a header discount that is stacked / above its coupon → throw, naming the
+	  row. F&F above the capped entitlement is a cap breach: logged, and the
+	  ledger applies ``on_cap_breach_at_submit`` at submit. Less F&F than the
+	  entitlement is kept and logged (``paid_under_discount``).
+	* A coupon that holds the whole cart (``coupon_split``) leaves no entitlement.
+	"""
+	offline = ff_paid.is_offline(doc)
+	# Copies only: a paid invoice keeps its rows; scope comes from Item.
+	copies = enrich_items_with_catalog([_row_copy(i) for i in items])
+	posting_date = doc.get("posting_date") or nowdate()
+	judge_restored(copies, doc, restore_context(doc.get("customer"), posting_date, doc.get("pos_profile")))
+	kwargs = {
+		"customer": doc.get("customer"),
+		"items": copies,
+		"posting_date": doc.get("posting_date") or nowdate(),
+		"amount_basis": bd.AMOUNT_BASIS_UNIT,
+		"exclude_invoice": doc.get("name") or None,
+		"pos_profile": doc.get("pos_profile"),
+		"conversion_rate": flt(doc.get("conversion_rate")) or 1.0,
+		"company": doc.get("company"),
+	}
+	# A coupon that holds the whole cart leaves the customer owed no F&F (D-R5-05).
+	kwargs["eligibility"] = _invoice_eligibility(doc, posting_date, doc.get("pos_profile"))
+	uncapped = compute_friends_and_family_discounts(ignore_caps=True, **kwargs)
+	capped = compute_friends_and_family_discounts(**kwargs)
+	percentage = flt(uncapped.get("discount_percentage"))
+	unit = 10 ** -ff_money.precision_for(ff_money.current_currency())
+
+	found = []
+	lines = []
+	carried_total = capped_total = within_total = tolerance_total = 0.0
+	for item, u_line, c_line in zip(items, uncapped["items"], capped["items"], strict=False):
+		if cint(item.get("is_free_item")):
 			continue
-		price_list_rate = flt(row.get("price_list_rate"))
-		rate = flt(row.get("rate"))
-		per_unit = price_list_rate - rate if price_list_rate > rate else flt(row.get("discount_amount"))
-		_set_item_attr(row, FIELD_FNF_AMOUNT, -bd.money(abs(flt(row.get("qty"))) * max(0.0, per_unit)))
+		tolerance = _line_tolerance(item, unit)
+		u_amt = flt(u_line["discount_amount"]) if u_line.get("applies") else 0.0
+		c_amt = flt(c_line["discount_amount"]) if c_line.get("applies") else 0.0
+		carried = _carried_fnf(item, bd.line_discount_value(item, bd.AMOUNT_BASIS_UNIT), u_amt, c_amt, tolerance)
+		capped_total += c_amt
+		lines.append((item, carried, u_amt, c_amt, tolerance))
+		if carried <= 0:
+			# Ruling 48: a row left at full price carries no F&F — drop stale client markers,
+			# or the submit log would record a "Discount Applied" the row never gave.
+			_clear_paid_fnf_markers(item)
+			continue
+		_stamp_paid_fnf_audit(item, carried, percentage or flt(item.get("discount_percentage")))
+		carried_total += carried
+		within_total += min(carried, u_amt)
+		tolerance_total += tolerance
+		if carried > u_amt + tolerance:
+			found.append(_disagreement(_over_reason(uncapped, u_line), item, carried, u_amt, c_amt))
+
+	if within_total > capped_total + max(tolerance_total, unit):
+		found.append(
+			_disagreement(ff_paid.CAP_EXCEEDED, carried=within_total, capped=capped_total, caps=capped.get("caps"))
+		)
+	elif carried_total < capped_total - unit:
+		for item, carried, u_amt, c_amt, tolerance in lines:
+			if carried < c_amt - tolerance:
+				found.append(_disagreement(ff_paid.MISSING_FNF, item, carried, u_amt, c_amt))
+
+	fnf_ids = {id(line[0]) for line in lines if line[1] > 0}
+	header = _paid_header_disagreement(doc, items, carried_total, unit, fnf_ids)
+	if header:
+		found.append(header)
+	found.extend(_paid_gift_disagreements(items, fnf_ids))
+
+	if not offline:
+		for entry in found:
+			entry["reason"] = ff_paid.online_reason(entry["reason"])
+		# A header stacked on F&F rows is logged, not thrown: the cart may have sent
+		# both, and the unpaid path used to resolve that silently. So is the header of a
+		# stored paid draft pos_next re-saves within the header it held (Rulings 97, 99: the
+		# POS app sets the flag only then); that draft's rows are still judged.
+		paid_draft = ff_paid.is_paid_draft(doc)
+		blocking = [
+			e
+			for e in found
+			if e["reason"] in ff_paid.ONLINE_BLOCKING
+			and not e.get("stacked")
+			and not (paid_draft and e["reason"] == ff_paid.HEADER_DISCOUNT)
+		]
+		if blocking:
+			frappe.throw(
+				"<br>".join(_paid_throw_message(entry) for entry in blocking)
+				+ "<br>"
+				+ _("The invoice is already paid, so it was not re-priced. Correct the cart and take payment again."),
+				title=_("Friends & Family discount not allowed"),
+			)
+
+	flags = getattr(doc, "flags", None)
+	if flags is not None:
+		# Not the entitlement payload: the submit log then records what the rows carry.
+		flags.friends_and_family = None
+		flags[ff_paid.DISAGREEMENTS_FLAG] = {"offline": offline, "entries": found}
+		# The caps as the cart computed them, for the submit log (D-R2-02).
+		flags[ff_paid.PLAN_FLAG] = capped
 
 
+def _paid_gift_disagreements(items, fnf_ids: set) -> list:
+	"""Gifts the gift policy forbids next to this paid invoice's F&F: reported, never removed.
+
+	The policy runs on copies, keyed on the rows that carry F&F (the POS marks them with
+	``posnext_discount_source``, and free rows keep their rule names; rows from older clients
+	carry no marker, so the default "stamped now" rows would miss them). Each free row it
+	would drop, and each F&F row whose gift stamp it would clear, is one disagreement.
+	"""
+	if not fnf_ids:
+		return []
+	copies = [_row_copy(i) for i in items]
+	keys = ff_compatibility.row_key_list(copies)
+	fnf_keys = {key for key, item in zip(keys, items, strict=True) if id(item) in fnf_ids}
+	kept = [c for c in copies if cint(c.get("is_free_item"))]
+	suppressed = ff_compatibility.enforce_gift_policy(copies, kept, ff_config.resolve(), fnf_keys=fnf_keys)
+	if not suppressed:
+		return []
+	found = []
+	for item, copy in zip(items, copies, strict=True):
+		if cint(copy.get("is_free_item")):
+			gone = all(copy is not k for k in kept)
+		else:
+			gone = (flt(copy.get("discount_amount")), flt(copy.get("discount_percentage"))) != (
+				flt(item.get("discount_amount")),
+				flt(item.get("discount_percentage")),
+			)
+		if gone:
+			found.append(_disagreement(ff_paid.GIFT_WITH_FNF, item, rules=suppressed))
+	return found
+
+
+def _clear_paid_fnf_markers(item) -> None:
+	"""Remove F&F markers only (audit fields and the cart source tag); prices stay as paid."""
+	_clear_fnf_audit_fields(item)
+	if cstr(item.get("discount_source")) == DISCOUNT_SOURCE_FRIENDS_AND_FAMILY:
+		_set_item_attr(item, "discount_source", None)
+
+
+def _clear_fnf_markers_on_coupon_rows(items) -> None:
+	"""A row a line coupon discounts carries no F&F: drop its stale F&F markers and snapshot.
+
+	A coupon never combines with F&F, so an F&F marker on a coupon-tagged row
+	(``posnext_coupon_code``) is left over from before the coupon took the line, e.g. an
+	F&F line that an "Add on top" coupon stacked on the promotion F&F had displaced.
+	Kept, it would make the paid freeze read promotion + coupon as F&F (``_carried_fnf``)
+	and the unpaid path restore the old promotion over the coupon (review I-1).
+	"""
+	for item in items or []:
+		if cint(item.get("is_free_item")) or not item.get("posnext_coupon_code"):
+			continue
+		_clear_paid_fnf_markers(item)
+		if item.get(FIELD_FNF_REPLACED):
+			_set_item_attr(item, FIELD_FNF_REPLACED, None)
+
+
+def _loyalty_total(doc) -> float:
+	"""The total ERPNext checks a redemption against (``validate_loyalty_points``)."""
+	disabled = getattr(doc, "is_rounded_total_disabled", None)
+	if callable(disabled):
+		rounding_off = disabled()
+	else:  # plain dict invoice: same rule from its own field / Global Defaults
+		rounding_off = (
+			doc.get("disable_rounded_total")
+			if "disable_rounded_total" in doc
+			else frappe.db.get_single_value("Global Defaults", "disable_rounded_total")
+		)
+	return flt(doc.get("grand_total") if cint(rounding_off) else doc.get("rounded_total"))
+
+
+def _check_loyalty_redemption(doc) -> None:
+	"""Re-run ERPNext's redemption limit after the F&F step (Ruling 47).
+
+	Only when points are redeemed, against the same total and with the same
+	comparison as ERPNext, so nothing ERPNext accepts is rejected here.
+	"""
+	if not cint(doc.get("redeem_loyalty_points")):
+		return
+	if flt(doc.get("loyalty_amount")) > _loyalty_total(doc):
+		frappe.throw(_("Loyalty redemption exceeds the total after the Friends & Family discount."))
+
+
+@ff_money.in_document_currency
 def apply_friends_and_family_on_invoice(doc, method=None):
 	"""Sales Invoice / POS Invoice ``validate`` — enforce Settings % and best-only.
 
@@ -1120,18 +1863,26 @@ def apply_friends_and_family_on_invoice(doc, method=None):
 	     per-line plan; each F&F row persists ``posnext_discount_source`` and
 	     ``posnext_fnf_discount_amount`` for the monthly usage ledger.
 
-	Returns / credit notes only get their (negative) F&F usage stamped.
+	  5. A paid invoice (:func:`ff_paid.is_paid`) is never re-priced: see
+	     :func:`_freeze_paid_invoice`. After the F&F step the loyalty redemption
+	     is re-checked against the grand total (not on offline sync).
+
+	Returns / credit notes only get their (negative) F&F usage stamped, from
+	the original rows. Consolidated invoices are left untouched.
 
 	Skips during install / migrate / patch.
 	"""
 	if frappe.flags.in_install or frappe.flags.in_migrate or frappe.flags.in_patch:
+		return
+	# Consolidated invoices merge POS Invoices that were already decided and recorded.
+	if cint(doc.get("is_consolidated")):
 		return
 	items = doc.get("items")
 	if not items:
 		return
 
 	if cint(doc.get("is_return")):
-		_stamp_return_usage(items)
+		_stamp_return_usage(doc, items)
 		return
 
 	# Only POS / point-of-sale invoices for now — the program is a POS benefit.
@@ -1140,17 +1891,32 @@ def apply_friends_and_family_on_invoice(doc, method=None):
 	if not is_pos_doc:
 		return
 
+	_clear_fnf_markers_on_coupon_rows(items)
+
+	if ff_paid.is_paid(doc):
+		# Never re-price a paid invoice (offline sync or payment collected).
+		_freeze_paid_invoice(doc, items)
+		if not ff_paid.is_offline(doc):
+			_check_loyalty_redemption(doc)
+		return None
+
 	before = _invoice_state(doc, items)
+	# Scope fields from Item before any rule scope is matched.
+	enrich_items_with_catalog(items)
 	# Re-open earlier decisions: lines get back the discount F&F replaced.
 	for item in items:
-		_restore_replaced_discount(item)
+		_restore_replaced_discount(item, doc)
+	# Buy X Get Y / Routine lines get no F&F (same rule as the cart).
+	ff_compatibility.block_ineligible_lines(items, doc=doc)
 	snapshots = [_snapshot_line(i) for i in items]
 	posting_date = doc.get("posting_date") or nowdate()
 
 	# Scenario-B line values: what each line saves without F&F.
 	pos_profile = doc.get("pos_profile")
-	program = get_customer_eligibility(doc.get("customer"), posting_date, pos_profile)
-	program = program.program if program.eligible else None
+	# Caps are company currency (ledger base_amount); this invoice may be in another.
+	conversion_rate = flt(doc.get("conversion_rate")) or 1.0
+	eligibility = _invoice_eligibility(doc, posting_date, pos_profile)
+	program = eligibility.program if eligibility.eligible else None
 	b_line_values = []
 	fnf_like = []
 	for item in items:
@@ -1165,8 +1931,30 @@ def apply_friends_and_family_on_invoice(doc, method=None):
 		amount_basis=bd.AMOUNT_BASIS_UNIT,
 		exclude_invoice=doc.get("name") or None,
 		pos_profile=pos_profile,
+		conversion_rate=conversion_rate,
+		company=doc.get("company"),
+		eligibility=eligibility,
 	)
 	order_decision = _resolve_order_level(doc, items, snapshots, b_line_values, ff_payload, fnf_like)
+	# Gift policy after the order-level decision, as on the cart: a gift goes only when
+	# its trigger line kept F&F. The invoice never adds gifts, it only removes them.
+	rerun = _enforce_invoice_gift_policy(doc, items)
+	if rerun:
+		items = doc.get("items")
+		# The dropped gift rewrote pricing_rules: re-judge with the doc (Ruling 124).
+		judge_restored(items, doc, restore_context(doc.get("customer"), posting_date, pos_profile))
+		ff_payload = apply_friends_and_family_to_items(
+			items,
+			customer=doc.get("customer"),
+			posting_date=posting_date,
+			amount_basis=bd.AMOUNT_BASIS_UNIT,
+			exclude_invoice=doc.get("name") or None,
+			pos_profile=pos_profile,
+			conversion_rate=conversion_rate,
+			company=doc.get("company"),
+			eligibility=eligibility,
+		)
+	items = doc.get("items")
 	if order_decision:
 		ff_payload["best_discount"]["order"] = order_decision
 		ff_payload["best_discount"]["granularity"] = bd.GRANULARITY_ORDER
@@ -1180,6 +1968,7 @@ def apply_friends_and_family_on_invoice(doc, method=None):
 
 	# frappe._dict answers any attribute with None, so test callability.
 	recalc = getattr(doc, "calculate_taxes_and_totals", None)
-	if _invoice_state(doc, items) != before and callable(recalc):
+	if _invoice_state(doc, doc.get("items")) != before and callable(recalc):
 		recalc()
+	_check_loyalty_redemption(doc)
 	return ff_payload

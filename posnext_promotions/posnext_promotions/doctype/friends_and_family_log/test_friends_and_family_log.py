@@ -322,8 +322,30 @@ class TestFriendsAndFamilyLog(FrappeTestCase):
 		applied = sum(flt(log.discount_amount) for log in logs)
 		self.assertEqual(applied, 0)  # applied 60 + reversal -60
 
+	def _original_sales_invoice(self, name):
+		"""A submitted original (raw insert) with one F&F row: 1 unit, 30 off."""
+		frappe.db.sql(
+			"""insert into `tabSales Invoice` (name, customer, company, posting_date, docstatus, is_pos)
+			values (%s, %s, %s, %s, 1, 1)""",
+			(name, CUSTOMER, self.company, DATE),
+		)
+		frappe.db.sql(
+			f"""insert into `tabSales Invoice Item`
+			(name, parent, parenttype, parentfield, idx, item_code, docstatus, qty, price_list_rate, rate,
+			`{FIELD_DISCOUNT_SOURCE}`, `{FIELD_FNF_AMOUNT}`)
+			values (%s, %s, 'Sales Invoice', 'items', 1, %s, 1, 1, 100, 70, %s, 30)""",
+			(f"{name}-1", name, ITEM, DISCOUNT_SOURCE_FRIENDS_AND_FAMILY),
+		)
+		return f"{name}-1"
+
 	def test_return_logged_with_negative_amount(self):
-		row = self._row(qty=-1, discount_percentage=30, **{FIELD_DISCOUNT_SOURCE: DISCOUNT_SOURCE_FRIENDS_AND_FAMILY})
+		original_row = self._original_sales_invoice("_T-PN131-ORIG")
+		row = self._row(
+			qty=-1,
+			discount_percentage=30,
+			sales_invoice_item=original_row,
+			**{FIELD_DISCOUNT_SOURCE: DISCOUNT_SOURCE_FRIENDS_AND_FAMILY},
+		)
 		row["rate"] = 70
 		plain = self._row(item_code=ITEM_2, qty=-1)
 		doc = self._invoice([row, plain], is_return=1, return_against="_T-PN131-ORIG")

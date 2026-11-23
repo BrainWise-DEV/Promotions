@@ -33,15 +33,17 @@ from posnext_promotions.promotions.friends_and_family_apply import (
 	_is_fnf_stamped,
 	_strip_line_discount,
 	apply_friends_and_family_to_items,
+	judge_restored,
+	restore_context,
 	summarize_line_payloads,
 )
 from posnext_promotions.promotions.friends_and_family_caps import FIELD_FNF_REPLACED
-from posnext_promotions.promotions.friends_and_family_gifts import (
-	allow_free_gift_with_ff,
-	fnf_stamped_indices,
-	mark_fnf_ineligible_lines,
-	suppress_incompatible_gifts,
+from posnext_promotions.promotions import ff_compatibility, ff_config, ff_money, ff_scope
+from posnext_promotions.promotions.ff_compatibility import (
+	enforce_gift_policy,
+	row_key_list,
 )
+from posnext_promotions.promotions.friends_and_family_gifts import fnf_stamped_indices
 from posnext_promotions.promotions.schedule import (
 	filter_rules_by_schedule,
 	get_inactive_rules,
@@ -72,7 +74,6 @@ try:
 	from posnext_promotions.api.gwp import (
 		GWP_BASIS_MAX,
 		PROMOTION_TYPE_GWP,
-		calculate_gwp_discount_amount,
 		distribute_gwp_free_units_for_basis,
 		get_gwp_same_item_free_qty,
 		get_gwp_slab_free_qty,
@@ -102,7 +103,6 @@ except Exception:  # pragma: no cover
 	PROMOTION_TYPE_ITEM_LEVEL = "Item Level Discount"
 	PROMOTION_TYPE_GWP = "GWP"
 	PROMOTION_TYPE_GIFT_POOL = "Gift Pool"
-	calculate_gwp_discount_amount = None
 	get_gwp_slab_free_qty = None
 	get_gwp_same_item_free_qty = None
 	distribute_gwp_free_units_for_basis = None
@@ -149,22 +149,6 @@ def _item_pricing_rule_names(item) -> list[str]:
 def _floor_free_item_qty(qty) -> int:
 	"""Free gift lines are always whole units (floor, never round up)."""
 	return max(0, int(math.floor(flt(qty))))
-
-
-def _stamp_gwp_line_discount(item_doc, line_free_qty, price_list_rate) -> None:
-	line_free_qty = _floor_free_item_qty(line_free_qty)
-	purchased_qty = flt(item_doc.get("qty") or item_doc.get("quantity") or 0)
-	price_list_rate = flt(price_list_rate)
-	line_discount = calculate_gwp_discount_amount(line_free_qty, price_list_rate)
-	if line_discount <= 0 or purchased_qty <= 0:
-		return
-
-	item_doc.discount_amount = line_discount
-	item_doc.discount_percentage = 0
-	item_doc.gwp_free_qty = line_free_qty
-	item_doc.free_qty = line_free_qty
-	item_doc.discount_source = DISCOUNT_SOURCE_GWP
-	item_doc.rate = flt(price_list_rate - (line_discount / purchased_qty))
 
 
 def _make_free_item_doc(item_code, qty, rule_name, full_rule, promotional_scheme=None, **extra):
@@ -345,18 +329,53 @@ def _recompute_recursive_product_free_items(prepared_items, free_items_map, rule
 		if not line_gave_free and applied_rules is not None:
 			applied_rules.discard(rule_name)
 
+
+def _add_gwp_gift_row(free_items_map, item_doc, free_qty, rule_name, full_rule, promotional_scheme) -> None:
+	"""Add ``free_qty`` units of the paid line's item as a GWP free row, on top of the paid qty.
+
+	The paid line is never discounted: a gift is always its own ``is_free_item``
+	row, so a line can't reach 100 % or a zero rate. The row is priced at the rule's
+	free item rate (0 when unset), as same-item GWP is. Rows of one item merge.
+	"""
+	free_qty = _floor_free_item_qty(free_qty)
+	if free_qty <= 0:
+		return
+	item_code = item_doc.get("item_code")
+	existing = free_items_map.get((item_code, rule_name))
+	if existing:
+		existing.qty = _floor_free_item_qty(flt(existing.get("qty")) + free_qty)
+		return
+	# The units are counted in the paid line's UOM, so the gift row uses it too.
+	line_uom = item_doc.get("uom")
+	uom_fields = (
+		{"uom": line_uom, "conversion_factor": flt(item_doc.get("conversion_factor")) or 1}
+		if line_uom
+		else {}
+	)
+	free_items_map[(item_code, rule_name)] = _make_free_item_doc(
+		item_code,
+		free_qty,
+		rule_name,
+		full_rule,
+		promotional_scheme,
+		discount_source=DISCOUNT_SOURCE_GWP,
+		**uom_fields,
+	)
+
+
 def _apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_rules=None) -> None:
-	"""Apply GWP: same-SKU gifts as a free row; mixed SKUs as line discounts.
+	"""Apply GWP: every gift is a free row on top of the paid quantity.
 
 	Same item (one SKU in the cart): paid qty (excluding echoed free rows)
 	must reach min_qty; free units are added on top as a separate free row.
 	Buy 2 get 1 free: 2 paid scans -> +1 free row.
 
 	Multi-item / item-group with mixed SKUs: total qty must fall between
-	min_qty and max_qty; free_qty is discounted on cheapest (Max Price basis)
-	or most expensive (Min Price basis) lines.
+	min_qty and max_qty; free_qty units of the cheapest (Max Price basis) or
+	most expensive (Min Price basis) lines are added as free rows. The paid
+	lines keep their price and carry the rule (the gift's trigger).
 	"""
-	if not calculate_gwp_discount_amount or not get_gwp_slab_free_qty:
+	if not get_gwp_slab_free_qty:
 		return
 
 	gwp_rule_names = [
@@ -452,12 +471,9 @@ def _apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_
 			)
 			for item_doc, line_free in zip(paid_lines, free_per_line, strict=False):
 				append_pricing_rule(item_doc, rule_name)
-				if line_free <= 0:
-					continue
-				price_list_rate = flt(
-					item_doc.get("price_list_rate") or item_doc.get("rate") or 0
+				_add_gwp_gift_row(
+					free_items_map, item_doc, line_free, rule_name, full_rule, promotional_scheme
 				)
-				_stamp_gwp_line_discount(item_doc, line_free, price_list_rate)
 			continue
 
 		if slab_free_qty <= 0:
@@ -476,10 +492,7 @@ def _apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_
 			if line_free <= 0:
 				continue
 
-			price_list_rate = flt(
-				item_doc.get("price_list_rate") or item_doc.get("rate") or 0
-			)
-			_stamp_gwp_line_discount(item_doc, line_free, price_list_rate)
+			_add_gwp_gift_row(free_items_map, item_doc, line_free, rule_name, full_rule, promotional_scheme)
 			append_pricing_rule(item_doc, rule_name)
 
 
@@ -1062,12 +1075,59 @@ def _friends_and_family_response_block(ff_result) -> dict:
 	}
 
 
+def _redeemed_one_time_rules(customer) -> set:
+	"""One-time rules ``customer`` already redeemed, fetched once per cart
+	(:func:`one_time_usage.redeemed_rules`), not counting the invoice being validated
+	(:func:`one_time_usage.judging_invoice`)."""
+	from posnext_promotions.api import one_time_usage
+
+	return one_time_usage.redeemed_rules(customer, one_time_usage.own_invoice())
+
+
+def _one_time_rule_used(record, customer, default_customer, doctype="Sales Invoice", redeemed=()) -> bool:
+	"""One-time-per-customer rule that may not apply (Ruling 114a / 115).
+
+	Never on a cart that is not a Sales Invoice (redemption only counts on invoices,
+	as pos_next), or an anonymous sale; and not once this customer redeemed it
+	(``redeemed`` = ``_redeemed_one_time_rules``, fetched once per call).
+	"""
+	if not cint(record.get("one_time_per_customer")):
+		return False
+	if doctype != "Sales Invoice":
+		return True
+	if not customer or customer == default_customer:
+		return True
+	return record.name in redeemed
+
+
+def _compat_doc(invoice, customer) -> frappe._dict:
+	"""Doc context for the shared BXGY / Routine rule source (same one invoice validate uses)."""
+	pos_profile = invoice.get("pos_profile")
+	company = invoice.get("company") or (
+		frappe.db.get_value("POS Profile", pos_profile, "company") if pos_profile else None
+	)
+	return frappe._dict(
+		company=company,
+		customer=customer,
+		pos_profile=pos_profile,
+		posting_date=invoice.get("posting_date") or nowdate(),
+		posting_time=invoice.get("posting_time"),
+		selling_price_list=invoice.get("selling_price_list") or invoice.get("price_list"),
+	)
+
+
 def _friends_and_family_only_response(items, prepared_items, customer, invoice) -> dict:
 	"""No promotion applies to the cart — Friends & Family still must.
 
 	Without this the early "no pricing rules" returns skipped F&F entirely, so
 	the POS cart never showed it until the invoice was saved.
 	"""
+	# A BXGY rule blocks its lines even when no offer was selected (Ruling 19).
+	judge_restored(
+		prepared_items,
+		_compat_doc(invoice, customer),
+		restore_context(customer, invoice.get("posting_date") or nowdate(), invoice.get("pos_profile")),
+	)
 	ff_result = apply_friends_and_family_to_items(
 		prepared_items,
 		customer=customer,
@@ -1082,7 +1142,14 @@ def _friends_and_family_only_response(items, prepared_items, customer, invoice) 
 			dict(prepared) if _is_fnf_stamped(original) else original
 			for original, prepared in zip(items, prepared_items, strict=False)
 		]
-		return {"items": cleaned, "friends_and_family": _friends_and_family_response_block(ff_result)}
+		return {
+			"items": cleaned,
+			# One response shape whatever the path (a selected offer ERPNext does not pick
+			# ends here too, G5).
+			"free_items": [],
+			"skipped_free_items": [],
+			"friends_and_family": _friends_and_family_response_block(ff_result),
+		}
 	return {
 		"items": [dict(item) for item in prepared_items],
 		"free_items": [],
@@ -1269,6 +1336,8 @@ def _prune_suppressed_rules(applied_rules, ff_result, prepared_items, free_items
 
 
 @frappe.whitelist()
+@ff_compatibility.without_verdict_marks
+@ff_money.in_cart_currency
 def apply_offers(invoice_data, selected_offers=None):
 	"""Calculate and apply promotional offers using ERPNext Pricing Rules.
 
@@ -1278,10 +1347,13 @@ def apply_offers(invoice_data, selected_offers=None):
 	                When provided, results are filtered to only include these rules.
 	                ERPNext handles all conflict resolution based on priority.
 	"""
+	if isinstance(invoice_data, str):
+		invoice_data = json.loads(invoice_data or "{}")
+	# Outside the try: a PermissionError must not become "Error applying offers".
+	customer = cstr((invoice_data or {}).get("customer")).strip()
+	if customer and frappe.db.exists("Customer", customer):
+		frappe.has_permission("Customer", "read", doc=customer, throw=True)
 	try:
-		if isinstance(invoice_data, str):
-			invoice_data = json.loads(invoice_data or "{}")
-
 		invoice = frappe._dict(invoice_data or {})
 		items = invoice.get("items") or []
 
@@ -1309,16 +1381,11 @@ def apply_offers(invoice_data, selected_offers=None):
 		if profile.ignore_pricing_rule:
 			return {"items": items}
 
-		# Batch fetch all item details in a single query (reduces N queries to 1)
-		item_codes = list({item.get("item_code") for item in items if item.get("item_code")})
-		item_details_map = {}
-		if item_codes:
-			item_records = frappe.get_all(
-				"Item",
-				filters={"name": ["in", item_codes]},
-				fields=["name", "item_name", "item_group", "brand", "stock_uom"],
-			)
-			item_details_map = {r.name: r for r in item_records}
+		# Item details for every line in one query, cached for the request (F&F reuses it).
+		item_details_map = {
+			code: frappe._dict(row)
+			for code, row in ff_scope.item_scope_fields(item.get("item_code") for item in items).items()
+		}
 
 		pricing_items = []
 		index_map = []
@@ -1346,19 +1413,12 @@ def apply_offers(invoice_data, selected_offers=None):
 			cached = item_details_map.get(item_code)
 			if cached:
 				item.item_name = item.get("item_name") or cached.item_name
-				item.item_group = item.get("item_group") or cached.item_group
-				item.brand = item.get("brand") or cached.brand
 				item.stock_uom = item.get("stock_uom") or cached.stock_uom
 
-			# Backfill catalog attributes onto the line itself. The cart payload
-			# carries no item_group / brand, and rule scope matching reads them
-			# straight off prepared_items — without this, every Item Group and
-			# Brand rule silently matches nothing.
-			if cached:
-				if not item.get("item_group"):
-					item.item_group = cached.item_group
-				if not item.get("brand"):
-					item.brand = cached.brand
+			# Scope fields always come from Item, never from the client: rule scope
+			# matching reads them straight off prepared_items. An unknown item has none.
+			for field in ff_scope.SCOPE_FIELDS:
+				item[field] = cached.get(field) if cached else None
 
 			if item.get("is_free_item"):
 				continue
@@ -1373,8 +1433,8 @@ def apply_offers(invoice_data, selected_offers=None):
 						"name": item.get("name") or f"POS-{idx}",
 						"item_code": item_code,
 						"item_name": (cached.item_name if cached else item.get("item_name")),
-						"item_group": (cached.item_group if cached else item.get("item_group")),
-						"brand": (cached.brand if cached else item.get("brand")),
+						"item_group": item.get("item_group"),
+						"brand": item.get("brand"),
 						"qty": qty,
 						"stock_qty": qty * conversion_factor,
 						"conversion_factor": conversion_factor,
@@ -1520,6 +1580,13 @@ def apply_offers(invoice_data, selected_offers=None):
 		# Walk-in / default customer can't be tracked one-time, so one-time
 		# rules never apply to anonymous sales (see the loop below).
 		default_customer = profile.get("customer")
+		cart_doctype = invoice.get("doctype") or "Sales Invoice"
+		# One fetch per call; skipped when no one-time rule can apply anyway.
+		redeemed_rules = (
+			_redeemed_one_time_rules(customer)
+			if cart_doctype == "Sales Invoice" and customer and customer != default_customer
+			else set()
+		)
 
 		rule_map = {}
 		if raw_rule_names:
@@ -1545,11 +1612,8 @@ def apply_offers(invoice_data, selected_offers=None):
 				# customers who have already redeemed this rule. Dropping the rule
 				# here keeps its discount out of the per-item loop below (which only
 				# applies rules present in rule_map), mirroring the coupon skip above.
-				if record.one_time_per_customer:
-					if not customer or customer == default_customer:
-						continue
-					if frappe.db.exists("One Time Customer Offer Usage", f"{customer}::{record.name}"):
-						continue
+				if _one_time_rule_used(record, customer, default_customer, cart_doctype, redeemed_rules):
+					continue
 
 				# Include both promotional scheme rules and standalone pricing rules
 				rule_map[record.name] = record
@@ -1573,18 +1637,32 @@ def apply_offers(invoice_data, selected_offers=None):
 					"name",
 					"promotional_scheme",
 					"coupon_code_based",
+					"one_time_per_customer",
 					"promotional_scheme_id",
 					"price_or_product_discount",
 					"promotion_type",
 				],
 			)
 			for record in txn_rule_records:
+				if _one_time_rule_used(record, customer, default_customer, cart_doctype, redeemed_rules):
+					continue
 				rule_map.setdefault(record.name, record)
 
 		if selected_offer_names:
 			# Restrict available rules to the ones explicitly selected from the UI.
 			rule_map = {name: details for name, details in rule_map.items() if name in selected_offer_names}
 			missing_selected = selected_offer_names - set(rule_map.keys())
+			if missing_selected:
+				# Only the names ERPNext's own selection picks for this cart (G5, ledger 531).
+				from posnext_promotions.api.selected_rules import selected_rules_that_win
+
+				missing_selected = selected_rules_that_win(
+					missing_selected,
+					pricing_args,
+					pricing_items,
+					price_list=profile.get("selling_price_list"),
+					redeemed=redeemed_rules,
+				)
 			if missing_selected:
 				extra_records = frappe.get_all(
 					"Pricing Rule",
@@ -1601,6 +1679,9 @@ def apply_offers(invoice_data, selected_offers=None):
 				)
 				for record in extra_records:
 					if record.coupon_code_based:
+						continue
+					# A selected offer is still one-time: same gate as above.
+					if _one_time_rule_used(record, customer, default_customer, cart_doctype, redeemed_rules):
 						continue
 					rule_map[record.name] = record
 
@@ -1692,6 +1773,12 @@ def apply_offers(invoice_data, selected_offers=None):
 			else:
 				line_discount_amount = per_unit_discount
 
+			# Several rules' discounts are summed above; they stop at the line's value
+			# (100 %), never beyond it.
+			discount_percentage = min(discount_percentage, 100.0)
+			if qty and price_list_rate:
+				line_discount_amount = min(line_discount_amount, price_list_rate * qty)
+
 			if not discount_percentage and line_discount_amount and qty and price_list_rate:
 				base_amount = price_list_rate * qty
 				if base_amount:
@@ -1768,10 +1855,16 @@ def apply_offers(invoice_data, selected_offers=None):
 		# whatever promotion / manual discount the line carries, compared in money,
 		# tie → F&F, never stacked. Percentage always from Settings.
 		# Snapshot the lines first: scenario "no F&F" for the order-level check.
-		# Miraaya: Buy X Get Y / Routine (Item Level Discount) lines are not
-		# eligible for F&F. Flag them *before* F&F runs — BXGY free units are only
+		# Miraaya: Routine (Item Level Discount) lines, and Buy X Get Y lines while
+		# Allow Free Gift with F&F is off, are not eligible for F&F. Flag them *before* F&F runs — BXGY free units are only
 		# valued further down, so the paid line would otherwise look undiscounted.
-		mark_fnf_ineligible_lines(prepared_items, rule_map)
+		# One rule source with invoice validate (Ruling 19): rules tagged on the lines plus
+		# every applicable blocking rule, not only the offers the client selected.
+		judge_restored(
+			prepared_items,
+			_compat_doc(invoice, customer),
+			restore_context(customer, invoice.get("posting_date") or nowdate(), invoice.get("pos_profile")),
+		)
 		pre_fnf_items = [frappe._dict(dict(item)) for item in prepared_items]
 		ff_result = apply_friends_and_family_to_items(
 			prepared_items,
@@ -1820,7 +1913,9 @@ def apply_offers(invoice_data, selected_offers=None):
 				_mark_fnf_lost_to_order(ff_result)
 
 		# Paid lines that hold F&F before the gift passes (Allow Free Gift with F&F).
-		fnf_line_indices = fnf_stamped_indices(prepared_items)
+		# Keyed by row (gift passes never reorder prepared_items).
+		line_keys = row_key_list(prepared_items)
+		fnf_line_keys = {line_keys[idx] for idx in fnf_stamped_indices(prepared_items)}
 
 		# Per-item results win on collisions because they already carry full
 		# discount metadata from the per-item engine result.
@@ -1848,17 +1943,24 @@ def apply_offers(invoice_data, selected_offers=None):
 		# Miraaya F&F gift rules (Allow Free Gift with F&F, default off): a Free
 		# Item / GWP / Gift Pool / Brand gift whose trigger line got F&F, or a
 		# cart-total gift on a cart with F&F, is dropped when the setting is off.
-		# BXGY is never dropped here — its lines carry no F&F.
-		gift_suppressed = suppress_incompatible_gifts(
-			fnf_indices=fnf_line_indices,
-			allow_free_gift=allow_free_gift_with_ff(),
-			prepared_items=prepared_items,
-			free_items_map=free_items_map,
+		# BXGY is never dropped here: with the setting off its lines carry no F&F; with
+		# it on the BXGY line gets F&F and keeps its free row (Task 8s).
+		gift_suppressed = enforce_gift_policy(
+			prepared_items,
+			free_items_map,
+			ff_config.resolve(),
+			fnf_keys=fnf_line_keys,
 			rule_map=rule_map,
 			applied_rules=applied_rules,
 		)
 		if gift_suppressed:
-			# A GWP stamp may have overwritten F&F on a paid line; reclaim F&F.
+			# A GWP stamp may have overwritten F&F on a paid line; reclaim F&F. The dropped
+			# gift rewrote pricing_rules: re-judge with the doc first (Ruling 124).
+			judge_restored(
+				prepared_items,
+				_compat_doc(invoice, customer),
+				restore_context(customer, invoice.get("posting_date") or nowdate(), invoice.get("pos_profile")),
+			)
 			ff_result = apply_friends_and_family_to_items(
 				prepared_items,
 				customer=customer,
@@ -1908,6 +2010,11 @@ def apply_offers(invoice_data, selected_offers=None):
 			# PN-128: which discount won per line / for the order, and why.
 			"best_discount": ff_result.get("best_discount"),
 		}
+	except frappe.PermissionError:
+		# A refused read (ERPNext's validate_pricing_context: the cart's target doctype,
+		# a document or a party this user may not read) is the answer, not an offers
+		# error: it reaches the caller as it is, unlogged (D-R3-06).
+		raise
 	except Exception as e:
 		frappe.log_error(frappe.get_traceback(), "Apply Offers Error")
 		frappe.throw(_("Error applying offers: {0}").format(str(e)))

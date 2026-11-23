@@ -13,8 +13,9 @@ from typing import Dict, List, Optional
 
 import frappe
 from frappe import _
-from frappe.utils import cint, cstr, flt, getdate, nowdate
+from frappe.utils import cint, flt, getdate, nowdate
 
+from posnext_promotions.promotions import ff_money
 from posnext_promotions.promotions.schedule import SCHEDULE_FIELDS, to_client_payload as schedule_payload
 from posnext_promotions.promotions.scope import (
 	APPLY_ON_CHILD_DOCTYPE,
@@ -22,7 +23,11 @@ from posnext_promotions.promotions.scope import (
 	get_item_group_with_descendants,
 	get_scope_config,
 )
-from posnext_promotions.api.gwp import PROMOTION_TYPE_GWP, calculate_gwp_discount_percentage
+from posnext_promotions.api.gwp import (
+	PROMOTION_TYPE_GWP,
+	calculate_gwp_discount_percentage,
+	normalize_gwp_paid_qty_basis,
+)
 from posnext_promotions.api.gift_pool import PROMOTION_TYPE_GIFT_POOL
 
 # ============================================================================
@@ -474,37 +479,23 @@ class OfferBuilder:
 		# Determine offer type
 		is_price_discount = rule.get("price_or_product_discount") == DiscountType.PRICE
 		promotion_type = rule.get("promotion_type") or None
-		gwp_discount_percentage = 0
-		if promotion_type == PROMOTION_TYPE_GWP and not is_price_discount:
-			gwp_discount_percentage = calculate_gwp_discount_percentage(
-				flt(slab.get("free_qty", 0)),
-				flt(slab.get("min_qty", 0)),
-			)
+		kind = (
+			OfferBuilder.price_fields(slab)
+			if is_price_discount
+			else OfferBuilder.product_fields(slab, promotion_type)
+		)
 
 		return Offer(
 			name=rule["name"],
 			title=rule.get("title") or rule.get("promotional_scheme") or rule["name"],
 			description=rule.get("title") or rule.get("promotional_scheme") or "",
 			apply_on=rule["apply_on"],
-			offer="Item Price" if is_price_discount else "Give Product",
 			auto=is_auto,
 			coupon_based=1 if rule.get("coupon_code_based") else 0,
 			min_qty=flt(slab.get("min_qty", 0)),
 			max_qty=flt(slab.get("max_qty", 0)),
 			min_amt=flt(slab.get("min_amount", 0)),
 			max_amt=flt(slab.get("max_amount", 0)),
-			discount_type=slab.get("rate_or_discount") if is_price_discount else None,
-			rate=flt(slab.get("rate", 0)) if is_price_discount else 0,
-			discount_amount=flt(slab.get("discount_amount", 0)) if is_price_discount else 0,
-			discount_percentage=(
-				flt(slab.get("discount_percentage", 0))
-				if is_price_discount
-				else gwp_discount_percentage
-			),
-			apply_discount_on_price=(slab.get("apply_discount_on_price") if is_price_discount else None),
-			min_or_max_discount_qty_limit=(
-				cint(slab.get("min_or_max_discount_qty_limit", 0)) if is_price_discount else 0
-			),
 			valid_from=rule.get("valid_from"),
 			valid_upto=rule.get("valid_upto"),
 			source=OfferSource.PROMOTIONAL_SCHEME,
@@ -513,21 +504,55 @@ class OfferBuilder:
 			eligible_items=eligible_items,
 			eligible_item_groups=eligible_item_groups,
 			eligible_brands=eligible_brands,
-			# Free item fields for product discounts
-			free_item=slab.get("free_item") if not is_price_discount else None,
-			free_qty=(
-				flt(slab.get("free_qty", 0)) if not is_price_discount and flt(slab.get("free_qty", 0)) > 0
-				else (1 if not is_price_discount and slab.get("is_recursive") else 0)
-			) if not is_price_discount else 0,
-			free_item_uom=slab.get("free_item_uom") if not is_price_discount else None,
-			same_item=1 if slab.get("same_item") and not is_price_discount else 0,
-			is_recursive=1 if slab.get("is_recursive") and not is_price_discount else 0,
-			recurse_for=flt(slab.get("recurse_for", 0)) if not is_price_discount else 0,
-			apply_recursion_over=flt(slab.get("apply_recursion_over", 0)) if not is_price_discount else 0,
 			one_time_per_customer=1 if rule.get("one_time_per_customer") else 0,
 			promotion_type=promotion_type,
-			gwp_paid_qty_basis=slab.get("gwp_paid_qty_basis"),
+			**kind,
 		)
+
+	@staticmethod
+	def price_fields(src: dict) -> dict:
+		"""Offer fields of a Price rule, read from a scheme price slab or a standalone Pricing Rule."""
+		return {
+			"offer": "Item Price",
+			"discount_type": src.get("rate_or_discount"),
+			"rate": flt(src.get("rate", 0)),
+			"discount_amount": flt(src.get("discount_amount", 0)),
+			"discount_percentage": flt(src.get("discount_percentage", 0)),
+			"apply_discount_on_price": src.get("apply_discount_on_price"),
+			"min_or_max_discount_qty_limit": cint(src.get("min_or_max_discount_qty_limit", 0)),
+		}
+
+	@staticmethod
+	def product_fields(src: dict, promotion_type: str | None) -> dict:
+		"""Offer fields of a Product rule (free item), read from a scheme product slab or a
+		standalone Pricing Rule — one shape, so the cart treats both the same online and offline."""
+		free_qty = flt(src.get("free_qty", 0))
+		is_recursive = 1 if src.get("is_recursive") else 0
+		return {
+			"offer": "Give Product",
+			"discount_type": None,
+			"rate": 0,
+			"discount_amount": 0,
+			"discount_percentage": (
+				calculate_gwp_discount_percentage(free_qty, flt(src.get("min_qty", 0)))
+				if promotion_type == PROMOTION_TYPE_GWP
+				else 0
+			),
+			"apply_discount_on_price": None,
+			"min_or_max_discount_qty_limit": 0,
+			"free_item": src.get("free_item"),
+			"free_qty": free_qty if free_qty > 0 else (1 if is_recursive else 0),
+			"free_item_uom": src.get("free_item_uom"),
+			"same_item": 1 if src.get("same_item") else 0,
+			"is_recursive": is_recursive,
+			"recurse_for": flt(src.get("recurse_for", 0)),
+			"apply_recursion_over": flt(src.get("apply_recursion_over", 0)),
+			"gwp_paid_qty_basis": (
+				normalize_gwp_paid_qty_basis(src.get("gwp_paid_qty_basis"))
+				if promotion_type == PROMOTION_TYPE_GWP
+				else src.get("gwp_paid_qty_basis")
+			),
+		}
 
 	@staticmethod
 	def build_from_standalone_rule(rule: dict, eligibility: OfferEligibility) -> Offer:
@@ -548,24 +573,24 @@ class OfferBuilder:
 		elif rule["apply_on"] == ApplyOn.BRAND:
 			eligible_brands = eligibility.brands
 
+		promotion_type = rule.get("promotion_type") or None
+		kind = (
+			OfferBuilder.product_fields(rule, promotion_type)
+			if rule.get("price_or_product_discount") == DiscountType.PRODUCT
+			else OfferBuilder.price_fields(rule)
+		)
+
 		return Offer(
 			name=rule["name"],
 			title=rule.get("title") or rule["name"],
 			description=rule.get("title") or f"Pricing Rule: {rule['name']}",
 			apply_on=rule["apply_on"],
-			offer="Item Price",
 			auto=is_auto,
 			coupon_based=1 if rule.get("coupon_code_based") else 0,
 			min_qty=flt(rule.get("min_qty", 0)),
 			max_qty=flt(rule.get("max_qty", 0)),
 			min_amt=flt(rule.get("min_amt", 0)),
 			max_amt=flt(rule.get("max_amt", 0)),
-			discount_type=rule.get("rate_or_discount"),
-			rate=flt(rule.get("rate", 0)),
-			discount_amount=flt(rule.get("discount_amount", 0)),
-			discount_percentage=flt(rule.get("discount_percentage", 0)),
-			apply_discount_on_price=rule.get("apply_discount_on_price"),
-			min_or_max_discount_qty_limit=cint(rule.get("min_or_max_discount_qty_limit", 0)),
 			valid_from=rule.get("valid_from"),
 			valid_upto=rule.get("valid_upto"),
 			source=OfferSource.PRICING_RULE,
@@ -575,7 +600,8 @@ class OfferBuilder:
 			eligible_item_groups=eligible_item_groups,
 			eligible_brands=eligible_brands,
 			one_time_per_customer=1 if rule.get("one_time_per_customer") else 0,
-			promotion_type=rule.get("promotion_type") or None,
+			promotion_type=promotion_type,
+			**kind,
 		)
 
 
@@ -607,11 +633,12 @@ def get_offers(pos_profile: str) -> list[dict]:
 		offers = []
 
 		# Get offers from promotional schemes
-		scheme_offers = _get_promotional_scheme_offers(profile.company, date)
+		price_list = profile.get("selling_price_list")
+		scheme_offers = _get_promotional_scheme_offers(profile.company, date, price_list)
 		offers.extend(scheme_offers)
 
 		# Get standalone pricing rule offers
-		standalone_offers = _get_standalone_pricing_rule_offers(profile.company, date)
+		standalone_offers = _get_standalone_pricing_rule_offers(profile.company, date, price_list)
 		offers.extend(standalone_offers)
 
 		_attach_accumulative_config(offers)
@@ -622,7 +649,9 @@ def get_offers(pos_profile: str) -> list[dict]:
 
 	except Exception as e:
 		frappe.log_error(f"Error fetching offers: {e!s}", "Offers API")
-		return []
+		# Not answered as "no offers": the POS clears its offline offer cache on an empty
+		# list, and keeps it when the request fails (D-R4-01 review I-2).
+		raise
 
 
 @frappe.whitelist()
@@ -732,12 +761,24 @@ def _attach_gift_pool_config(offers: list[Offer]) -> None:
 			offer.gift_pool_items = by_scheme[offer.promotional_scheme]
 
 
-def _get_promotional_scheme_offers(company: str, date: str) -> list[Offer]:
+# Ruling 135: a Product rule priced for another price list is not this profile's offer
+# (the offline cart cannot tell, so it must not get it). Rules without a price list,
+# and Price rules, are listed as before.
+PRODUCT_PRICE_LIST_SQL = """
+			AND (
+				price_or_product_discount <> 'Product'
+				OR IFNULL(for_price_list, '') = ''
+				OR %(price_list)s IS NULL
+				OR for_price_list = %(price_list)s
+			)"""
+
+
+def _get_promotional_scheme_offers(company: str, date: str, price_list: str | None = None) -> list[Offer]:
 	"""Fetch offers from promotional schemes"""
 
 	# Fetch pricing rules linked to promotional schemes
 	pricing_rules = frappe.db.sql(
-		"""
+		f"""
 		SELECT
 			name, title, apply_on, selling, promotional_scheme,
 			promotional_scheme_id, coupon_code_based, one_time_per_customer,
@@ -751,9 +792,10 @@ def _get_promotional_scheme_offers(company: str, date: str) -> list[Offer]:
 			AND company = %(company)s
 			AND (valid_from IS NULL OR valid_from <= %(date)s)
 			AND (valid_upto IS NULL OR valid_upto >= %(date)s)
+			{PRODUCT_PRICE_LIST_SQL}
 		ORDER BY priority DESC, name
 	""",
-		{"company": company, "date": date},
+		{"company": company, "date": date, "price_list": price_list or None},
 		as_dict=1,
 	)
 
@@ -789,19 +831,26 @@ def _get_promotional_scheme_offers(company: str, date: str) -> list[Offer]:
 	return offers
 
 
-def _get_standalone_pricing_rule_offers(company: str, date: str) -> list[Offer]:
+def _get_standalone_pricing_rule_offers(company: str, date: str, price_list: str | None = None) -> list[Offer]:
 	"""Fetch offers from standalone pricing rules"""
 
-	# Fetch standalone pricing rules (not linked to schemes)
+	# Fetch standalone pricing rules (not linked to schemes), Price and Product alike:
+	# a Product rule (BXGY, free item, cart-total gift, GWP) reaches the cart as
+	# "Give Product", the same shape as a Promotional Scheme product rule (D-17).
+	optional_sql = (
+		", gwp_paid_qty_basis" if frappe.db.has_column("Pricing Rule", "gwp_paid_qty_basis") else ""
+	)
 	pricing_rules = frappe.db.sql(
-		"""
+		f"""
 		SELECT
 			name, title, apply_on, selling,
 			coupon_code_based, one_time_per_customer, price_or_product_discount,
 			rate_or_discount, rate, discount_amount, discount_percentage,
 			apply_discount_on_price, min_or_max_discount_qty_limit,
 			min_qty, max_qty, min_amt, max_amt,
-			priority, valid_from, valid_upto, promotion_type
+			free_item, free_qty, free_item_uom, same_item, is_recursive,
+			recurse_for, apply_recursion_over,
+			priority, valid_from, valid_upto, promotion_type{optional_sql}
 		FROM `tabPricing Rule`
 		WHERE
 			disable = 0
@@ -810,10 +859,16 @@ def _get_standalone_pricing_rule_offers(company: str, date: str) -> list[Offer]:
 			AND company = %(company)s
 			AND (valid_from IS NULL OR valid_from <= %(date)s)
 			AND (valid_upto IS NULL OR valid_upto >= %(date)s)
-			AND price_or_product_discount = %(discount_type)s
+			AND price_or_product_discount IN %(discount_types)s
+			{PRODUCT_PRICE_LIST_SQL}
 		ORDER BY priority DESC, name
 	""",
-		{"company": company, "date": date, "discount_type": DiscountType.PRICE},
+		{
+			"company": company,
+			"date": date,
+			"price_list": price_list or None,
+			"discount_types": (DiscountType.PRICE, DiscountType.PRODUCT),
+		},
 		as_dict=1,
 	)
 
@@ -1001,6 +1056,8 @@ def validate_coupon(
 	company: str | None = None,
 	items=None,
 	pos_profile: str | None = None,
+	taxes=None,
+	target_doctype: str | None = None,
 ) -> dict:
 	"""Validate a coupon code and optionally compute line-level discounts for cart items.
 
@@ -1011,9 +1068,22 @@ def validate_coupon(
 
 	``pos_profile`` (optional): a profile with **Allow F&F** off takes F&F out of the
 	comparison, so the coupon is never compared with (or suppressed by) F&F there.
+
+	``taxes`` (optional, the cart's tax rows): which taxes are exclusive, for a "Grand
+	Total" coupon; without them the POS Profile's tax template decides.
+
+	``target_doctype`` (optional, default Sales Invoice): the document the coupon is for.
+	On a Sales Order / Quotation F&F never applies, so it is not compared at all.
 	"""
 	return _validate_coupon(
-		coupon_code, customer, company, items=items, resolve_best=True, pos_profile=pos_profile
+		coupon_code,
+		customer,
+		company,
+		items=items,
+		resolve_best=True,
+		pos_profile=pos_profile,
+		taxes=taxes,
+		target_doctype=target_doctype,
 	)
 
 
@@ -1040,7 +1110,14 @@ def _fnf_hint(customer, pos_profile=None) -> dict | None:
 
 
 def _validate_coupon(
-	coupon_code, customer=None, company=None, items=None, resolve_best=True, pos_profile=None
+	coupon_code,
+	customer=None,
+	company=None,
+	items=None,
+	resolve_best=True,
+	pos_profile=None,
+	taxes=None,
+	target_doctype=None,
 ) -> dict:
 	if not customer:
 		return {"valid": False, "message": _("Customer is required")}
@@ -1056,10 +1133,13 @@ def _validate_coupon(
 		apply_coupon_to_items,
 		check_coupon_code,
 	)
+	from posnext_promotions.promotions import ff_non_invoice
 	from posnext_promotions.promotions.best_discount_coupon import resolve_coupon_best_discount
 
 	if isinstance(items, str):
 		items = json.loads(items) if items else None
+	if isinstance(taxes, str):
+		taxes = json.loads(taxes) if taxes else None
 
 	result = check_coupon_code(coupon_code, customer=customer, company=company)
 	if not result.get("valid") or not result.get("coupon"):
@@ -1077,13 +1157,15 @@ def _validate_coupon(
 	}
 
 	if items is None:
-		hint = _fnf_hint(customer, pos_profile)
+		hint = _fnf_hint(customer, pos_profile) if ff_non_invoice.ff_applies_to(target_doctype) else None
 		if hint:
 			response["friends_and_family"] = hint
 		return response
 
 	if resolve_best:
-		apply_result = resolve_coupon_best_discount(coupon, items, customer=customer, pos_profile=pos_profile)
+		apply_result = resolve_coupon_best_discount(
+			coupon, items, customer=customer, pos_profile=pos_profile, taxes=taxes, doctype=target_doctype
+		)
 	else:
 		apply_result = apply_coupon_to_items(coupon, items)
 	if not apply_result.get("valid"):
@@ -1100,6 +1182,7 @@ def _validate_coupon(
 			"best_discount": apply_result.get("best_discount"),
 			"customer_message": apply_result.get("customer_message"),
 			"kept_promotion_items": apply_result.get("kept_promotion_items") or [],
+			"coupon_value": apply_result.get("coupon_value") or 0,
 		}
 	response.update(
 		{
@@ -1113,6 +1196,8 @@ def _validate_coupon(
 			"message_ar": apply_result.get("message_ar"),
 			"best_discount": apply_result.get("best_discount"),
 			"customer_message": apply_result.get("customer_message"),
+			"coupon_value": apply_result.get("coupon_value") or 0,
+			"replaces_friends_and_family_on_cart": bool(apply_result.get("replaces_friends_and_family_on_cart")),
 		}
 	)
 
@@ -1121,144 +1206,89 @@ def _validate_coupon(
 
 
 @frappe.whitelist()
+@ff_money.in_cart_currency
 def calculate_coupon_discount(
-	coupon_code: str, invoice_data, customer: str | None = None, company: str | None = None
+	coupon_code: str,
+	invoice_data,
+	customer: str | None = None,
+	company: str | None = None,
+	target_doctype: str | None = None,
 ):
-	"""Validate and calculate an order-level coupon discount with item exclusions.
+	"""The coupon's order discount, decided by the same resolver as ``validate_coupon``.
 
-	PN-128: for a Friends & Family customer the order-level coupon competes with
-	the cart's total F&F saving (lines offered to the coupon without their F&F
-	stamp). Larger total wins; tie → F&F. When the coupon wins the response sets
-	``suppress_friends_and_family`` so the POS drops the F&F line stamps (the
-	invoice validate hook enforces the same rule server-side).
+	PN-128: :func:`best_discount_coupon.decide_coupon_vs_fnf` compares the coupon with
+	F&F (lines offered without their F&F stamp) and the discounts already on the lines,
+	as Friends and Family Settings' ``coupon_combination`` says (K1). Larger saving
+	wins; tie → F&F. ``discount`` is what
+	the coupon keeps; when it wins over F&F the response sets
+	``suppress_friends_and_family`` so the POS drops the F&F line stamps (the invoice
+	validate hook enforces the same rule server-side). ``line_updates`` are the lines
+	the coupon won; ``granularity`` is always ``"line"``. ``invoice_data.taxes`` (optional)
+	tells which taxes are exclusive for a "Grand Total" coupon. ``target_doctype``
+	(default ``invoice_data.doctype``): on a Sales Order / Quotation F&F is no rival.
 	"""
 	import json
 
-	from posnext_promotions.api.coupon_engine import apply_coupon_discount
 	from posnext_promotions.promotions import best_discount as bd
-	from posnext_promotions.promotions.best_discount_coupon import (
-		REASON_BETTER_DISCOUNT_EXISTS,
-		_neutral_copy,
-	)
-	from posnext_promotions.promotions.friends_and_family_apply import (
-		compute_friends_and_family_discounts,
-	)
+	from posnext_promotions.promotions.best_discount_coupon import decide_coupon_vs_fnf
 
 	if isinstance(invoice_data, str):
 		invoice_data = json.loads(invoice_data or "{}")
 
 	invoice = frappe._dict(invoice_data or {})
-	items = invoice.get("items") or []
 	company = company or invoice.get("company")
 	customer = customer or invoice.get("customer")
-
-	fnf = compute_friends_and_family_discounts(
-		customer=customer,
-		items=[_neutral_copy(i) for i in items],
-		posting_date=invoice.get("posting_date"),
-		pos_profile=invoice.get("pos_profile"),
-	)
-	fnf_total = sum(flt(line.get("discount_amount")) for line in fnf.get("items") or [] if line.get("applies"))
-	if fnf_total > 0:
-		# Coupon sees the cart without F&F stamps so it can compete with F&F.
-		items = [_neutral_copy(i) for i in items]
-		invoice["grand_total"] = 0
-		invoice["net_total"] = 0
+	pos_profile = invoice.get("pos_profile")
+	invoice.doctype = target_doctype or invoice.get("doctype")
 
 	validation = _validate_coupon(
-		coupon_code,
-		customer,
-		company,
-		items=items,
-		resolve_best=False,
-		pos_profile=invoice.get("pos_profile"),
+		coupon_code, customer, company, pos_profile=pos_profile, target_doctype=invoice.doctype
 	)
 	if not validation.get("valid"):
 		return validation
+	coupon_dict = validation.get("coupon") or {}
+	coupon = frappe.get_doc("POS Coupon", coupon_dict.get("name"))
 
-	coupon = frappe._dict(validation.get("coupon") or {})
-
-	grand_total = flt(invoice.get("grand_total") or 0)
-	net_total = flt(invoice.get("net_total") or 0)
-	tax_amount = flt(invoice.get("total_taxes_and_charges") or invoice.get("tax_amount") or 0)
-
-	if not grand_total and items:
-		from posnext_promotions.api.promotion_exclusions import (
-			PROMOTION_TARGET_COUPON,
-			get_eligible_subtotal,
-			get_excluded_subtotal,
-		)
-		from posnext_promotions.api.coupon_engine import _get_excluded_brands
-
-		excluded_brands = _get_excluded_brands(coupon)
-		subtotal_kwargs = {
-			"promotion_target": PROMOTION_TARGET_COUPON,
-			"excluded_brands": excluded_brands,
-		}
-		net_total = get_eligible_subtotal(items, **subtotal_kwargs) + get_excluded_subtotal(
-			items, **subtotal_kwargs
-		)
-		grand_total = net_total + tax_amount
-
-	if not net_total and items:
-		from posnext_promotions.api.promotion_exclusions import (
-			PROMOTION_TARGET_COUPON,
-			get_eligible_subtotal,
-			get_excluded_subtotal,
-		)
-		from posnext_promotions.api.coupon_engine import _get_excluded_brands
-
-		excluded_brands = _get_excluded_brands(coupon)
-		subtotal_kwargs = {
-			"promotion_target": PROMOTION_TARGET_COUPON,
-			"excluded_brands": excluded_brands,
-		}
-		net_total = get_eligible_subtotal(items, **subtotal_kwargs) + get_excluded_subtotal(
-			items, **subtotal_kwargs
-		)
-
-	result = apply_coupon_discount(
-		coupon,
-		cart_total=grand_total or net_total,
-		net_total=net_total,
-		items=items,
-		tax_amount=tax_amount,
-	)
-
+	decision = decide_coupon_vs_fnf(invoice, coupon, customer=customer, pos_profile=pos_profile)
+	result = decision.result
+	eligible_subtotal = flt(result.get("eligible_subtotal") or 0)
+	gross = sum(bd.line_gross(i) for i in decision.items if not cint(i.get("is_free_item")))
 	response = {
-		"valid": result.get("valid", False),
+		"valid": bool(result.get("valid")) and decision.coupon_wins,
 		"message": result.get("message"),
-		"discount": flt(result.get("discount") or 0),
-		"discount_type": result.get("discount_type"),
-		"discount_percentage": result.get("discount_percentage"),
-		"apply_on": result.get("apply_on"),
-		"eligible_subtotal": flt(result.get("eligible_subtotal") or 0),
-		"excluded_subtotal": flt(result.get("excluded_subtotal") or 0),
-		"coupon": coupon,
+		"discount": flt(decision.kept_total, 6),
+		"coupon_value": flt(decision.coupon_value, 6),
+		"discount_type": coupon.discount_type,
+		"discount_percentage": coupon.discount_percentage if coupon.discount_type == "Percentage" else None,
+		"apply_on": coupon.apply_on,
+		"eligible_subtotal": eligible_subtotal,
+		"excluded_subtotal": max(gross - eligible_subtotal, 0.0),
+		"coupon": coupon_dict,
+		"granularity": bd.GRANULARITY_LINE,
+		"line_updates": decision.kept,
 	}
+	if not result.get("valid"):
+		response["discount"] = 0
+		return response
 
-	if fnf_total > 0 and response["valid"]:
-		code = cstr(coupon.get("coupon_code")).upper()
-		pct = flt(coupon.get("discount_percentage")) if coupon.get("discount_type") == "Percentage" else None
-		decision = bd.decide(
-			[
-				bd.Candidate(
-					source=bd.SOURCE_FRIENDS_AND_FAMILY,
-					amount=fnf_total,
-					percentage=flt(fnf.get("discount_percentage")) or None,
-				),
-				bd.Candidate(source=bd.SOURCE_ORDER_COUPON, amount=response["discount"], percentage=pct, code=code),
-			],
-			granularity=bd.GRANULARITY_ORDER,
+	summary = decision.summary
+	response["best_discount"] = summary
+	if decision.rejection:
+		response.update({"message_en": None, "message_ar": None, **decision.rejection, "discount": 0})
+		return response
+	if summary.get("suppressed"):
+		response.update(
+			{
+				"message": summary["message"],
+				"message_en": summary.get("message_en"),
+				"message_ar": summary.get("message_ar"),
+			}
 		)
-		msgs = decision.messages()
-		response["best_discount"] = bd.summarize([], decision)
-		response.update({"message": msgs["message"], "message_en": msgs["en"], "message_ar": msgs["ar"]})
-		if decision.fnf_wins:
-			response.update({"valid": False, "discount": 0, "reason": REASON_BETTER_DISCOUNT_EXISTS})
-		else:
-			response["suppress_friends_and_family"] = True
-
+	if decision.fnf_lines:
+		response["suppress_friends_and_family"] = True
+	# "Better of the two for the whole cart" and the coupon won: F&F comes off every line,
+	# not only the coupon's (the POS strips it from the whole cart).
+	response["replaces_friends_and_family_on_cart"] = decision.replaces_fnf_on_cart
 	return response
 
 

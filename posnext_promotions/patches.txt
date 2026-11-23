@@ -11,3 +11,5 @@ posnext_promotions.patches.v2_6_0.drop_ff_settings_user_message
 posnext_promotions.patches.v2_6_0.drop_ff_settings_brand_name
 posnext_promotions.patches.v2_6_0.force_apply_with_ff_default
 posnext_promotions.patches.v2_6_0.hide_ff_group_flag_eligibility
+posnext_promotions.patches.v3_0_0.build_ff_usage_ledger
+posnext_promotions.patches.v3_0_0.ff_usage_return_links

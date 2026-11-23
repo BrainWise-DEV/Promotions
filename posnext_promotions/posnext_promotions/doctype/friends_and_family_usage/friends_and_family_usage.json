@@ -1,0 +1,192 @@
+{
+ "actions": [],
+ "autoname": "hash",
+ "creation": "2026-11-17 10:00:00.000000",
+ "description": "Friends & Family usage ledger: one row per invoice line that received F&F. Written on invoice submit, flagged on cancel. Caps sum base_amount per customer and period.",
+ "doctype": "DocType",
+ "editable_grid": 0,
+ "engine": "InnoDB",
+ "field_order": [
+  "customer",
+  "company",
+  "program",
+  "period_key",
+  "column_break_main",
+  "invoice_doctype",
+  "invoice",
+  "invoice_item",
+  "original_row",
+  "posting_date",
+  "section_break_amount",
+  "currency",
+  "qty",
+  "amount",
+  "column_break_amount",
+  "base_amount",
+  "is_return",
+  "is_cancelled"
+ ],
+ "fields": [
+  {
+   "fieldname": "customer",
+   "fieldtype": "Link",
+   "label": "Customer",
+   "options": "Customer",
+   "reqd": 1,
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "read_only": 1
+  },
+  {
+   "fieldname": "company",
+   "fieldtype": "Link",
+   "label": "Company",
+   "options": "Company",
+   "reqd": 1,
+   "in_standard_filter": 1,
+   "description": "The invoice's company.",
+   "read_only": 1
+  },
+  {
+   "fieldname": "program",
+   "fieldtype": "Data",
+   "label": "Program",
+   "description": "Friends & Family program that granted the discount.",
+   "read_only": 1
+  },
+  {
+   "fieldname": "period_key",
+   "fieldtype": "Data",
+   "label": "Period",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "description": "Cap period from the invoice posting date (YYYY-MM). A return uses its original invoice's period.",
+   "read_only": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "column_break_main",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "invoice_doctype",
+   "fieldtype": "Link",
+   "label": "Invoice Type",
+   "options": "DocType",
+   "read_only": 1
+  },
+  {
+   "fieldname": "invoice",
+   "fieldtype": "Dynamic Link",
+   "label": "Invoice",
+   "options": "invoice_doctype",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "read_only": 1
+  },
+  {
+   "fieldname": "invoice_item",
+   "fieldtype": "Data",
+   "label": "Invoice Item",
+   "read_only": 1
+  },
+  {
+   "fieldname": "original_row",
+   "fieldtype": "Data",
+   "label": "Original Invoice Item",
+   "search_index": 1,
+   "read_only": 1,
+   "description": "Returns only: the original invoice row this return row gives F&F back for."
+  },
+  {
+   "fieldname": "posting_date",
+   "fieldtype": "Date",
+   "label": "Posting Date",
+   "read_only": 1
+  },
+  {
+   "fieldname": "section_break_amount",
+   "fieldtype": "Section Break",
+   "label": "Amount"
+  },
+  {
+   "fieldname": "currency",
+   "fieldtype": "Link",
+   "label": "Currency",
+   "options": "Currency",
+   "read_only": 1
+  },
+  {
+   "fieldname": "qty",
+   "fieldtype": "Float",
+   "label": "Qty",
+   "read_only": 1,
+   "description": "Quantity on the invoice row (negative on returns)."
+  },
+  {
+   "fieldname": "amount",
+   "fieldtype": "Currency",
+   "label": "Amount",
+   "options": "currency",
+   "description": "Friends & Family saving on the line, invoice currency. Negative on returns.",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_amount",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "base_amount",
+   "fieldtype": "Currency",
+   "label": "Amount (Company Currency)",
+   "options": "Company:company:default_currency",
+   "in_list_view": 1,
+   "description": "Amount x conversion rate. Caps compare on this.",
+   "read_only": 1
+  },
+  {
+   "fieldname": "is_return",
+   "fieldtype": "Check",
+   "label": "Is Return",
+   "default": "0",
+   "read_only": 1
+  },
+  {
+   "fieldname": "is_cancelled",
+   "fieldtype": "Check",
+   "label": "Is Cancelled",
+   "default": "0",
+   "read_only": 1
+  }
+ ],
+ "in_create": 1,
+ "index_web_pages_for_search": 0,
+ "links": [],
+ "modified": "2026-11-17 18:00:00.000000",
+ "modified_by": "Administrator",
+ "module": "POSNext Promotions",
+ "name": "Friends and Family Usage",
+ "naming_rule": "Random",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Sales Manager"
+  },
+  {
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "Accounts Manager"
+  }
+ ],
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": [],
+ "title_field": "customer",
+ "track_changes": 0
+}
