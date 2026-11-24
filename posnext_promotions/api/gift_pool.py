@@ -18,6 +18,7 @@ import frappe
 from frappe.utils import cint, cstr, flt
 
 from posnext_promotions.promotions.scope import get_item_group_with_descendants
+from posnext_promotions.api.security import ensure_desk_user
 
 PROMOTION_TYPE_GIFT_POOL = "Gift Pool"
 
@@ -163,6 +164,7 @@ def gift_pool_item_query(doctype, txt, searchfield, start, page_len, filters, as
 	``as_dict=1`` and reads ``result.item_name`` / ``result.item_group``; lists
 	render as blank checkbox rows.
 	"""
+	ensure_desk_user()
 	if isinstance(filters, str):
 		filters = frappe.parse_json(filters)
 	filters = frappe._dict(filters or {})
