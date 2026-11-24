@@ -19,6 +19,7 @@ from posnext_promotions.promotions.friends_and_family_eligibility import (
 	get_customer_eligibility,
 	get_eligibility_rules_payload,
 )
+from posnext_promotions.api.security import ensure_desk_user, ensure_pos_user
 
 
 def _parse_items(items):
@@ -41,6 +42,9 @@ def get_friends_and_family_program(posting_date: str | None = None, pos_profile:
 	indefinitely so admin changes take effect on the next recalculation.
 	A ``pos_profile`` with **Allow F&F** off always gets ``{"active": False}``.
 	"""
+	ensure_desk_user()
+	if pos_profile:
+		ensure_pos_user(pos_profile)
 	program = get_active_program(posting_date) if profile_allows_ff(pos_profile) else None
 	if program is None:
 		return {"active": False}
@@ -69,6 +73,9 @@ def check_friends_and_family_eligibility(
 	``friends_and_family_apply.apply_friends_and_family_to_items``, so a client
 	cannot grant F&F by ignoring this answer.
 	"""
+	ensure_desk_user()
+	if pos_profile:
+		ensure_pos_user(pos_profile)
 	customer = cstr(customer).strip()
 	if customer and frappe.db.exists("Customer", customer):
 		frappe.has_permission("Customer", "read", doc=customer, throw=True)
@@ -126,6 +133,9 @@ def apply_friends_and_family_discount(
 	     ``apply_offers``, which also runs the same engine).
 	  3. Never send a cashier-editable F&F percentage; the server overwrites it.
 	"""
+	ensure_desk_user()
+	if pos_profile:
+		ensure_pos_user(pos_profile)
 	customer = cstr(customer).strip() or None
 	if customer and frappe.db.exists("Customer", customer):
 		frappe.has_permission("Customer", "read", doc=customer, throw=True)

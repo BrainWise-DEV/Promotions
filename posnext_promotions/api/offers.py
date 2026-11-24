@@ -24,6 +24,7 @@ from posnext_promotions.promotions.scope import (
 )
 from posnext_promotions.api.gwp import PROMOTION_TYPE_GWP, calculate_gwp_discount_percentage
 from posnext_promotions.api.gift_pool import PROMOTION_TYPE_GIFT_POOL
+from posnext_promotions.api.security import ensure_desk_user, ensure_pos_user
 
 # ============================================================================
 # Constants
@@ -601,6 +602,7 @@ def get_offers(pos_profile: str) -> list[dict]:
 	Returns:
 		List of offer dictionaries
 	"""
+	ensure_pos_user(pos_profile)
 	try:
 		profile = frappe.get_doc("POS Profile", pos_profile)
 
@@ -639,8 +641,10 @@ def get_customer_one_time_redemptions(customer: str | None = None) -> list[str]:
 	the cart caches this list when a customer is selected (while online) so the
 	offline offer engine can mirror the server-side gate in ``apply_offers``.
 	"""
+	ensure_desk_user()
 	if not customer or not frappe.db.table_exists("One Time Customer Offer Usage"):
 		return []
+	frappe.has_permission("Customer", "read", customer, throw=True)
 
 	return frappe.get_all(
 		"One Time Customer Offer Usage",
@@ -853,6 +857,7 @@ def item_has_active_promotion(
 	Locks manual discounts only when ``qty`` falls within a matching rule's
 	min_qty / max_qty (e.g. Buy 2–5 Get 1). Qty outside that range does not lock.
 	"""
+	ensure_desk_user()
 	if not item_code:
 		return {"has_promotion": False}
 
@@ -982,8 +987,10 @@ def item_has_active_promotion(
 @frappe.whitelist()
 def get_active_coupons(customer: str | None = None, company: str | None = None) -> list[dict]:
 	"""Get active gift card coupons for a customer"""
+	ensure_desk_user()
 	if not customer or not company:
 		return []
+	frappe.has_permission("Customer", "read", customer, throw=True)
 
 	if not frappe.db.table_exists("POS Coupon"):
 		return []
@@ -1020,6 +1027,11 @@ def validate_coupon(
 	``pos_profile`` (optional): a profile with **Allow F&F** off takes F&F out of the
 	comparison, so the coupon is never compared with (or suppressed by) F&F there.
 	"""
+	ensure_desk_user()
+	if pos_profile:
+		ensure_pos_user(pos_profile)
+	if customer:
+		frappe.has_permission("Customer", "read", customer, throw=True)
 	return _validate_coupon(
 		coupon_code, customer, company, items=items, resolve_best=True, pos_profile=pos_profile
 	)
@@ -1140,6 +1152,7 @@ def calculate_coupon_discount(
 	``suppress_friends_and_family`` so the POS drops the F&F line stamps (the
 	invoice validate hook enforces the same rule server-side).
 	"""
+	ensure_desk_user()
 	import json
 
 	from posnext_promotions.api.coupon_engine import apply_coupon_discount
@@ -1159,6 +1172,10 @@ def calculate_coupon_discount(
 	items = invoice.get("items") or []
 	company = company or invoice.get("company")
 	customer = customer or invoice.get("customer")
+	if invoice.get("pos_profile"):
+		ensure_pos_user(invoice.get("pos_profile"))
+	if customer:
+		frappe.has_permission("Customer", "read", customer, throw=True)
 
 	fnf = compute_friends_and_family_discounts(
 		customer=customer,
@@ -1272,5 +1289,6 @@ def calculate_coupon_discount(
 
 @frappe.whitelist()
 def apply_offers(invoice_data, selected_offers=None):
+	ensure_desk_user()
 	from posnext_promotions.api.apply_offers import apply_offers as _apply_offers
 	return _apply_offers(invoice_data, selected_offers=selected_offers)

@@ -9,6 +9,7 @@ from frappe.utils import cint, flt, getdate
 from posnext_promotions.promotions import friends_and_family
 from posnext_promotions.promotions import friends_and_family_eligibility as eligibility
 from posnext_promotions.promotions.friends_and_family_log import log_settings_change
+from posnext_promotions.api.security import ensure_desk_user
 
 
 class FriendsandFamilySettings(Document):
@@ -168,6 +169,7 @@ _PICKER_SOURCES = {
 @frappe.whitelist()
 def get_all_for_table(source_doctype: str, leaf_only=1):
 	"""Names for the 'Get All' buttons: enabled sales items, item groups (leaf only by default), brands."""
+	ensure_desk_user()
 	frappe.only_for(("System Manager", "Sales Manager"))
 	if source_doctype not in _PICKER_SOURCES:
 		frappe.throw(_("Unsupported doctype {0}").format(source_doctype))

@@ -12,6 +12,7 @@ from posnext_promotions.api.coupon_engine import (
 	PROMOTION_CONFLICT_SKIP,
 )
 from posnext_promotions.api.gwp import GWP_BASIS_MAX
+from posnext_promotions.api.security import ensure_desk_user, ensure_pos_user
 
 
 def check_promotion_permissions(action="read"):
@@ -111,6 +112,9 @@ def _apply_promotion_type_constraints(data):
 @frappe.whitelist()
 def get_promotions(pos_profile=None, company=None, include_disabled=False):
 	"""Get all promotional schemes AND standalone pricing rules for POS with simplified structure."""
+	ensure_desk_user()
+	if pos_profile:
+		ensure_pos_user(pos_profile)
 	check_promotion_permissions("read")
 
 	filters = {}
@@ -252,6 +256,7 @@ def get_promotions(pos_profile=None, company=None, include_disabled=False):
 @frappe.whitelist()
 def get_promotion_details(scheme_name):
 	"""Get detailed information about a promotional scheme OR standalone pricing rule."""
+	ensure_desk_user()
 	check_promotion_permissions("read")
 
 	# Check if it's a Promotional Scheme
@@ -328,6 +333,7 @@ def create_promotion(data):
 		"customer_group": "Retail"  # if applicable_for is set
 	}
 	"""
+	ensure_desk_user()
 	check_promotion_permissions("write")
 
 	import json
@@ -478,6 +484,7 @@ def update_promotion(scheme_name, data):
 	Update an existing promotional scheme.
 	Supports updating validity dates, discount values, and slab conditions.
 	"""
+	ensure_desk_user()
 	check_promotion_permissions("write")
 
 	import json
@@ -584,6 +591,7 @@ def update_promotion(scheme_name, data):
 @frappe.whitelist()
 def toggle_promotion(scheme_name, disable=None):
 	"""Enable or disable a promotional scheme."""
+	ensure_desk_user()
 	check_promotion_permissions("write")
 
 	if not frappe.db.exists("Promotional Scheme", scheme_name):
@@ -615,6 +623,7 @@ def toggle_promotion(scheme_name, disable=None):
 @frappe.whitelist()
 def delete_promotion(scheme_name):
 	"""Delete a promotional scheme and its pricing rules."""
+	ensure_desk_user()
 	check_promotion_permissions("delete")
 
 	if not frappe.db.exists("Promotional Scheme", scheme_name):
@@ -637,12 +646,14 @@ def get_item_groups(company=None):
 	"""Get all item groups."""
 	# Item Group is a global doctype, not company-specific
 	# Return all item groups (both parent groups and leaf nodes)
+	ensure_desk_user()
 	return frappe.get_all("Item Group", fields=["name", "parent_item_group", "is_group"], order_by="name")
 
 
 @frappe.whitelist()
 def get_brands():
 	"""Get all brands."""
+	ensure_desk_user()
 	return frappe.get_all("Brand", fields=["name"], order_by="name")
 
 
@@ -650,6 +661,9 @@ def get_brands():
 def search_items(search_term, pos_profile=None, limit=20):
 	"""Search for items."""
 	# Rate limiting: Track API calls per user
+	ensure_desk_user()
+	if pos_profile:
+		ensure_pos_user(pos_profile)
 	cache_key = f"search_items_rate_limit:{frappe.session.user}"
 	call_count_raw = frappe.cache().get(cache_key)
 	call_count = int(call_count_raw) if call_count_raw else 0
@@ -696,6 +710,7 @@ def search_items(search_term, pos_profile=None, limit=20):
 @frappe.whitelist()
 def get_coupons(company=None, include_disabled=False, coupon_type=None):
 	"""Get all coupons for the company with enhanced filtering."""
+	ensure_desk_user()
 	check_promotion_permissions("read")
 
 	filters = {}
@@ -800,6 +815,7 @@ def _set_coupon_scope_tables(coupon, data):
 @frappe.whitelist()
 def get_coupon_details(coupon_name):
 	"""Get detailed information about a specific coupon."""
+	ensure_desk_user()
 	check_promotion_permissions("read")
 
 	if not frappe.db.exists("POS Coupon", coupon_name):
@@ -836,6 +852,7 @@ def create_coupon(data):
 		"campaign": "Campaign Name"  # Optional
 	}
 	"""
+	ensure_desk_user()
 	check_promotion_permissions("write")
 
 	import json
@@ -938,6 +955,7 @@ def update_coupon(coupon_name, data):
 	Update an existing coupon.
 	Can update validity dates, usage limits, disabled status, and discount configuration.
 	"""
+	ensure_desk_user()
 	check_promotion_permissions("write")
 
 	import json
@@ -1008,6 +1026,7 @@ def update_coupon(coupon_name, data):
 @frappe.whitelist()
 def toggle_coupon(coupon_name, disabled=None):
 	"""Enable or disable a coupon."""
+	ensure_desk_user()
 	check_promotion_permissions("write")
 
 	if not frappe.db.exists("POS Coupon", coupon_name):
@@ -1040,6 +1059,7 @@ def toggle_coupon(coupon_name, disabled=None):
 @frappe.whitelist()
 def delete_coupon(coupon_name):
 	"""Delete a coupon."""
+	ensure_desk_user()
 	check_promotion_permissions("delete")
 
 	if not frappe.db.exists("POS Coupon", coupon_name):
@@ -1082,6 +1102,10 @@ def apply_referral_code(referral_code, customer):
 	Returns:
 		dict with generated coupon information
 	"""
+	ensure_desk_user()
+	if not customer:
+		frappe.throw(_("Customer is required"))
+	frappe.has_permission("Customer", "write", customer, throw=True)
 	try:
 		apply_code = frappe.get_attr(
 			"pos_next.pos_next.doctype.referral_code.referral_code.apply_referral_code"
@@ -1097,6 +1121,8 @@ def apply_referral_code(referral_code, customer):
 			"referrer_coupon": result.get("referrer_coupon"),
 			"referee_coupon": result.get("referee_coupon"),
 		}
+	except frappe.PermissionError:
+		raise
 	except Exception as e:
 		frappe.db.rollback()
 		frappe.log_error(title=_("Apply Referral Code Failed"), message=frappe.get_traceback())
@@ -1106,6 +1132,8 @@ def apply_referral_code(referral_code, customer):
 @frappe.whitelist()
 def get_referral_codes(company=None, include_disabled=False):
 	"""Get all referral codes with optional filters."""
+	ensure_desk_user()
+	check_promotion_permissions("read")
 	filters = {}
 
 	if company:
@@ -1143,6 +1171,7 @@ def get_referral_codes(company=None, include_disabled=False):
 @frappe.whitelist()
 def get_referral_details(referral_name):
 	"""Get detailed information about a specific referral code."""
+	ensure_desk_user()
 	check_promotion_permissions("read")
 
 	if not frappe.db.exists("Referral Code", referral_name):

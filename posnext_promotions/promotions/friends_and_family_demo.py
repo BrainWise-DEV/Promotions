@@ -53,6 +53,7 @@ from posnext_promotions.promotions.friends_and_family_eligibility import (
 	ensure_customer_flag_field,
 )
 from posnext_promotions.promotions.friends_and_family_testing import approved_domain_rows, give_verified_email
+from posnext_promotions.api.security import ensure_desk_user
 
 DEFAULT_PREFIX = "FF Demo"
 DISCOUNT_PERCENTAGE = 30
@@ -74,6 +75,7 @@ COUPONS = (("15", 15), ("40", 40))
 @frappe.whitelist()
 def setup_demo_data(company: str | None = None, price_list: str | None = None, prefix: str | None = None) -> dict:
 	"""Seed the F&F demo data on a development site (System Manager, developer_mode only)."""
+	ensure_desk_user()
 	if not cint_conf("developer_mode"):
 		frappe.throw(
 			_("Friends & Family demo data can only be created when developer_mode is enabled"),

@@ -47,6 +47,7 @@ from posnext_promotions.promotions.schedule import (
 	get_inactive_rules,
 	resolve_moment,
 )
+from posnext_promotions.api.security import ensure_desk_user
 
 try:
 	from erpnext.accounts.doctype.pricing_rule.pricing_rule import (
@@ -1306,6 +1307,7 @@ def apply_offers(invoice_data, selected_offers=None):
 	                When provided, results are filtered to only include these rules.
 	                ERPNext handles all conflict resolution based on priority.
 	"""
+	ensure_desk_user()
 	try:
 		if isinstance(invoice_data, str):
 			invoice_data = json.loads(invoice_data or "{}")
