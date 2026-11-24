@@ -532,7 +532,7 @@ def enforce_cross_cart_pricing_config(doc, method=None):
 				doc.pos_only = 1
 
 		many_items_gwp = (
-			doc.get("apply_on") == "Item Group"
+			doc.get("apply_on") in ("Item Group", "Brand")
 			or (doc.get("apply_on") == "Item Code" and len(doc.get("items") or []) > 1)
 		) and doc.get("promotion_type") == "GWP" and (doc.get("product_discount_slabs") or [])
 		if many_items_gwp:

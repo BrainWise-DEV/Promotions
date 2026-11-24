@@ -302,6 +302,8 @@ def _recompute_recursive_product_free_items(prepared_items, free_items_map, rule
 				full_rule,
 				promotional_scheme,
 			)
+			if applied_rules is not None:
+				applied_rules.add(rule_name)
 			continue
 
 		# Per-line: same-item always; Item Code other-item also.
@@ -342,8 +344,11 @@ def _recompute_recursive_product_free_items(prepared_items, free_items_map, rule
 				)
 			line_gave_free = True
 
-		if not line_gave_free and applied_rules is not None:
-			applied_rules.discard(rule_name)
+		if applied_rules is not None:
+			if line_gave_free:
+				applied_rules.add(rule_name)
+			else:
+				applied_rules.discard(rule_name)
 
 def _apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_rules=None) -> None:
 	"""Apply GWP: same-SKU gifts as a free row; mixed SKUs as line discounts.
@@ -430,6 +435,8 @@ def _apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_
 				discount_source=DISCOUNT_SOURCE_GWP,
 				gwp_same_item_row=1,
 			)
+			if applied_rules is not None:
+				applied_rules.add(rule_name)
 			continue
 
 		if aggregate:
@@ -445,6 +452,10 @@ def _apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_
 				slab_free_qty, total_qty, full_rule.min_qty, full_rule.max_qty
 			)
 			if total_free <= 0:
+				for item_doc in paid_lines:
+					remove_pricing_rule(item_doc, rule_name)
+				if applied_rules is not None:
+					applied_rules.discard(rule_name)
 				continue
 
 			free_per_line = distribute_gwp_free_units_for_basis(
@@ -458,11 +469,14 @@ def _apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_
 					item_doc.get("price_list_rate") or item_doc.get("rate") or 0
 				)
 				_stamp_gwp_line_discount(item_doc, line_free, price_list_rate)
+			if applied_rules is not None:
+				applied_rules.add(rule_name)
 			continue
 
 		if slab_free_qty <= 0:
 			continue
 
+		gave_free = False
 		for item_doc in paid_lines:
 			if rule_name not in _item_pricing_rule_names(item_doc) and not _item_matches_gwp_rule(
 				item_doc, full_rule
@@ -481,6 +495,10 @@ def _apply_gwp_line_discounts(prepared_items, free_items_map, rule_map, applied_
 			)
 			_stamp_gwp_line_discount(item_doc, line_free, price_list_rate)
 			append_pricing_rule(item_doc, rule_name)
+			gave_free = True
+
+		if gave_free and applied_rules is not None:
+			applied_rules.add(rule_name)
 
 
 def _gift_pool_available_qty(pool_codes, warehouse, paid_items, pos_profile):
@@ -595,8 +613,11 @@ def _apply_gift_pool_free_items(
 					)
 			rule_gave_free = True
 
-		if not rule_gave_free and applied_rules is not None:
-			applied_rules.discard(rule_name)
+		if applied_rules is not None:
+			if rule_gave_free:
+				applied_rules.add(rule_name)
+			else:
+				applied_rules.discard(rule_name)
 
 
 # ==========================================
@@ -1075,11 +1096,18 @@ def _friends_and_family_only_response(items, prepared_items, customer, invoice) 
 		pos_profile=invoice.get("pos_profile"),
 	)
 	if not ff_result.get("eligible"):
-		# Keep the cart as sent, minus any stale F&F stamp (e.g. customer
-		# switched to an ineligible one / program ended): those lines come back
-		# at list price with no F&F metadata. Tell the POS why F&F is off.
+		# Keep manual/untouched lines as sent, but drop any stale F&F stamp or
+		# lapsed promotional discount/metadata (e.g. customer switched to an
+		# ineligible one, program ended, or a previously applied offer stopped
+		# qualifying and fell into this early return).
+		def _needs_prepared_reset(original) -> bool:
+			if _is_fnf_stamped(original) or original.get("pricing_rules"):
+				return True
+			src = cstr(original.get("discount_source") or "").strip()
+			return bool(src) and src not in (DISCOUNT_SOURCE_MANUAL, "pos_coupon")
+
 		cleaned = [
-			dict(prepared) if _is_fnf_stamped(original) else original
+			dict(prepared) if _needs_prepared_reset(original) else original
 			for original, prepared in zip(items, prepared_items, strict=False)
 		]
 		return {"items": cleaned, "friends_and_family": _friends_and_family_response_block(ff_result)}
@@ -1398,8 +1426,9 @@ def apply_offers(invoice_data, selected_offers=None):
 			# Clear previously applied promotional metadata if the
 			# current quantity can no longer satisfy the rule.
 			# Preserve manual cashier discounts across offer re-evaluation.
-			is_manual = item.get("discount_source") == DISCOUNT_SOURCE_MANUAL
-			if not is_manual and not is_fnf_stamp and not item.get("pricing_rules"):
+			incoming_source = cstr(item.get("discount_source") or "").strip()
+			is_manual = incoming_source == DISCOUNT_SOURCE_MANUAL
+			if not is_manual and not is_fnf_stamp and not incoming_source and not item.get("pricing_rules"):
 				is_manual = flt(item.get("discount_percentage")) > 0 or flt(item.get("discount_amount")) > 0
 				if is_manual:
 					item.discount_source = DISCOUNT_SOURCE_MANUAL
@@ -1409,6 +1438,12 @@ def apply_offers(invoice_data, selected_offers=None):
 				item.discount_amount = 0
 				item.pricing_rules = []
 				item.applied_promotional_schemes = []
+				item.is_already_discounted = 0
+				item.is_accumulative_discount = 0
+				if incoming_source != "pos_coupon":
+					item.discount_source = ""
+				if price_list_rate:
+					item.rate = price_list_rate
 			else:
 				item.pricing_rules = []
 				item.applied_promotional_schemes = []

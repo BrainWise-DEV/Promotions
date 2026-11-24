@@ -387,7 +387,7 @@ class SlabFetcher:
 		results = frappe.db.sql(
 			f"""
 			SELECT
-				parent, min_qty, max_qty, min_amount, max_amount,
+				name, parent, min_qty, max_qty, min_amount, max_amount,
 				rate_or_discount, rate, discount_amount, discount_percentage,
 				apply_multiple_pricing_rules{optional_sql}
 			FROM `tabPromotional Scheme Price Discount`
@@ -398,9 +398,12 @@ class SlabFetcher:
 			as_dict=1,
 		)
 
-		# Take first slab for each parent
+		# Index each slab by its row name (matching Pricing Rule.promotional_scheme_id)
+		# and also keep the first slab per parent as a fallback for legacy rules.
 		slabs_map = {}
 		for slab in results:
+			if slab.get("name"):
+				slabs_map[slab["name"]] = slab
 			if slab["parent"] not in slabs_map:
 				slabs_map[slab["parent"]] = slab
 
@@ -408,7 +411,7 @@ class SlabFetcher:
 
 	@staticmethod
 	def fetch_product_slabs(scheme_names: list[str]) -> dict[str, dict]:
-		"""Fetch first product discount slab for each scheme"""
+		"""Fetch product discount slabs keyed by slab name and parent fallback"""
 		if not scheme_names:
 			return {}
 
@@ -420,7 +423,7 @@ class SlabFetcher:
 		results = frappe.db.sql(
 			f"""
 			SELECT
-				parent, min_qty, max_qty, min_amount, max_amount,
+				name, parent, min_qty, max_qty, min_amount, max_amount,
 				apply_multiple_pricing_rules,
 				free_item, free_qty, free_item_uom, same_item, is_recursive,
 				recurse_for, apply_recursion_over{optional_sql}
@@ -432,9 +435,12 @@ class SlabFetcher:
 			as_dict=1,
 		)
 
-		# Take first slab for each parent
+		# Index each slab by its row name (matching Pricing Rule.promotional_scheme_id)
+		# and also keep the first slab per parent as a fallback for legacy rules.
 		slabs_map = {}
 		for slab in results:
+			if slab.get("name"):
+				slabs_map[slab["name"]] = slab
 			if slab["parent"] not in slabs_map:
 				slabs_map[slab["parent"]] = slab
 
@@ -772,12 +778,14 @@ def _get_promotional_scheme_offers(company: str, date: str) -> list[Offer]:
 	offers = []
 	for rule in pricing_rules:
 		scheme_name = rule["promotional_scheme"]
+		slab_id = rule.get("promotional_scheme_id")
 
-		# Get appropriate slab
+		# Get appropriate slab: match the exact slab row by promotional_scheme_id first,
+		# falling back to the scheme's first slab for legacy rows without an id.
 		if rule.get("price_or_product_discount") == DiscountType.PRICE:
-			slab = price_slabs.get(scheme_name)
+			slab = (price_slabs.get(slab_id) if slab_id else None) or price_slabs.get(scheme_name)
 		else:
-			slab = product_slabs.get(scheme_name)
+			slab = (product_slabs.get(slab_id) if slab_id else None) or product_slabs.get(scheme_name)
 
 		if not slab:
 			continue

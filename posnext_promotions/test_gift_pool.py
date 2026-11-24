@@ -148,6 +148,51 @@ class TestGiftPoolApplyStockFallback(unittest.TestCase):
 
 		self.assertEqual(list(free_items_map.keys()), [("B", "RULE1")])
 		self.assertEqual(flt(free_items_map[("B", "RULE1")].qty), 1)
+		self.assertIn("RULE1", applied)
+
+	def test_apply_adds_rule_to_empty_applied_rules_when_gift_granted(self):
+		from unittest.mock import patch
+
+		from posnext_promotions.api import apply_offers as mod
+
+		prepared = [
+			frappe._dict(item_code="PAID", item_group="Snacks", qty=1, is_free_item=0)
+		]
+		free_items_map = {}
+		applied = set()
+		rule_map = {
+			"RULE1": frappe._dict(
+				promotional_scheme="SCHEME",
+				promotion_type=PROMOTION_TYPE_GIFT_POOL,
+			)
+		}
+
+		def fake_free_doc(item_code, qty, rule_name, full_rule, promotional_scheme):
+			return frappe._dict(item_code=item_code, qty=qty, pricing_rules=rule_name)
+
+		with (
+			patch.object(mod, "get_scheme_gift_pools", return_value={"Snacks": ["A"]}),
+			patch.object(mod, "get_scheme_gift_pool_qtys", return_value={"Snacks": 1}),
+			patch.object(mod, "expanded_groups", side_effect=lambda group: {group}),
+			patch.object(
+				frappe,
+				"get_cached_doc",
+				return_value=frappe._dict(free_item_uom="Nos", free_item_rate=0),
+			),
+			patch.object(mod, "_gift_pool_available_qty", return_value={"A": 5}),
+			patch.object(mod, "_make_free_item_doc", side_effect=fake_free_doc),
+		):
+			_apply_gift_pool_free_items(
+				prepared,
+				free_items_map,
+				rule_map,
+				applied,
+				warehouse="WH",
+				pos_profile="PROFILE",
+			)
+
+		self.assertIn("RULE1", applied)
+		self.assertIn(("A", "RULE1"), free_items_map)
 
 	def test_apply_skips_all_when_pool_is_oos(self):
 		from unittest.mock import patch
