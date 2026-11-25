@@ -880,7 +880,12 @@ class TestPromotions(FrappeTestCase):
 		self.assertAlmostEqual(flt(free_lines[0].rate), 0, places=2)
 
 	def test_gwp_many_items_max_basis(self):
-		"""Buy 4 across two items; 2 free on cheapest lines when Max basis."""
+		"""Buy 4 across two items; 2 of the cheapest item free (Max basis) as a free row.
+
+		Task 6g: the gift was a line discount (A's 2 units at 100 %, total 160). It is
+		now a free row on top of the paid units, which keep their price: 2 A + 2 B paid
+		(260) and 2 A free.
+		"""
 		rule = _make_rule(
 			"_PNXT_TEST_GWP_ManyMax",
 			apply_on="Item Code",
@@ -902,19 +907,22 @@ class TestPromotions(FrappeTestCase):
 				_line(self.ctx, ITEM_B, qty=2),
 			],
 		)
-		_apply_offers_and_stamp(payload, [rule])
-		final = _submit_invoice(self.ctx, payload, paid_amount=160)
+		resp = _apply_offers_and_stamp(payload, [rule])
+		free_rows = resp.get("free_items") or []
+		self.assertEqual([(row["item_code"], flt(row["qty"])) for row in free_rows], [(ITEM_A, 2)])
+		final = _submit_invoice(self.ctx, payload, paid_amount=260)
 
 		self.assertEqual(final.status, "Paid")
-		self.assertAlmostEqual(flt(final.grand_total), 160, places=2)
+		self.assertAlmostEqual(flt(final.grand_total), 260, places=2)
 
 		by_code = {it.item_code: it for it in final.items if not it.is_free_item}
-		line_a = by_code[ITEM_A]
-		self.assertAlmostEqual(
-			flt(line_a.discount_amount) * flt(line_a.qty), 100, places=2
-		)
-		self.assertAlmostEqual(flt(by_code[ITEM_B].discount_amount), 0, places=2)
-		self.assertEqual(len([it for it in final.items if it.is_free_item]), 0)
+		for code, qty in ((ITEM_A, 2), (ITEM_B, 2)):
+			self.assertAlmostEqual(flt(by_code[code].qty), qty, places=2)
+			self.assertAlmostEqual(flt(by_code[code].rate), ITEM_PRICES[code], places=2)
+			self.assertAlmostEqual(flt(by_code[code].discount_amount), 0, places=2)
+		free_lines = [it for it in final.items if it.is_free_item]
+		self.assertEqual([(it.item_code, flt(it.qty), flt(it.rate)) for it in free_lines], [(ITEM_A, 2, 0)])
+		self.assertEqual(free_lines[0].pricing_rules, rule)
 
 	def test_transaction_level_discount(self):
 		"""10% off entire cart when total ≥ 100; cart of 130 → grand_total 117."""
@@ -1117,10 +1125,9 @@ class TestPromotions(FrappeTestCase):
 		self.assertAlmostEqual(flt(final.items[0].discount_percentage), 15, places=2)
 		self.assertAlmostEqual(flt(final.items[0].discount_amount), 7.5, places=2)
 		self.assertAlmostEqual(flt(final.items[0].rate), 42.5, places=2)
-		# POS Next clears item.pricing_rules pre-save to avoid the ERPNext
-		# removal branch; the rule is still effectively applied via the
-		# discount fields.
-		self.assertFalse(final.items[0].pricing_rules)
+		# The discount survives both saves, and the row keeps the server-confirmed
+		# rule tag (Ruling 137: a promotion-won row keeps the server's rule).
+		self.assertIn(rule, final.items[0].pricing_rules or "")
 
 	def test_transaction_harvest_response(self):
 		"""Canary for the transaction-level harvest fix.

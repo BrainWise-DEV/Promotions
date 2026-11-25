@@ -60,10 +60,12 @@ This module is pure (no DB writes); callers own mutation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from frappe import _
 from frappe.utils import cstr, flt
+
+from posnext_promotions.promotions import ff_money
 
 # ---- candidate sources ---------------------------------------------------
 
@@ -117,8 +119,6 @@ GRANULARITY_ORDER = "order"
 AMOUNT_BASIS_LINE = "line"  # POS cart payloads: discount_amount is the line total
 AMOUNT_BASIS_UNIT = "unit"  # saved invoice rows: ERPNext discount_amount is per unit
 
-MONEY_PRECISION = 2
-
 RULE_PAYLOAD = {
 	"rule": "best_only_no_stacking",
 	"tie_breaker": SOURCE_FRIENDS_AND_FAMILY,
@@ -127,7 +127,8 @@ RULE_PAYLOAD = {
 
 
 def money(value) -> float:
-	return flt(value, MONEY_PRECISION)
+	"""``value`` at the precision of the currency the engine is pricing in."""
+	return ff_money.money(value)
 
 
 # ---- line helpers --------------------------------------------------------
@@ -146,24 +147,51 @@ def line_gross(item) -> float:
 	return line_price_list_rate(item) * line_qty(item)
 
 
+def _charged_saving(item, qty: float, gross: float, pct: float) -> float | None:
+	"""The saving when ``rate`` is what the line charges, else ``None`` (caller uses % / amount).
+
+	ERPNext's ``calculate_item_values`` re-prices a line from its percentage
+	(or amount) only when it has Pricing Rules or no rate; otherwise ``rate``
+	stands and the percentage is only a label. Cart lines carry the list price
+	in ``rate`` and their discount in the percentage / amount (``apply_offers``
+	folds them into the net rate later), so ``rate`` counts only when it is
+	below the list price and no Pricing Rule re-prices the line.
+	"""
+	price_list_rate = line_price_list_rate(item)
+	if price_list_rate <= 0 or qty <= 0:
+		return None
+	if pct >= 100:
+		return gross
+	if has_pricing_rules(item) and (pct > 0 or flt(item.get("discount_amount")) > 0):
+		return None
+	rate = flt(item.get("rate") or 0)
+	if 0 < rate < price_list_rate:
+		return min(gross, (price_list_rate - rate) * qty)
+	return None
+
+
 def line_discount_value(item, amount_basis: str = AMOUNT_BASIS_LINE) -> float:
-	"""Money the line's current discount saves, whatever its source."""
+	"""Money the line's current discount saves, whatever its source.
+
+	The one valuation for cart and invoice (Ruling 28): both follow ERPNext's
+	pricing precedence, so the same line gets the same value on both paths.
+	``amount_basis`` only says whether ``discount_amount`` is per unit (saved
+	invoice rows) or the line total (cart payloads).
+	"""
 	if item.get("is_free_item"):
 		return 0.0
 	qty = line_qty(item)
 	gross = line_gross(item)
 	pct = flt(item.get("discount_percentage") or 0)
+	charged = _charged_saving(item, qty, gross, pct)
+	if charged is not None:
+		return charged
 	if pct > 0 and gross > 0:
 		return min(gross, gross * pct / 100.0)
 	amount = flt(item.get("discount_amount") or 0)
 	if amount > 0:
 		value = amount * qty if amount_basis == AMOUNT_BASIS_UNIT else amount
 		return min(gross, value) if gross > 0 else value
-	if amount_basis == AMOUNT_BASIS_UNIT:
-		rate = flt(item.get("rate") or 0)
-		pl = line_price_list_rate(item)
-		if pl > 0 and 0 <= rate < pl and qty > 0:
-			return (pl - rate) * qty
 	return 0.0
 
 
@@ -244,6 +272,9 @@ class Decision:
 	candidates: list[Candidate] = field(default_factory=list)
 	idx: int | None = None
 	item_code: str | None = None
+	# F&F and the other side as the note names them, by their own money before tax
+	# (a coupon vs F&F on the cart, D-R5-07). The outcome still comes from ``candidates``.
+	shown: tuple[Candidate | None, Candidate | None] | None = None
 
 	@property
 	def fnf(self) -> Candidate | None:
@@ -294,6 +325,8 @@ class Decision:
 		return OUTCOME_OTHER_BETTER
 
 	def messages(self) -> dict:
+		if self.shown:
+			return build_cart_messages(self.outcome, *self.shown)
 		return build_messages(self.outcome, self.fnf, self.best_other or self.skipped_other)
 
 	def to_payload(self) -> dict:
@@ -358,7 +391,7 @@ def _value_text(candidate: Candidate | None) -> str:
 		return "0"
 	if candidate.percentage:
 		return f"{flt(candidate.percentage):g}%"
-	return f"{money(candidate.amount):.2f}"
+	return ff_money.fmt(money(candidate.amount))
 
 
 def build_messages(outcome: str, fnf: Candidate | None, other: Candidate | None) -> dict:
@@ -395,6 +428,51 @@ def build_messages(outcome: str, fnf: Candidate | None, other: Candidate | None)
 		"en": _cap(en.format(fnf_v, o_label["en"], other_v)),
 		"ar": ar.format(fnf_v, o_label["ar"], other_v),
 		"message": _cap(_(en).format(fnf_v, _(o_label["en"]), other_v)),
+		"customer": customer_message_for(outcome, other),
+	}
+
+
+# A coupon vs F&F on one cart (D-R5-07). Each side is named by its own money before tax,
+# never by a %: "20%" against "30%" reads wrong when the 20% saves more on this cart.
+# The sentence says which one the cart saves more with, which is what was compared.
+CART_MESSAGES = {
+	OUTCOME_OTHER_BETTER: (
+		"{1} ({2}) applied instead of the Friends & Family discount ({0}): this cart saves more with {1}.",
+		"تم تطبيق {1} ({2}) بدلاً من خصم الأصدقاء والعائلة ({0}): التوفير في هذه السلة أكبر مع {1}.",
+	),
+	OUTCOME_FNF_BETTER: (
+		"Friends & Family discount ({0}) applied instead of {1} ({2}): this cart saves more with Friends & Family.",
+		"تم تطبيق خصم الأصدقاء والعائلة ({0}) بدلاً من {1} ({2}): التوفير في هذه السلة أكبر مع خصم الأصدقاء والعائلة.",
+	),
+	OUTCOME_TIE_FNF: (
+		"Friends & Family discount ({0}) applied instead of {1} ({2}): this cart saves the same with either, and Friends & Family wins a tie.",
+		"تم تطبيق خصم الأصدقاء والعائلة ({0}) بدلاً من {1} ({2}): التوفير في هذه السلة واحد مع أي منهما، وعند التساوي يُطبَّق خصم الأصدقاء والعائلة.",
+	),
+}
+
+
+def build_cart_messages(outcome: str, fnf: Candidate | None, other: Candidate | None) -> dict:
+	"""A coupon vs F&F on the cart: both named by money (``Candidate.amount``, before tax)."""
+	fnf = replace(fnf, percentage=None) if fnf else None
+	other = replace(other, percentage=None) if other else None
+	if outcome not in CART_MESSAGES:
+		return build_messages(outcome, fnf, other)
+	en, ar = CART_MESSAGES[outcome]
+	o_label = source_label(other.source, other.code) if other else source_label(SOURCE_NONE)
+	o_message = _(o_label["en"])
+	if other is not None and other.source in _COUPON_SOURCES and other.code:
+		# The coupon in ar.csv's word for it, and translatable for the desk (review M7).
+		o_label = {"en": o_label["en"], "ar": f"القسيمة {other.code}"}
+		o_message = _("coupon {0}").format(other.code)
+	fnf_v, other_v = _value_text(fnf), _value_text(other)
+
+	def _cap(text: str) -> str:
+		return text[:1].upper() + text[1:]
+
+	return {
+		"en": _cap(en.format(fnf_v, o_label["en"], other_v)),
+		"ar": ar.format(fnf_v, o_label["ar"], other_v),
+		"message": _cap(_(en).format(fnf_v, o_message, other_v)),
 		"customer": customer_message_for(outcome, other),
 	}
 

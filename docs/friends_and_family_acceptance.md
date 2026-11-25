@@ -52,6 +52,8 @@ POS Coupons (لو POS Next متسطب): `FFDEMO15` (15%) و`FFDEMO40` (40%)، ا
 
 ### 0.2 إعدادات الـ Desk (لو هتجهّز يدوي أو عايز تراجع)
 
+> **Superseded — see design doc** for the Customer Group / Flag eligibility settings below.
+
 افتح **Friends and Family Settings** (Desk → Search → "Friends and Family Settings"):
 
 | Section | Field | القيمة |
@@ -275,11 +277,11 @@ response.best_discount = { winner, lines[], order, fnf_total, suppressed[], stac
 ```bash
 cd ~/frappe-bench
 # اختبارات القبول (end-to-end)
-bench --site brainwise.dev run-tests --skip-before-tests \
-  --module posnext_promotions.posnext_promotions.doctype.friends_and_family_settings.test_friends_and_family_acceptance
+bench --site <dev-site> execute posnext_promotions.dev_tests.run \
+  --kwargs "{'module': 'posnext_promotions.posnext_promotions.doctype.friends_and_family_settings.test_friends_and_family_acceptance'}"
 # POS Profile تاني (اختياري)
-FF_ACCEPTANCE_POS_PROFILE="profile 1" bench --site brainwise.dev run-tests --skip-before-tests \
-  --module posnext_promotions.posnext_promotions.doctype.friends_and_family_settings.test_friends_and_family_acceptance
+FF_ACCEPTANCE_POS_PROFILE="profile 1" bench --site <dev-site> execute posnext_promotions.dev_tests.run \
+  --kwargs "{'module': 'posnext_promotions.posnext_promotions.doctype.friends_and_family_settings.test_friends_and_family_acceptance'}"
 ```
 
 الاختبارات بتعمل بيانات بـ prefix `_Test FF Acc` وبتعمل rollback بعد كل حالة، فمش بتسيب فواتير أو Logs على الـ site.
@@ -341,6 +343,8 @@ QA: open `/app/friends-and-family-settings` → use the grid buttons, save; `/ap
 
 ## Apply with F&F (Promotional Scheme) & Allow F&F (POS Profile) (2026-10-18)
 
+> **Superseded — see design doc** (`docs/superpowers/specs/2026-11-16-friends-and-family-generic-design.md` in pos_next). The per-scheme `apply_with_ff` switch is replaced by the classifier and the compatibility evaluator (`ff_classifier`, `ff_compatibility`).
+
 ### A. Promotional Scheme → **Apply with F&F** (`apply_with_ff`, Check, default 0)
 
 | Scheme check | Line is covered by F&F | Result |
@@ -379,7 +383,7 @@ QA: `/app/pos-profile/<profile>` → untick **Allow F&F** → add an item for an
 no badge, full price; save/submit the invoice: no F&F rows in `/app/friends-and-family-log`.
 Tick it again → F&F applies.
 
-Automated: `bench --site <dev-site> run-tests --app posnext_promotions --module posnext_promotions.posnext_promotions.doctype.friends_and_family_settings.test_friends_and_family_scheme_profile`
+Automated: `bench --site <dev-site> execute posnext_promotions.dev_tests.run --kwargs "{'module': 'posnext_promotions.posnext_promotions.doctype.friends_and_family_settings.test_friends_and_family_scheme_profile'}"`
 (known pre-existing failures unrelated to this change: `test_friends_and_family_best_discount.test_invoice_header_discount_weaker_than_fnf_is_removed`, `test_friends_and_family_acceptance.test_10_coupon_vs_fnf`).
 
 ## Approved Domains + verified email are mandatory (2026-10-20, rev. 2)
@@ -417,16 +421,16 @@ Rules (server = `friends_and_family_eligibility.get_customer_eligibility`):
 | D6 | `FF Demo Public` (non-member) with any email, POS switch off | Normal price, no F&F message, no verify panel |
 | D7 | Add `mail.miraaya.com` as a 2nd row; Staff `x@mail.miraaya.com` verified | F&F applied |
 
-## Allow Free Gift with F&F (2026-11-15, Miraaya)
+## Allow Free Gift with F&F (2026-11-15)
 
 Friends and Family Settings → **Allow Free Gift with F&F** (`allow_free_gift_with_ff`, Check, default **0**).
 
-Global for these gift kinds (not per Promotional Scheme):
+Global for these gift kinds (not per Promotional Scheme). Product Gift with Purchase (counted as Buy X Get Y), Buy X Get Y and Item Level Discount (Routine) items never receive F&F:
 
 | Kind | How we detect it |
 |---|---|
 | Free Item | Product discount, different SKU (`same_item=0`), apply on Item Code / Item Group; Gift Pool schemes |
-| GWP | `promotion_type = GWP` |
+| GWP | Discount-type Gift with Purchase (`promotion_type = GWP`, not a product rule) follows this checkbox. A product GWP rule has `same_item` forced to 1, counts as Buy X Get Y and never receives F&F |
 | Cart Total Gift | Product discount on `apply_on = Transaction` |
 | Brand Gift | Product discount on `apply_on = Brand` |
 
@@ -447,11 +451,19 @@ scheme recursive if the client expects 2 free at qty 4.
 
 | Setting | Result |
 |---|---|
-| ☐ unchecked (default) | A Free Item / GWP / Gift Pool / Brand gift whose **trigger line received F&F** is not awarded (GWP line discount not stamped on an F&F line). A Cart Total gift is removed when F&F applied anywhere on the cart. |
+| ☐ unchecked (default) | A Free Item / Gift Pool / Brand gift whose **trigger line received F&F** is not awarded (a discount-type GWP line discount is not stamped on an F&F line). A Cart Total gift is removed when F&F applied anywhere on the cart. |
 | ☑ checked | Gift and F&F both apply. Cart Total gift threshold is checked on the subtotal **after** F&F. |
 | any, trigger line without F&F | Gift applies as usual. |
 | any | BXGY keeps its free units (its lines have no F&F). |
 
 QA: `/app/friends-and-family-settings` → leave **Allow Free Gift with F&F** off → F&F customer buys the gift trigger item → F&F applies, no gift. Tick the box → F&F **and** the gift. B1G1 item at qty 1..6 → never F&F on that line; other items still F&F.
 
-Automated: `bench --site <dev-site> run-tests --app posnext_promotions --module posnext_promotions.posnext_promotions.doctype.friends_and_family_settings.test_friends_and_family_gifts` and `...test_friends_and_family_scheme_rules`
+Automated: `bench --site <dev-site> execute posnext_promotions.dev_tests.run --kwargs "{'module': 'posnext_promotions.posnext_promotions.doctype.friends_and_family_settings.test_friends_and_family_gifts'}"` and the same with `test_friends_and_family_scheme_rules`
+
+
+## Phase 1 changes (generic F&F redesign)
+
+- **Signed snapshot.** The replaced-discount snapshot a cart line carries is an HMAC-signed envelope (`ff_snapshot`), bound to item, qty, list price, customer, company and POS profile, and it expires per Settings. A client-sent snapshot is never trusted unsigned.
+- **Usage ledger.** Caps read a usage ledger (`ff_ledger`: Friends and Family Usage rows plus a per-customer, per-period Usage Total) written under a per-customer row lock, in company currency, with the period taken from the posting date. Returns credit the original row.
+- **Gift rules on the invoice.** F&F rows persist `posnext_discount_source` and keep the names of their gift rules, including free rows, so the cart and the invoice evaluate the same gift policy.
+- **Install parity.** `after_install` creates the F&F fields, standard message events and ledger keys that `after_migrate` creates. `posnext_promotions.FF_CONTRACT` (1) is exported for pos_next's gate.

@@ -12,6 +12,12 @@ from posnext_promotions.test_promotions import ITEM_A, _cart_payload, _ctx, _lin
 
 
 class TestBundledSameItemFree(FrappeTestCase):
+	@classmethod
+	def setUpClass(cls):
+		super().setUpClass()
+		# The test items must exist before a Pricing Rule can name them (fresh site).
+		cls.ctx = _ctx()
+
 	def test_same_item_free_is_separate_row_on_top(self):
 		"""Same-item Product rule: gift is returned as a free row, the paid
 		line keeps its full price (no carve / rate drift)."""
@@ -27,7 +33,7 @@ class TestBundledSameItemFree(FrappeTestCase):
 			free_item_uom="Nos",
 			free_item_rate=0,
 		)
-		payload = _cart_payload(_ctx(), [_line(_ctx(), ITEM_A, qty=4)])
+		payload = _cart_payload(self.ctx, [_line(self.ctx, ITEM_A, qty=4)])
 		resp = apply_offers(
 			invoice_data=json.dumps(payload),
 			selected_offers=json.dumps([rule]),
@@ -56,8 +62,8 @@ class TestBundledSameItemFree(FrappeTestCase):
 			free_item_uom="Nos",
 			free_item_rate=0,
 		)
-		line = _line(_ctx(), ITEM_A, qty=3)
-		payload = _cart_payload(_ctx(), [line])
+		line = _line(self.ctx, ITEM_A, qty=3)
+		payload = _cart_payload(self.ctx, [line])
 		resp = apply_offers(
 			invoice_data=json.dumps(payload),
 			selected_offers=json.dumps([rule]),
@@ -80,7 +86,7 @@ class TestBundledSameItemFree(FrappeTestCase):
 			free_item_uom="Nos",
 			free_item_rate=0,
 		)
-		payload = _cart_payload(_ctx(), [_line(_ctx(), ITEM_A, qty=3)])
+		payload = _cart_payload(self.ctx, [_line(self.ctx, ITEM_A, qty=3)])
 		resp = apply_offers(
 			invoice_data=json.dumps(payload),
 			selected_offers=json.dumps([rule]),

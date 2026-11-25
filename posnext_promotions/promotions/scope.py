@@ -46,6 +46,9 @@ APPLY_ON_CHILD_DOCTYPE: dict[str, str] = {
 
 ITEM_GROUP_FIELD = "item_group"
 
+# Redis key prefix of the expanded item-group trees (cleared by ff_scope.clear_item_group_cache).
+ITEM_GROUP_CACHE_PREFIX = "item_group_descendants:"
+
 # Per-scope-row discount, added by POS Next to all three child DocTypes.
 SCOPE_PERCENTAGE_FIELD = "pos_discount_percentage"
 
@@ -55,8 +58,9 @@ def get_item_group_with_descendants(item_group):
 	if not item_group:
 		return []
 
-	cache_key = f"item_group_descendants:{item_group}"
-	cached = frappe.cache().get_value(cache_key)
+	cache_key = f"{ITEM_GROUP_CACHE_PREFIX}{item_group}"
+	# expires=True: read Redis, not a per-process copy that outlives a delete.
+	cached = frappe.cache().get_value(cache_key, expires=True)
 	if cached is not None:
 		return cached
 

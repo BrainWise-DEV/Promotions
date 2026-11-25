@@ -12,7 +12,11 @@ is left behind on the site.
 
 Needs a POS Profile that can submit invoices: ``profile 1`` when present,
 otherwise the first enabled profile (override with the
-``FF_ACCEPTANCE_POS_PROFILE`` environment variable).
+``FF_ACCEPTANCE_POS_PROFILE`` environment variable). Prices come from a
+test-owned selling Price List in the profile's currency (set as the demo
+customers' default price list), so the expected amounts hold whatever currency
+the profile's own price list uses; the site's other Pricing Rules are disabled
+for the run (rolled back with everything else).
 """
 
 import os
@@ -22,7 +26,11 @@ import frappe
 from frappe.tests.utils import FrappeTestCase
 from frappe.utils import add_days, flt, nowdate
 
-from posnext_promotions.promotions.friends_and_family_testing import approved_domain_rows
+from posnext_promotions.promotions.friends_and_family_testing import (
+	approved_domain_rows,
+	ensure_test_pos_profile,
+	set_coupon_combination,
+)
 from posnext_promotions.api.apply_offers import apply_offers
 from posnext_promotions.api.friends_and_family import apply_friends_and_family_discount
 from posnext_promotions.api.offers import validate_coupon
@@ -30,6 +38,7 @@ from posnext_promotions.posnext_promotions.report.friends_and_family_performance
 	execute as run_report,
 )
 from posnext_promotions.promotions import best_discount as bd
+from posnext_promotions.promotions import ff_constants, ff_money
 from posnext_promotions.promotions import friends_and_family_demo
 from posnext_promotions.promotions.friends_and_family_caps import (
 	FIELD_DISCOUNT_SOURCE,
@@ -47,13 +56,28 @@ LOG = "Friends and Family Log"
 CASHIER = "_test_ff_acc_cashier@example.com"
 
 
-def _pick_pos_profile() -> str | None:
+def _pick_pos_profile() -> str:
 	wanted = os.environ.get("FF_ACCEPTANCE_POS_PROFILE")
 	if wanted and frappe.db.exists("POS Profile", wanted):
 		return wanted
 	if frappe.db.exists("POS Profile", {"name": "profile 1", "disabled": 0}):
 		return "profile 1"
-	return frappe.db.get_value("POS Profile", {"disabled": 0})
+	return frappe.db.get_value("POS Profile", {"disabled": 0}) or ensure_test_pos_profile()
+
+
+def _ensure_price_list(profile) -> str:
+	"""Selling Price List in the invoice currency, so list prices are not converted.
+
+	A profile's own list may be in another currency than the invoice (e.g. an EGP
+	list on a SAR profile), which would scale every expected amount.
+	"""
+	currency = profile.currency or frappe.get_cached_value("Company", profile.company, "default_currency")
+	name = f"{PREFIX} Selling {currency}"
+	if not frappe.db.exists("Price List", name):
+		frappe.get_doc(
+			{"doctype": "Price List", "price_list_name": name, "currency": currency, "selling": 1, "enabled": 1}
+		).insert(ignore_permissions=True)
+	return name
 
 
 class TestFriendsAndFamilyAcceptance(FrappeTestCase):
@@ -64,8 +88,6 @@ class TestFriendsAndFamilyAcceptance(FrappeTestCase):
 		cls._commit_patch.start()
 		ensure_invoice_item_fields()
 		cls.profile = _pick_pos_profile()
-		if not cls.profile:
-			raise cls.skipTest(cls, "No POS Profile on this site")
 		profile = frappe.get_doc("POS Profile", cls.profile)
 		cls.company = profile.company
 		cls.mode_of_payment = next(
@@ -76,11 +98,21 @@ class TestFriendsAndFamilyAcceptance(FrappeTestCase):
 			),
 			profile.payments[0].mode_of_payment if profile.payments else None,
 		)
-		cls.demo = build_demo_data(prefix=PREFIX, company=cls.company, price_list=profile.selling_price_list)
+		cls.demo = build_demo_data(prefix=PREFIX, company=cls.company, price_list=_ensure_price_list(profile))
 		cls.items = cls.demo["items"]
 		cls.staff = cls.demo["customers"]["staff"]
 		cls.flagged = cls.demo["customers"]["flagged"]
 		cls.public = cls.demo["customers"]["public"]
+		# The invoice takes the customer's default price list before the profile's.
+		for customer in cls.demo["customers"].values():
+			frappe.db.set_value("Customer", customer, "default_price_list", cls.demo["price_list"])
+		# Only the demo Pricing Rules may price these invoices: a site's own rules
+		# (e.g. a cart-wide Transaction rule) would add discounts the scenarios do not
+		# expect. Disabled inside the class transaction (rolled back by the class cleanup).
+		frappe.db.sql(
+			"update `tabPricing Rule` set disable = 1 where disable = 0 and name not in %(keep)s",
+			{"keep": tuple(cls.demo["pricing_rules"].values()) or ("",)},
+		)
 		cls.today = nowdate()
 
 	@classmethod
@@ -247,15 +279,31 @@ class TestFriendsAndFamilyAcceptance(FrappeTestCase):
 		self.assertEqual(flt(self._row(doc, "laptop").rate), 1000)
 
 	def test_01c_pos_cart_payload_contract(self):
-		response = apply_offers(
-			{
-				"customer": self.staff,
-				"pos_profile": self.profile,
-				"company": self.company,
-				"posting_date": self.today,
-				"items": self._cart(("laptop", 1), ("headset", 1)),
-			}
-		)
+		from posnext_promotions.api import apply_offers as apply_offers_module
+
+		apply_ff = apply_offers_module.apply_friends_and_family_to_items
+		seen = []
+
+		def spy(*args, **kwargs):
+			# Before the F&F function's own context: what the rest of the request prices in.
+			seen.append(ff_money.current_currency())
+			return apply_ff(*args, **kwargs)
+
+		with patch.object(apply_offers_module, "apply_friends_and_family_to_items", spy):
+			response = apply_offers(
+				{
+					"customer": self.staff,
+					"pos_profile": self.profile,
+					"company": self.company,
+					"posting_date": self.today,
+					"items": self._cart(("laptop", 1), ("headset", 1)),
+				}
+			)
+		# The whole cart request prices in the cart's currency, not only the F&F call.
+		profile_currency = frappe.get_cached_value("POS Profile", self.profile, "currency")
+		self.assertTrue(seen)
+		self.assertEqual(set(seen), {profile_currency or ff_money.company_currency(self.company)})
+		self.assertIsNone(ff_money.current_currency())
 		ff = response["friends_and_family"]
 		self.assertTrue(ff["eligible"])
 		self.assertEqual(ff["discount_percentage"], 30)
@@ -473,6 +521,9 @@ class TestFriendsAndFamilyAcceptance(FrappeTestCase):
 		coupons = self.demo["coupons"]
 		if not coupons:
 			self.skipTest("POS Coupon (POS Next) is not installed")
+		# Per line: the invoice logs F&F's comparison on the coupon line.
+		set_coupon_combination(ff_constants.COUPON_PER_LINE)
+		self.addCleanup(set_coupon_combination, None)
 		cart = self._cart(("laptop", 1), discount_percentage=30, discount_source=FNF, rate=700)
 		weak = validate_coupon(coupons["15"], customer=self.staff, company=self.company, items=cart)
 		self.assertFalse(weak["valid"])
@@ -487,6 +538,9 @@ class TestFriendsAndFamilyAcceptance(FrappeTestCase):
 
 		def coupon(pct, code):
 			def apply(doc):
+				# The POS sends the coupon on the header as well as on the lines it
+				# tags; validate_scoped_coupon_lines rejects a tag without it.
+				doc.coupon_code = code
 				row = self._row(doc, "laptop")
 				row.discount_percentage = pct
 				row.posnext_coupon_code = code
@@ -508,7 +562,7 @@ class TestFriendsAndFamilyAcceptance(FrappeTestCase):
 		self.assertEqual(flt(self._row(doc, "laptop").get(FIELD_FNF_AMOUNT)), 100)
 		caps = self._payload(doc)["caps"]
 		self.assertEqual((caps["cap_hit"], caps["fnf_uncapped_total"], caps["fnf_applied_total"]), ("order", 300, 100))
-		self.assertIn("per-order maximum of 100.00", caps["message_en"])
+		self.assertIn(f"per-order maximum of {ff_money.fmt(100, doc.currency)}", caps["message_en"])
 		self.assertTrue(caps["message_ar"])
 		types = [log.log_type for log in self._logs(doc)]
 		self.assertEqual(sorted(types), ["Cap Hit", "Discount Applied"])
@@ -527,17 +581,17 @@ class TestFriendsAndFamilyAcceptance(FrappeTestCase):
 		second = self._sell(self.staff, [("laptop", 1)])
 		self.assertEqual(flt(self._row(second, "laptop").rate), 800)  # 200 left
 		self.assertEqual(self._payload(second)["caps"]["cap_hit"], "monthly")
-		self.assertIn("reduced to 200.00", self._payload(second)["message_en"])
+		self.assertIn(f"reduced to {ff_money.fmt(200, second.currency)}", self._payload(second)["message_en"])
 
 		third = self._sell(self.staff, [("phone", 1)])
 		self.assertEqual(flt(self._row(third, "phone").rate), 500)
-		self.assertIn("Monthly Friends & Family limit of 500.00 reached", self._payload(third)["message_en"])
+		self.assertIn(f"Monthly Friends & Family limit of {ff_money.fmt(500, third.currency)} reached", self._payload(third)["message_en"])
 		self.assertEqual(self._logs(third, item_code=self.items["phone"])[0].log_type, "Cap Hit")
-		self.assertEqual(get_monthly_usage(self.staff, self.today), 500)
+		self.assertEqual(get_monthly_usage(self.staff, self.today, company=self.company), 500)
 
 		ret = self._return(first)
 		self.assertEqual(flt(ret.items[0].get(FIELD_FNF_AMOUNT)), -300)
-		self.assertEqual(get_monthly_usage(self.staff, self.today), 200)
+		self.assertEqual(get_monthly_usage(self.staff, self.today, company=self.company), 200)
 		fourth = self._sell(self.staff, [("laptop", 1)])
 		self.assertEqual(flt(self._row(fourth, "laptop").rate), 700)  # 300 allowance again
 
@@ -598,6 +652,37 @@ class TestFriendsAndFamilyAcceptance(FrappeTestCase):
 			(self.staff, self.today),
 		)[0][0]
 		self.assertEqual(flt(direct), 150)
+
+	def test_14b_real_submit_and_cancel_drive_ledger_and_counter(self):
+		from posnext_promotions.promotions import ff_ledger
+
+		period = ff_ledger.period_key(self.today)
+
+		def counter():
+			return flt(
+				frappe.db.get_value(ff_ledger.TOTAL_DOCTYPE, ff_ledger.total_name(self.staff, self.company, period), "base_amount")
+			)
+
+		def rows(doc):
+			return frappe.get_all(
+				ff_ledger.LEDGER_DOCTYPE,
+				filters={"invoice": doc.name},
+				fields=["invoice_doctype", "invoice_item", "base_amount", "is_cancelled", "company", "period_key"],
+			)
+
+		before = counter()
+		doc = self._sell(self.staff, [("laptop", 1)])  # F&F 300
+		recorded = rows(doc)
+		self.assertEqual(len(recorded), 1)
+		self.assertEqual(recorded[0].invoice_doctype, "Sales Invoice")
+		self.assertEqual(recorded[0].invoice_item, self._row(doc, "laptop").name)
+		self.assertEqual(flt(recorded[0].base_amount), 300)
+		self.assertEqual((recorded[0].company, recorded[0].period_key), (self.company, period))
+		self.assertEqual(counter(), before + 300)
+
+		self._cancel(doc)
+		self.assertTrue(all(row.is_cancelled for row in rows(doc)))
+		self.assertEqual(counter(), before)
 
 	def test_15_settings_and_eligibility_changes_are_logged(self):
 		from posnext_promotions.promotions.friends_and_family_testing import give_verified_email

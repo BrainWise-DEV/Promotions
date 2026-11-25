@@ -16,6 +16,8 @@ frappe.listview_settings["Friends and Family Log"] = {
 			"Discount Reversed": "red",
 			"Discount Returned": "orange",
 			"Settings Changed": "purple",
+			"Offline Disagreement": "orange",
+			"Paid Disagreement": "orange",
 		};
 		return [__(doc.log_type), colors[doc.log_type] || "gray", `log_type,=,${doc.log_type}`];
 	},

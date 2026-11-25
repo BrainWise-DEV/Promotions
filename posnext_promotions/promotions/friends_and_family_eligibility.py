@@ -32,10 +32,12 @@ from dataclasses import dataclass
 
 import frappe
 from frappe import _
-from frappe.utils import cint, cstr
+from frappe.utils import cint, cstr, getdate, nowdate
+from frappe.utils.caching import request_cache
 
 from posnext_promotions.promotions.friends_and_family import (
 	FriendsAndFamilyProgram,
+	forget_request_cache,
 	get_active_program,
 	get_settings,
 	profile_allows_ff,
@@ -199,9 +201,29 @@ def get_customer_eligibility(
 ) -> CustomerEligibility:
 	"""Whether ``customer`` gets Friends & Family on ``on_date`` (today when omitted).
 
-	Eligibility is approved email domain + OTP-verified email only.
+	Eligibility is approved email domain + OTP-verified email only. Computed once
+	per request for the same customer, date and profile (:func:`clear_cache` after
+	a write it reads).
 	"""
-	customer = cstr(customer).strip() or None
+	return _cached_eligibility(
+		cstr(customer).strip() or None, getdate(on_date or nowdate()), cstr(pos_profile).strip() or None
+	)
+
+
+@request_cache
+def _cached_eligibility(customer: str | None, on_date, pos_profile: str | None) -> CustomerEligibility:
+	return _compute_eligibility(customer, on_date, pos_profile)
+
+
+def clear_cache(doc=None, method=None) -> None:
+	"""Forget this request's eligibility and Allow-F&F answers.
+
+	Customer / POS Profile ``on_update``; Settings saves clear every request cache.
+	"""
+	forget_request_cache(_cached_eligibility, profile_allows_ff)
+
+
+def _compute_eligibility(customer: str | None, on_date, pos_profile: str | None) -> CustomerEligibility:
 	if not profile_allows_ff(pos_profile):
 		return CustomerEligibility(customer=customer, eligible=False, reason=REASON_PROFILE_NOT_ALLOWED)
 	if not customer:
@@ -243,6 +265,48 @@ def get_customer_eligibility(
 def is_customer_ff_member(customer: str | None, pos_profile: str | None = None) -> bool:
 	"""True when the customer's email domain is approved (OTP may be offered for F&F)."""
 	return bool(get_customer_eligibility(customer, pos_profile=pos_profile).ff_member)
+
+
+def _log_verification_change(customer: str, verified: bool, email_domain: str | None, via: str | None) -> None:
+	"""F&F Log row for an email-verification change. Domain and flags only, never the address.
+
+	Inside a save of this Customer (POS Next resets the verification from its
+	``on_update`` when the email changes) the Customer ``on_update`` logger writes the
+	row, with the diff and the previous qualifying reason: one change, one row.
+	"""
+	if ("Customer", customer) in (frappe.flags.currently_saving or []):
+		return
+	from posnext_promotions.promotions.friends_and_family_log import (
+		LOG_ELIGIBILITY_APPLIED,
+		LOG_ELIGIBILITY_REMOVED,
+		write_log,
+	)
+
+	write_log(
+		LOG_ELIGIBILITY_APPLIED if verified else LOG_ELIGIBILITY_REMOVED,
+		customer=customer,
+		reference_doctype="Customer",
+		reference_name=customer,
+		reason=REASON_EMAIL_VERIFIED if verified else REASON_EMAIL_NOT_VERIFIED,
+		message=_("Customer {0} email verification changed ({1})").format(customer, via or "-"),
+		details={"email_domain": email_domain, "verified": bool(verified), "via": via},
+	)
+
+
+def benefit_provider() -> dict:
+	"""``pos_next_customer_benefit_providers`` hook: lets POS Next ask who is an F&F member,
+	and what F&F rate the server gives each row of an invoice (``fnf_line_rates``)."""
+	return {
+		"is_member": is_customer_ff_member,
+		"on_verification_change": _log_verification_change,
+		"fnf_line_rates": _fnf_line_rates,
+	}
+
+
+def _fnf_line_rates(doc) -> dict:
+	from posnext_promotions.promotions.friends_and_family_apply import fnf_line_rates
+
+	return fnf_line_rates(doc)
 
 
 def is_customer_eligible(customer: str | None, on_date=None, pos_profile: str | None = None) -> bool:

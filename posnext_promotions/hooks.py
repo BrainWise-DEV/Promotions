@@ -77,27 +77,56 @@ doc_events = {
 		],
 		"on_submit": [
 			"posnext_promotions.api.one_time_usage.record_one_time_offer_usage",
+			"posnext_promotions.promotions.ff_ledger.on_submit",
 			"posnext_promotions.promotions.friends_and_family_log.log_invoice_submit",
+			"posnext_promotions.overrides.coupon_split.log_under_applied",
 		],
 		"on_cancel": [
 			"posnext_promotions.api.one_time_usage.release_one_time_offer_usage",
+			"posnext_promotions.promotions.ff_ledger.on_cancel",
 			"posnext_promotions.promotions.friends_and_family_log.log_invoice_cancel",
 		],
 	},
-	"Sales Order": {"validate": "posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts"},
-	"Quotation": {"validate": "posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts"},
+	"Sales Order": {
+		"validate": [
+			"posnext_promotions.promotions.ff_non_invoice.strip_ff",
+			"posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts",
+		]
+	},
+	"Quotation": {
+		"validate": [
+			"posnext_promotions.promotions.ff_non_invoice.strip_ff",
+			"posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts",
+		]
+	},
 	"Delivery Note": {"validate": "posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts"},
 	"POS Invoice": {
 		"validate": [
 			"posnext_promotions.overrides.pricing_rule.apply_min_max_price_discounts",
 			"posnext_promotions.promotions.friends_and_family_apply.apply_friends_and_family_on_invoice",
 		],
-		"on_submit": "posnext_promotions.promotions.friends_and_family_log.log_invoice_submit",
-		"on_cancel": "posnext_promotions.promotions.friends_and_family_log.log_invoice_cancel",
+		"on_submit": [
+			"posnext_promotions.promotions.ff_ledger.on_submit",
+			"posnext_promotions.promotions.friends_and_family_log.log_invoice_submit",
+		],
+		"on_cancel": [
+			"posnext_promotions.promotions.ff_ledger.on_cancel",
+			"posnext_promotions.promotions.friends_and_family_log.log_invoice_cancel",
+		],
 	},
 	"Customer": {
 		"validate": "posnext_promotions.promotions.friends_and_family_eligibility.guard_flag_changes",
-		"on_update": "posnext_promotions.promotions.friends_and_family_log.log_customer_eligibility_change",
+		"on_update": [
+			"posnext_promotions.promotions.friends_and_family_log.log_customer_eligibility_change",
+			"posnext_promotions.promotions.friends_and_family_eligibility.clear_cache",
+		],
+	},
+	# F&F caches what these decide for the rest of the request (and item-group trees in Redis).
+	"POS Profile": {"on_update": "posnext_promotions.promotions.friends_and_family_eligibility.clear_cache"},
+	"Item Group": {
+		"on_update": "posnext_promotions.promotions.ff_scope.clear_item_group_cache",
+		"on_trash": "posnext_promotions.promotions.ff_scope.clear_item_group_cache",
+		"after_rename": "posnext_promotions.promotions.ff_scope.clear_item_group_cache",
 	},
 }
 
@@ -105,4 +134,12 @@ doc_events = {
 # are installed. Keep the task module for sites that call it explicitly.
 
 before_install = "posnext_promotions.install.before_install"
+after_install = "posnext_promotions.install.after_install"
 after_migrate = "posnext_promotions.install.after_migrate"
+# An older pos_next must not run next to this F&F contract (no shim, Ruling 104).
+before_migrate = ["posnext_promotions.contract_gate.before_migrate"]
+
+# POS Next asks these providers who is a Friends & Family member.
+pos_next_customer_benefit_providers = [
+	"posnext_promotions.promotions.friends_and_family_eligibility.benefit_provider"
+]

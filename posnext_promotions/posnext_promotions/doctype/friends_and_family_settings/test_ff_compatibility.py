@@ -1,0 +1,1303 @@
+# Copyright (c) 2026, BrainWise and contributors
+# For license information, please see license.txt
+
+"""Cart and invoice apply the same F&F compatibility rules (ff_compatibility).
+
+* Buy X Get Y lines get no F&F on the invoice either, tagged or not.
+* Allow Free Gift with F&F off: the invoice removes a gift whose trigger line got F&F.
+* Parity: rows built from the cart output, as the POS submits them, keep the
+  same meaning after invoice validate.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+from collections import Counter
+from unittest.mock import patch
+
+import frappe
+from frappe.tests.utils import FrappeTestCase
+from frappe.utils import add_days, cint, cstr, flt, get_datetime, now_datetime, nowdate
+
+from posnext_promotions.api.apply_offers import apply_offers
+from posnext_promotions.api.friends_and_family import apply_friends_and_family_discount
+from posnext_promotions.promotions import ff_compatibility, ff_config, ff_paid, schedule
+from posnext_promotions.promotions import friends_and_family_apply as ff_apply
+from posnext_promotions.promotions import friends_and_family_gifts as gifts
+from posnext_promotions.promotions.best_discount_coupon import decide_coupon_vs_fnf
+from posnext_promotions.promotions.friends_and_family_apply import (
+	DISCOUNT_SOURCE_FRIENDS_AND_FAMILY as FNF,
+	REASON_SCHEME_NOT_ELIGIBLE,
+	apply_friends_and_family_on_invoice,
+	apply_friends_and_family_to_items,
+	compute_friends_and_family_discounts,
+	fnf_line_rates,
+)
+from posnext_promotions.promotions.friends_and_family_caps import FIELD_DISCOUNT_SOURCE
+from posnext_promotions.promotions.friends_and_family_testing import (
+	approved_domain_rows,
+	ff_settings_guard,
+	give_verified_email,
+)
+from posnext_promotions.test_promotions import ITEM_A, ITEM_B, ITEM_C, ITEM_PRICES, _cart_payload, _ctx, _line, _make_rule
+
+PREFIX = "_PNXT_FFC_"
+
+
+def _source(row) -> str:
+	return FNF if FNF in (cstr(row.get("discount_source")), cstr(row.get(FIELD_DISCOUNT_SOURCE))) else ""
+
+
+def _pos_rows(resp) -> list:
+	"""Rows the POS submits from an apply_offers response (formatItemsForSubmission).
+
+	Only the fields the POS really sends: no ``discount_source``, ``free_qty`` or
+	``gwp_free_qty``. Each row also carries the cart's ``discount_source`` under
+	``_cart_source`` / ``_cart_unit_discount`` for the comparison (stripped before validate).
+	"""
+	rows = []
+
+	def paid(ri):
+		qty = flt(ri.get("qty"))
+		plr = flt(ri.get("price_list_rate"))
+		discount = flt(ri.get("discount_amount"))
+		return {
+			"item_code": ri.get("item_code"),
+			"qty": qty,
+			"rate": (plr * qty - discount) / qty if qty else plr,
+			"price_list_rate": plr,
+			"uom": ri.get("uom") or "Nos",
+			"conversion_factor": 1,
+			"discount_percentage": flt(ri.get("discount_percentage")),
+			"discount_amount": discount,
+			"pricing_rules": cstr(ri.get("pricing_rules")),
+			"is_free_item": 0,
+			"_cart_source": _source(ri),
+			# Cart discount_amount is the line total; invoice rows hold it per unit.
+			"_cart_unit_discount": discount / qty if qty else 0,
+		}
+
+	def free(code, qty, rules):
+		return {
+			"item_code": code,
+			"qty": qty,
+			"rate": 0,
+			"price_list_rate": 0,
+			"uom": "Nos",
+			"conversion_factor": 1,
+			"discount_percentage": 0,
+			"discount_amount": 0,
+			"pricing_rules": cstr(rules),
+			"is_free_item": 1,
+			"_cart_source": "",
+			"_cart_unit_discount": 0,
+		}
+
+	free_items = resp.get("free_items") or []
+	for ri in resp.get("items") or []:
+		if cint(ri.get("is_free_item")):
+			continue
+		rows.append(paid(ri))
+		fq = flt(ri.get("free_qty"))
+		if fq > 0 and not any(f.get("item_code") == ri.get("item_code") for f in free_items):
+			rows.append(free(ri.get("item_code"), fq, ri.get("pricing_rules")))
+	for fi in free_items:
+		fq = flt(fi.get("qty"))
+		if cint(fi.get("gwp_same_item_row")):
+			for row in rows:
+				if not row["is_free_item"] and row["item_code"] == fi.get("item_code"):
+					row["qty"] = max(0, row["qty"] - fq)
+					break
+		rows.append(free(fi.get("item_code"), fq, fi.get("pricing_rules")))
+	return rows
+
+
+def _tuple(row, source, unit_discount):
+	return (
+		cstr(row.get("item_code")),
+		cint(row.get("is_free_item")),
+		flt(row.get("qty")),
+		source,
+		round(flt(unit_discount), 2),
+	)
+
+
+class TestFFCompatibility(FrappeTestCase):
+	@classmethod
+	def setUpClass(cls):
+		super().setUpClass()
+		cls.ctx = _ctx()
+		give_verified_email(cls.ctx.customer)
+
+	def setUp(self):
+		frappe.set_user("Administrator")
+		self._stack = contextlib.ExitStack()
+		self._stack.enter_context(ff_settings_guard())
+		frappe.db.savepoint("ff_compat")
+		for name in frappe.get_all("Pricing Rule", filters={"title": ["like", f"{PREFIX}%"]}, pluck="name"):
+			frappe.delete_doc("Pricing Rule", name, force=True, ignore_permissions=True)
+		self._settings()
+
+	def tearDown(self):
+		frappe.db.rollback(save_point="ff_compat")
+		self._stack.close()
+
+	def _settings(self, **values):
+		doc = frappe.get_single("Friends and Family Settings")
+		doc.update(
+			{
+				"enabled": 1,
+				"approved_domains": approved_domain_rows(),
+				"discount_percentage": 30,
+				"discount_scope": "Entire Cart",
+				"start_date": None,
+				"end_date": None,
+				"allow_free_gift_with_ff": 0,
+				"applicable_brands": [],
+				"applicable_item_groups": [],
+				"applicable_items": [],
+				"excluded_brands": [],
+				"excluded_items": [],
+				"excluded_item_groups": [],
+				"max_discount_per_order": 0,
+				"max_discount_per_customer_month": 0,
+			}
+		)
+		doc.update(values)
+		doc.save()
+		return doc
+
+	# ---- fixtures ----------------------------------------------------------
+
+	def _bxgy(self, **extra):
+		fields = dict(
+			apply_on="Item Code",
+			items=[{"item_code": ITEM_A}],
+			price_or_product_discount="Product",
+			rate_or_discount="Discount Percentage",
+			same_item=1,
+			min_qty=2,
+			free_qty=1,
+			free_item_uom="Nos",
+			free_item_rate=0,
+		)
+		fields.update(extra)
+		return _make_rule(f"{PREFIX}BXGY", **fields)
+
+	def _gift(self, trigger=ITEM_B, promotion_type=None, triggers=None):
+		rule = _make_rule(
+			f"{PREFIX}GIFT",
+			apply_on="Item Code",
+			items=[{"item_code": code} for code in (triggers or [trigger])],
+			price_or_product_discount="Product",
+			rate_or_discount="Discount Percentage",
+			same_item=0,
+			free_item=ITEM_C,
+			min_qty=1,
+			free_qty=1,
+			free_item_uom="Nos",
+			free_item_rate=0,
+		)
+		if promotion_type:
+			if not frappe.get_meta("Pricing Rule").has_field("promotion_type"):
+				self.skipTest("Pricing Rule.promotion_type custom field missing")
+			frappe.db.set_value("Pricing Rule", rule, "promotion_type", promotion_type)
+			frappe.clear_document_cache("Pricing Rule", rule)
+		return rule
+
+	def _row(self, item_code, qty=1, rules="", free=False, idx=None):
+		plr = 0 if free else ITEM_PRICES[item_code]
+		return frappe._dict(
+			{
+				"idx": idx,
+				"item_code": item_code,
+				"qty": qty,
+				"rate": plr,
+				"price_list_rate": plr,
+				"discount_percentage": 0,
+				"discount_amount": 0,
+				"pricing_rules": rules,
+				"is_free_item": 1 if free else 0,
+			}
+		)
+
+	def _invoice(self, rows):
+		for position, row in enumerate(rows, start=1):
+			row.idx = row.idx or position
+		return frappe._dict(
+			{
+				"doctype": "POS Invoice",
+				"is_pos": 1,
+				"company": self.ctx.company,
+				"customer": self.ctx.customer,
+				"pos_profile": self.ctx.pos_profile,
+				"selling_price_list": self.ctx.price_list,
+				"posting_date": nowdate(),
+				"additional_discount_percentage": 0,
+				"discount_amount": 0,
+				"items": rows,
+			}
+		)
+
+	def _apply(self, lines, rules):
+		payload = _cart_payload(self.ctx, [_line(self.ctx, code, qty=qty) for code, qty in lines])
+		return apply_offers(invoice_data=json.dumps(payload), selected_offers=json.dumps(list(rules)))
+
+	@staticmethod
+	def _paid(doc, item_code):
+		return next(r for r in doc.get("items") if r.item_code == item_code and not cint(r.is_free_item))
+
+	# ---- BXGY on the invoice ---------------------------------------------
+
+	def test_invoice_blocks_bxgy_line(self):
+		rule = self._bxgy()
+		doc = self._invoice(
+			[self._row(ITEM_A, 2, rule), self._row(ITEM_A, 1, rule, free=True), self._row(ITEM_B, 1)]
+		)
+		apply_friends_and_family_on_invoice(doc)
+		line_a = self._paid(doc, ITEM_A)
+		self.assertNotEqual(_source(line_a), FNF)
+		self.assertEqual(flt(line_a.discount_percentage), 0)
+		self.assertEqual(_source(self._paid(doc, ITEM_B)), FNF)
+		self.assertEqual(flt(self._paid(doc, ITEM_B).discount_percentage), 30)
+
+	def test_invoice_blocks_untagged_bxgy_line_above_max_qty(self):
+		# Capped B1G1 at qty 4: ERPNext tags nothing and adds no free row, but the
+		# cart still blocks the line by scope + min_qty. The invoice must agree.
+		rule = self._bxgy(max_qty=3)
+		cart = self._apply([(ITEM_A, 4), (ITEM_B, 1)], [rule])
+		cart_a = next(i for i in cart["items"] if i["item_code"] == ITEM_A and not i.get("is_free_item"))
+		self.assertNotEqual(_source(cart_a), FNF)
+
+		doc = self._invoice([self._row(ITEM_A, 4), self._row(ITEM_B, 1)])
+		apply_friends_and_family_on_invoice(doc)
+		self.assertNotEqual(_source(self._paid(doc, ITEM_A)), FNF)
+		self.assertEqual(_source(self._paid(doc, ITEM_B)), FNF)
+
+	def test_block_ineligible_lines_returns_positions(self):
+		rule = self._bxgy()
+		rows = [self._row(ITEM_B, 1, idx=7), self._row(ITEM_A, 2, rule, idx=3)]
+		self.assertEqual(ff_compatibility.block_ineligible_lines(rows), {1})
+		self.assertEqual(rows[1].get(gifts.FIELD_FNF_BLOCKED_BY), rule)
+
+	# ---- gifts on the invoice --------------------------------------------
+
+	def _gift_invoice(self, rule):
+		return self._invoice([self._row(ITEM_B, 1, rule), self._row(ITEM_C, 1, rule, free=True)])
+
+	def test_invoice_removes_gift_when_not_allowed(self):
+		rule = self._gift(promotion_type=gifts.PROMOTION_TYPE_GWP)
+		doc = self._gift_invoice(rule)
+		apply_friends_and_family_on_invoice(doc)
+		self.assertFalse([r for r in doc.get("items") if cint(r.is_free_item)])
+		line_b = self._paid(doc, ITEM_B)
+		self.assertEqual(_source(line_b), FNF)
+		self.assertNotIn(rule, gifts._item_rule_names(line_b))
+
+	def test_invoice_document_removes_gift_row_and_renumbers(self):
+		rule = self._gift(promotion_type=gifts.PROMOTION_TYPE_GWP)
+		doc = frappe.get_doc(
+			{
+				"doctype": "POS Invoice",
+				"company": self.ctx.company,
+				"customer": self.ctx.customer,
+				"pos_profile": self.ctx.pos_profile,
+				"is_pos": 1,
+				"currency": self.ctx.currency,
+				"conversion_rate": 1,
+				"selling_price_list": self.ctx.price_list,
+				"price_list_currency": self.ctx.currency,
+				"plc_conversion_rate": 1,
+				"posting_date": nowdate(),
+				"items": [
+					{**self._row(ITEM_C, 1, rule, free=True), "idx": None, "warehouse": self.ctx.warehouse, "uom": "Nos", "conversion_factor": 1},
+					{**self._row(ITEM_B, 1, rule), "idx": None, "warehouse": self.ctx.warehouse, "uom": "Nos", "conversion_factor": 1},
+				],
+			}
+		)
+		apply_friends_and_family_on_invoice(doc)
+		self.assertEqual([(r.idx, r.item_code) for r in doc.items], [(1, ITEM_B)])
+		self.assertEqual(_source(doc.items[0]), FNF)
+		self.assertAlmostEqual(flt(doc.items[0].rate), ITEM_PRICES[ITEM_B] * 0.7, places=2)
+
+	def test_invoice_gift_policy_stable_across_revalidate(self):
+		# Save then submit validate twice; F&F replaces a weaker 10% promotion here.
+		gift = self._gift(promotion_type=gifts.PROMOTION_TYPE_GWP)
+		price = _make_rule(
+			f"{PREFIX}PRICE10",
+			apply_on="Item Code",
+			items=[{"item_code": ITEM_B}],
+			price_or_product_discount="Price",
+			rate_or_discount="Discount Percentage",
+			discount_percentage=10,
+		)
+		trigger = self._row(ITEM_B, 1, f"{gift},{price}")
+		trigger.update({"discount_percentage": 10, "discount_amount": 8, "rate": 72})
+		doc = self._invoice([trigger, self._row(ITEM_C, 1, gift, free=True)])
+
+		def state():
+			return [
+				(r.item_code, cint(r.is_free_item), flt(r.qty), _source(r), flt(r.rate, 2), flt(r.discount_amount, 2))
+				for r in doc.get("items")
+			]
+
+		apply_friends_and_family_on_invoice(doc)
+		first = state()
+		apply_friends_and_family_on_invoice(doc)
+		self.assertEqual(state(), first)
+		self.assertEqual(first, [(ITEM_B, 0, 1.0, FNF, 56.0, 24.0)])
+
+	def test_invoice_keeps_gift_when_allowed(self):
+		self._settings(allow_free_gift_with_ff=1)
+		rule = self._gift(promotion_type=gifts.PROMOTION_TYPE_GWP)
+		doc = self._gift_invoice(rule)
+		apply_friends_and_family_on_invoice(doc)
+		free_rows = [r for r in doc.get("items") if cint(r.is_free_item)]
+		self.assertEqual([r.item_code for r in free_rows], [ITEM_C])
+		self.assertEqual(_source(self._paid(doc, ITEM_B)), FNF)
+
+	def test_invoice_keeps_gift_when_trigger_has_no_fnf(self):
+		self._settings(excluded_items=[{"item_code": ITEM_B}])
+		rule = self._gift()
+		doc = self._invoice([self._row(ITEM_B, 1, rule), self._row(ITEM_C, 1, rule, free=True), self._row(ITEM_A, 1)])
+		apply_friends_and_family_on_invoice(doc)
+		self.assertEqual([r.item_code for r in doc.get("items") if cint(r.is_free_item)], [ITEM_C])
+		self.assertEqual(_source(self._paid(doc, ITEM_A)), FNF)
+
+	def test_normalize_keys_rows_not_positions(self):
+		rule = self._gift()
+		rows = [self._row(ITEM_B, 1, rule, idx=5), self._row(ITEM_C, 1, rule, free=True, idx=9)]
+		snapshot = ff_compatibility.normalize(rows, [rows[1]])
+		self.assertEqual(list(snapshot.lines), [5, 9])
+		self.assertEqual(len(snapshot.gifts), 1)
+		gift = snapshot.gifts[0]
+		self.assertEqual((gift.rule_name, gift.item_code, gift.qty, gift.trigger_keys), (rule, ITEM_C, 1, (5,)))
+
+	# ---- fix round 1 ------------------------------------------------------
+
+	def _price_rule(self, item_code, pct=10, title="PRICE10"):
+		return _make_rule(
+			f"{PREFIX}{title}",
+			apply_on="Item Code",
+			items=[{"item_code": item_code}],
+			price_or_product_discount="Price",
+			rate_or_discount="Discount Percentage",
+			discount_percentage=pct,
+		)
+
+	def test_one_time_bxgy_already_redeemed_does_not_block(self):
+		if not frappe.get_meta("Pricing Rule").has_field("one_time_per_customer"):
+			self.skipTest("one_time_per_customer field missing")
+		# The test profile's default (walk-in) customer is the test customer: clear it.
+		frappe.db.set_value("POS Profile", self.ctx.pos_profile, "customer", None)
+		frappe.clear_document_cache("POS Profile", self.ctx.pos_profile)
+		self.addCleanup(frappe.clear_document_cache, "POS Profile", self.ctx.pos_profile)
+		rule = self._bxgy(one_time_per_customer=1)
+		doc = self._invoice([self._row(ITEM_A, 2), self._row(ITEM_B, 1)])
+		self.assertIn(rule, ff_compatibility.blocking_rule_map(doc))
+		frappe.get_doc(
+			{"doctype": "One Time Customer Offer Usage", "customer": self.ctx.customer, "pricing_rule": rule}
+		).insert(ignore_permissions=True)
+		self.assertNotIn(rule, ff_compatibility.blocking_rule_map(doc))
+		apply_friends_and_family_on_invoice(doc)
+		self.assertEqual(_source(self._paid(doc, ITEM_A)), FNF)
+
+	def test_one_time_bxgy_never_blocks_anonymous_sale(self):
+		if not frappe.get_meta("Pricing Rule").has_field("one_time_per_customer"):
+			self.skipTest("one_time_per_customer field missing")
+		rule = self._bxgy(one_time_per_customer=1)
+		doc = self._invoice([self._row(ITEM_A, 2)])
+		# The test customer is the profile's default (walk-in) customer.
+		self.assertEqual(frappe.db.get_value("POS Profile", self.ctx.pos_profile, "customer"), self.ctx.customer)
+		self.assertNotIn(rule, ff_compatibility.blocking_rule_map(doc))
+		doc.customer = None
+		self.assertNotIn(rule, ff_compatibility.blocking_rule_map(doc))
+
+	def test_cart_skips_one_time_rule_already_redeemed(self):
+		if not frappe.get_meta("Pricing Rule").has_field("one_time_per_customer"):
+			self.skipTest("one_time_per_customer field missing")
+		# F&F off so the 10% rule is the only discount; the profile's walk-in customer cleared.
+		self._settings(enabled=0)
+		frappe.db.set_value("POS Profile", self.ctx.pos_profile, "customer", None)
+		frappe.clear_document_cache("POS Profile", self.ctx.pos_profile)
+		self.addCleanup(frappe.clear_document_cache, "POS Profile", self.ctx.pos_profile)
+		rule = self._price_rule(ITEM_B)
+		frappe.db.set_value("Pricing Rule", rule, "one_time_per_customer", 1)
+		frappe.clear_document_cache("Pricing Rule", rule)
+
+		for selected in ([rule], []):
+			resp = self._apply([(ITEM_B, 1)], selected)
+			self.assertIn(rule, resp.get("applied_pricing_rules") or [], f"selected={selected}: before redemption")
+		frappe.get_doc(
+			{"doctype": "One Time Customer Offer Usage", "customer": self.ctx.customer, "pricing_rule": rule}
+		).insert(ignore_permissions=True)
+		for selected in ([rule], []):
+			resp = self._apply([(ITEM_B, 1)], selected)
+			self.assertNotIn(rule, resp.get("applied_pricing_rules") or [], f"selected={selected}")
+			line = next(i for i in resp["items"] if i["item_code"] == ITEM_B)
+			self.assertEqual(flt(line.get("discount_percentage")), 0, f"selected={selected}")
+
+	def test_invoice_keeps_free_row_without_rule(self):
+		doc = self._invoice([self._row(ITEM_B, 1), self._row(ITEM_C, 1, "", free=True)])
+		apply_friends_and_family_on_invoice(doc)
+		self.assertEqual([r.item_code for r in doc.get("items") if cint(r.is_free_item)], [ITEM_C])
+		self.assertEqual(_source(self._paid(doc, ITEM_B)), FNF)
+
+	def test_cleared_gift_stamp_keeps_price_rule(self):
+		# A GWP stamp on an F&F line goes; the Price rule sharing the line stays attached.
+		gwp = self._gift(promotion_type=gifts.PROMOTION_TYPE_GWP)
+		price = self._price_rule(ITEM_B)
+		row = self._row(ITEM_B, 1, f"{gwp},{price}", idx=1)
+		row.update(
+			{"discount_source": gifts.DISCOUNT_SOURCE_GWP, "discount_percentage": 10, "discount_amount": 8, "rate": 72}
+		)
+		applied = {gwp, price}
+		suppressed = ff_compatibility.enforce_gift_policy(
+			[row], {}, ff_config.resolve(), fnf_keys={1}, applied_rules=applied
+		)
+		self.assertEqual(suppressed, [gwp])
+		self.assertEqual(gifts._item_rule_names(row), [price])
+		self.assertEqual(applied, {price})
+		self.assertEqual((flt(row.discount_amount), flt(row.rate)), (0, 80))
+
+	def test_fallback_gift_stamp_detaches_only_the_unknown_rule(self):
+		# The gift kind comes from discount_source only (its rule no longer resolves):
+		# that rule goes, the Price rule stays.
+		price = self._price_rule(ITEM_B)
+		row = self._row(ITEM_B, 1, f"{PREFIX}DELETED-GIFT,{price}", idx=1)
+		row.update(
+			{"discount_source": gifts.DISCOUNT_SOURCE_GWP, "discount_percentage": 10, "discount_amount": 8, "rate": 72}
+		)
+		suppressed = ff_compatibility.enforce_gift_policy([row], {}, ff_config.resolve(), fnf_keys={1})
+		self.assertEqual(suppressed, [f"{PREFIX}DELETED-GIFT"])
+		self.assertEqual(gifts._item_rule_names(row), [price])
+		self.assertEqual(flt(row.discount_amount), 0)
+
+	def test_invoice_line_freed_from_gift_gets_fnf_on_rerun(self):
+		# ITEM_B's only discount is the gift rule's (50 % beats F&F 30 %). ITEM_A gets F&F and
+		# also triggers the gift, so the gift goes: ITEM_B loses the gift discount and the
+		# re-run gives it F&F.
+		gift = self._gift(triggers=[ITEM_A, ITEM_B])
+		row_b = self._row(ITEM_B, 1, gift)
+		row_b.update({"discount_percentage": 50, "discount_amount": 40, "rate": 40})
+		doc = self._invoice([self._row(ITEM_A, 1, gift), row_b, self._row(ITEM_C, 1, gift, free=True)])
+		apply_friends_and_family_on_invoice(doc)
+		self.assertFalse([r for r in doc.get("items") if cint(r.is_free_item)])
+		line_b = self._paid(doc, ITEM_B)
+		self.assertEqual(_source(line_b), FNF)
+		self.assertEqual(flt(line_b.discount_percentage), 30)
+		self.assertNotIn(gift, gifts._item_rule_names(line_b))
+
+	def test_clear_line_gift_stamp_detaches_only_named_rules(self):
+		row = frappe._dict(
+			{"pricing_rules": "GIFT-1,PRICE-1", "price_list_rate": 80, "rate": 72, "discount_amount": 8}
+		)
+		gifts._clear_line_gift_stamp(row, ["GIFT-1"])
+		self.assertEqual(row.pricing_rules, "PRICE-1")
+		gifts._clear_line_gift_stamp(row)
+		self.assertEqual(row.pricing_rules, "")
+
+	def test_removed_gift_keeps_other_rules_on_trigger_row(self):
+		# ITEM_A is excluded from F&F and keeps a 10% Price rule; ITEM_B gets F&F, so
+		# the gift (triggered by both) goes. ITEM_A loses only the gift tag.
+		self._settings(excluded_items=[{"item_code": ITEM_A}])
+		gift = self._gift(triggers=[ITEM_A, ITEM_B])
+		price = self._price_rule(ITEM_A)
+		row_a = self._row(ITEM_A, 1, f"{gift},{price}")
+		row_a.update({"discount_percentage": 10, "discount_amount": 5, "rate": 45})
+		doc = self._invoice([row_a, self._row(ITEM_B, 1, gift), self._row(ITEM_C, 1, gift, free=True)])
+		apply_friends_and_family_on_invoice(doc)
+		self.assertFalse([r for r in doc.get("items") if cint(r.is_free_item)])
+		line_a = self._paid(doc, ITEM_A)
+		self.assertEqual(gifts._item_rule_names(line_a), [price])
+		self.assertEqual((flt(line_a.discount_percentage), flt(line_a.rate)), (10, 45))
+		self.assertEqual(_source(self._paid(doc, ITEM_B)), FNF)
+
+	def _group(self, name, parent="All Customer Groups"):
+		if not frappe.db.exists("Customer Group", name):
+			frappe.get_doc(
+				{"doctype": "Customer Group", "customer_group_name": name, "parent_customer_group": parent, "is_group": 1}
+			).insert(ignore_permissions=True)
+		return name
+
+	def test_customer_group_rule_matches_descendants(self):
+		parent = self._group(f"{PREFIX}PARENT")
+		child = self._group(f"{PREFIX}CHILD", parent)
+		other = self._group(f"{PREFIX}OTHER")
+		rule = self._bxgy(applicable_for="Customer Group", customer_group=parent)
+		doc = self._invoice([self._row(ITEM_A, 2)])
+		doc.customer_group = child
+		self.assertIn(rule, ff_compatibility.blocking_rule_map(doc))
+		doc.customer_group = other
+		self.assertNotIn(rule, ff_compatibility.blocking_rule_map(doc))
+
+	def _unclassified_invoice(self):
+		rule = self._price_rule(ITEM_B)
+		frappe.db.set_value("Pricing Rule", rule, "price_or_product_discount", "")
+		frappe.clear_document_cache("Pricing Rule", rule)
+		self.assertEqual(ff_compatibility.classify_promotion(rule), "unclassified")
+		row = self._row(ITEM_B, 1, rule)
+		row.update({"discount_percentage": 10, "discount_amount": 8, "rate": 72})
+		return self._invoice([row])
+
+	def test_unclassified_rule_competes(self):
+		self._settings(unclassified_promotion_policy=ff_compatibility.const.UNCLASSIFIED_POLICIES[0])
+		doc = self._unclassified_invoice()
+		apply_friends_and_family_on_invoice(doc)
+		self.assertEqual(_source(self._paid(doc, ITEM_B)), FNF)
+		self.assertEqual(flt(self._paid(doc, ITEM_B).discount_percentage), 30)
+
+	def test_unclassified_rule_blocks_fnf_on_line(self):
+		self._settings(unclassified_promotion_policy=ff_compatibility.POLICY_BLOCK_FNF)
+		doc = self._unclassified_invoice()
+		apply_friends_and_family_on_invoice(doc)
+		line = self._paid(doc, ITEM_B)
+		self.assertNotEqual(_source(line), FNF)
+		self.assertEqual((flt(line.discount_percentage), flt(line.rate)), (10, 72))
+
+	# ---- cart / invoice parity -------------------------------------------
+
+	def _assert_parity(self, resp):
+		rows = _pos_rows(resp)
+		expected = Counter(_tuple(row, row["_cart_source"], row["_cart_unit_discount"]) for row in rows)
+		doc = self._invoice([frappe._dict({k: v for k, v in row.items() if not k.startswith("_cart")}) for row in rows])
+		apply_friends_and_family_on_invoice(doc)
+		actual = Counter(_tuple(row, _source(row), row.get("discount_amount")) for row in doc.get("items"))
+		self.assertEqual(actual, expected)
+
+	def test_deselected_bxgy_blocks_cart_and_invoice(self):
+		# Ruling 19: one rule source, independent of the offers the client selected.
+		# Allow Free Gift with F&F stays off: when on, BXGY lines get F&F (Task 8s).
+		bxgy = self._bxgy()
+		gift = self._gift()
+		for selected in ([gift], []):
+			with self.subTest(selected=selected):
+				resp = self._apply([(ITEM_A, 2), (ITEM_B, 1)], selected)
+				cart_a = next(i for i in resp["items"] if i["item_code"] == ITEM_A and not i.get("is_free_item"))
+				cart_b = next(i for i in resp["items"] if i["item_code"] == ITEM_B and not i.get("is_free_item"))
+				self.assertNotEqual(_source(cart_a), FNF)
+				self.assertEqual(_source(cart_b), FNF)
+				if selected:
+					self.assertNotIn(bxgy, resp.get("applied_pricing_rules") or [])
+				self._assert_parity(resp)
+
+	def test_bxgy_source_respects_pos_profile_warehouse(self):
+		other = frappe.db.get_value(
+			"Warehouse", {"company": self.ctx.company, "is_group": 0, "name": ["!=", self.ctx.warehouse]}, "name"
+		)
+		if not other:
+			self.skipTest("needs a second warehouse")
+		self._bxgy(warehouse=other)
+		doc = self._invoice([self._row(ITEM_A, 2), self._row(ITEM_B, 1)])
+		self.assertEqual(ff_compatibility.blocking_rule_map(doc), {})
+		apply_friends_and_family_on_invoice(doc)
+		self.assertEqual(_source(self._paid(doc, ITEM_A)), FNF)
+
+	def test_cart_invoice_parity(self):
+		for allow, promotion_type in ((0, None), (1, None), (0, gifts.PROMOTION_TYPE_GWP), (1, gifts.PROMOTION_TYPE_GWP)):
+			with self.subTest(allow_free_gift_with_ff=allow, promotion_type=promotion_type):
+				self._settings(allow_free_gift_with_ff=allow)
+				bxgy = self._bxgy()
+				gift = self._gift(promotion_type=promotion_type)
+				# Same-item GWP: the POS carves the free unit off the scanned qty, so scan 2.
+				qty_b = 2 if promotion_type else 1
+				resp = self._apply([(ITEM_A, 2), (ITEM_B, qty_b)], [bxgy, gift])
+				# The cart itself: BXGY free row always, the gift only when allowed. A GWP rule
+				# whose matching lines are one SKU gives that SKU free (same-item GWP), not free_item.
+				free_codes = sorted(f["item_code"] for f in resp.get("free_items") or [])
+				gift_code = ITEM_B if promotion_type else ITEM_C
+				self.assertEqual(free_codes, sorted([ITEM_A, gift_code] if allow else [ITEM_A]))
+				self._assert_parity(resp)
+
+	# ---- Ruling 119: a client tag blocks F&F only while its rule is eligible ----
+
+	def _stale_line(self, rule, qty):
+		"""The cart line after BXGY dropped (Task 8q), as a client that kept the tag sends it.
+
+		Shape of ``apply_offers_qty2.items[0]`` in pos_next
+		``POS/src/stores/__tests__/fixtures-ff-bxgy-qty-1-2-1.json`` with the qty lowered:
+		the discount is zeroed but ``pricing_rules`` still names the rule. The POS does
+		not send ``fnf_blocked_by_scheme`` (``buildOfferEvaluationPayload``); it is kept
+		here as a hostile echo of the server's earlier verdict, which must not count.
+		"""
+		price = ITEM_PRICES[ITEM_A]
+		return {
+			"item_code": ITEM_A,
+			"qty": qty,
+			"rate": price,
+			"uom": "Nos",
+			"warehouse": self.ctx.warehouse,
+			"conversion_factor": 1,
+			"price_list_rate": price,
+			"discount_percentage": 0.0,
+			"discount_amount": 0.0,
+			"stock_uom": "Nos",
+			"pricing_rules": rule,
+			"applied_promotional_schemes": [],
+			"is_already_discounted": 0,
+			"discount_source": "pricing_rule",
+			"fnf_blocked_by_scheme": rule,
+		}
+
+	def _fnf_only_line(self, rule, qty):
+		"""``apply_friends_and_family_discount`` (the cart's F&F-only call) on a tagged line + a plain one."""
+		resp = apply_friends_and_family_discount(
+			customer=self.ctx.customer,
+			items=json.dumps([self._stale_line(rule, qty), _line(self.ctx, ITEM_B)]),
+			posting_date=nowdate(),
+			pos_profile=self.ctx.pos_profile,
+		)
+		self.assertTrue(resp["items"][1]["applies"], "the plain line always gets F&F")
+		return resp["items"][0]
+
+	def _invoice_line_gets_fnf(self, rule, qty) -> bool:
+		doc = self._invoice([self._row(ITEM_A, qty, rule), self._row(ITEM_B, 1)])
+		apply_friends_and_family_on_invoice(doc)
+		self.assertEqual(_source(self._paid(doc, ITEM_B)), FNF)
+		return _source(self._paid(doc, ITEM_A)) == FNF
+
+	def _assert_tag(self, rule, qty, blocked):
+		"""One verdict on the cart's F&F-only call and on invoice validate (spec §7)."""
+		line = self._fnf_only_line(rule, qty)
+		self.assertEqual(bool(line["applies"]), not blocked, f"F&F-only, qty {qty}: {line.get('reason')}")
+		if blocked:
+			self.assertEqual(line["reason"], REASON_SCHEME_NOT_ELIGIBLE)
+		self.assertEqual(self._invoice_line_gets_fnf(rule, qty), not blocked, f"invoice validate, qty {qty}")
+
+	def _item_level(self, title, **extra):
+		if not frappe.get_meta("Pricing Rule").has_field("promotion_type"):
+			self.skipTest("Pricing Rule.promotion_type custom field missing")
+		rule = self._price_rule(ITEM_A, pct=10, title=title)
+		frappe.db.set_value(
+			"Pricing Rule", rule, {"promotion_type": gifts.PROMOTION_TYPE_ITEM_LEVEL, "min_qty": 2, **extra}
+		)
+		frappe.clear_document_cache("Pricing Rule", rule)
+		self.assertEqual(gifts.scheme_blocking_kind(rule), gifts.SCHEME_KIND_ITEM_LEVEL)
+		return rule
+
+	def test_stale_bxgy_tag_at_qty_1_gets_fnf(self):
+		self._assert_tag(self._bxgy(), 1, blocked=False)
+
+	def test_stale_bxgy_tag_through_apply_offers_gets_fnf(self):
+		# Guard: ERPNext re-prices the line, so this path never trusted the stale tag.
+		rule = self._bxgy()
+		for selected in ([rule], []):
+			payload = _cart_payload(self.ctx, [self._stale_line(rule, 1), _line(self.ctx, ITEM_B)])
+			resp = apply_offers(invoice_data=json.dumps(payload), selected_offers=json.dumps(selected))
+			line_a = next(i for i in resp["items"] if i["item_code"] == ITEM_A and not i.get("is_free_item"))
+			self.assertEqual(_source(line_a), FNF, f"selected={selected}")
+			self.assertFalse(resp.get("free_items"), f"selected={selected}")
+
+	def test_real_bxgy_at_qty_2_still_blocks(self):
+		rule = self._bxgy()
+		self._assert_tag(rule, 2, blocked=True)
+		# Untagged on the F&F-only call: the scope + min_qty source blocks it too (Ruling 19).
+		self.assertFalse(self._fnf_only_line("", 2)["applies"])
+		resp = self._apply([(ITEM_A, 2), (ITEM_B, 1)], [rule])
+		line_a = next(i for i in resp["items"] if i["item_code"] == ITEM_A and not i.get("is_free_item"))
+		self.assertNotEqual(_source(line_a), FNF)
+		self.assertEqual(sum(flt(f.get("qty")) for f in resp.get("free_items") or []), 1)
+
+	def test_expired_bxgy_tag_does_not_block(self):
+		rule = self._bxgy(valid_from=add_days(nowdate(), -10), valid_upto=add_days(nowdate(), -1))
+		for qty in (1, 2):
+			self._assert_tag(rule, qty, blocked=False)
+
+	def test_bxgy_tag_below_min_amount_does_not_block(self):
+		# min_amt on qty × price_list_rate, as ERPNext: 2 × 50 < 150 ≤ 3 × 50.
+		rule = self._bxgy(min_amt=150)
+		self._assert_tag(rule, 2, blocked=False)
+		self._assert_tag(rule, 3, blocked=True)
+
+	def test_bxgy_tag_for_another_customer_group_does_not_block(self):
+		other = self._group(f"{PREFIX}OTHER")
+		self._assert_tag(self._bxgy(applicable_for="Customer Group", customer_group=other), 2, blocked=False)
+
+	def test_bxgy_tag_on_an_item_outside_its_scope_does_not_block(self):
+		rule = self._bxgy(items=[{"item_code": ITEM_C}])
+		self._assert_tag(rule, 2, blocked=False)
+
+	def test_item_level_tag_follows_its_eligibility(self):
+		rule = self._item_level("ROUTINE")
+		self._assert_tag(rule, 1, blocked=False)
+		self._assert_tag(rule, 2, blocked=True)
+		expired = self._item_level(
+			"ROUTINE_OLD", valid_from=add_days(nowdate(), -10), valid_upto=add_days(nowdate(), -1)
+		)
+		# The live rule still covers the line, untagged (D-R3-01).
+		self._assert_tag(expired, 2, blocked=True)
+		# Off: an expired tag alone does not block.
+		frappe.db.set_value("Pricing Rule", rule, "disable", 1)
+		frappe.clear_document_cache("Pricing Rule", rule)
+		self._assert_tag(expired, 2, blocked=False)
+
+	# ---- Ruling 121: ERPNext's qty basis; cart-wide rules fail closed ----------
+
+	def _box_uom(self, factor=6):
+		"""ITEM_A also sold by the Box of ``factor`` (rolled back with the test's savepoint)."""
+		if not frappe.db.exists("UOM", "Box"):
+			frappe.get_doc({"doctype": "UOM", "uom_name": "Box"}).insert(ignore_permissions=True)
+		item = frappe.get_doc("Item", ITEM_A)
+		if not any(row.uom == "Box" for row in item.uoms):
+			item.append("uoms", {"uom": "Box", "conversion_factor": factor})
+			item.save(ignore_permissions=True)
+		self.addCleanup(frappe.clear_document_cache, "Item", ITEM_A)
+		return ITEM_PRICES[ITEM_A] * factor
+
+	def _verdicts(self, cart_lines, invoice_rows, item_code=ITEM_A):
+		"""``item_code``'s F&F on the three paths: apply_offers (selected [] and the rules), F&F-only, invoice."""
+		rules = sorted({r for line in cart_lines for r in gifts._item_rule_names(line)})
+		untagged = [{k: v for k, v in line.items() if k != "pricing_rules"} for line in cart_lines]
+		out = {}
+		for selected in (rules, []):
+			payload = _cart_payload(self.ctx, [dict(line) for line in untagged])
+			resp = apply_offers(invoice_data=json.dumps(payload), selected_offers=json.dumps(selected))
+			line = next(i for i in resp["items"] if i["item_code"] == item_code and not i.get("is_free_item"))
+			out[f"apply_offers {selected}"] = _source(line) == FNF
+		resp = apply_friends_and_family_discount(
+			customer=self.ctx.customer,
+			items=json.dumps(cart_lines),
+			posting_date=nowdate(),
+			pos_profile=self.ctx.pos_profile,
+		)
+		idx = next(k for k, line in enumerate(cart_lines) if line["item_code"] == item_code)
+		out["fnf_only"] = bool(resp["items"][idx]["applies"])
+		doc = self._invoice(invoice_rows)
+		apply_friends_and_family_on_invoice(doc)
+		out["invoice"] = _source(self._paid(doc, item_code)) == FNF
+		return out
+
+	def test_box_uom_bxgy_line_stays_blocked(self):
+		# C1: 1 Box (6 Nos) reaches min_qty 2 in stock qty; ERPNext gives the free row, so no F&F.
+		price = self._box_uom()
+		rule = self._bxgy()
+		box = dict(_line(self.ctx, ITEM_A), qty=1, uom="Box", conversion_factor=6, rate=price, price_list_rate=price)
+		row = self._row(ITEM_A, 1, rule)
+		row.update(uom="Box", conversion_factor=6, stock_qty=6, rate=price, price_list_rate=price)
+		free = self._row(ITEM_A, 1, rule, free=True)
+		verdicts = self._verdicts(
+			[dict(box, pricing_rules=rule), _line(self.ctx, ITEM_B)], [row, free, self._row(ITEM_B, 1)]
+		)
+		self.assertEqual(verdicts, dict.fromkeys(verdicts, False))
+		# Untagged on the F&F-only call: the scope source uses the same basis.
+		resp = apply_friends_and_family_discount(
+			customer=self.ctx.customer, items=json.dumps([box]), posting_date=nowdate(), pos_profile=self.ctx.pos_profile
+		)
+		self.assertFalse(resp["items"][0]["applies"])
+
+	def test_rule_uom_is_the_threshold_unit(self):
+		# min_qty in the rule row's UOM (Box); ERPNext never applies it to a Nos line.
+		price = self._box_uom()
+		rule = self._bxgy(items=[{"item_code": ITEM_A, "uom": "Box"}], min_qty=1)
+		box = dict(self._row(ITEM_A, 1, rule), uom="Box", conversion_factor=6, rate=price, price_list_rate=price)
+		self.assertEqual(ff_compatibility.block_ineligible_lines([box], doc=self._invoice([])), {0})
+		nos = self._row(ITEM_A, 6, rule)
+		nos.update(uom="Nos", conversion_factor=1)
+		self.assertEqual(ff_compatibility.block_ineligible_lines([nos], doc=self._invoice([])), set())
+
+	def test_mixed_conditions_routine_stays_blocked(self):
+		# I1: A x1 + B x1 reach min_qty 2 together; ERPNext prices both lines at 10%.
+		if not frappe.get_meta("Pricing Rule").has_field("promotion_type"):
+			self.skipTest("Pricing Rule.promotion_type custom field missing")
+		rule = _make_rule(
+			f"{PREFIX}MIXED_IL",
+			apply_on="Item Code",
+			items=[{"item_code": ITEM_A}, {"item_code": ITEM_B}],
+			mixed_conditions=1,
+			price_or_product_discount="Price",
+			rate_or_discount="Discount Percentage",
+			discount_percentage=10,
+			min_qty=2,
+		)
+		frappe.db.set_value("Pricing Rule", rule, "promotion_type", gifts.PROMOTION_TYPE_ITEM_LEVEL)
+		frappe.clear_document_cache("Pricing Rule", rule)
+		rows = []
+		for code in (ITEM_A, ITEM_B):
+			row = self._row(code, 1, rule)
+			price = ITEM_PRICES[code]
+			row.update(discount_percentage=10, discount_amount=price / 10, rate=price * 0.9)
+			rows.append(row)
+		cart = [dict(_line(self.ctx, code), pricing_rules=rule) for code in (ITEM_A, ITEM_B)]
+		for code in (ITEM_A, ITEM_B):
+			rows_copy = [frappe._dict(dict(r)) for r in rows]
+			verdicts = self._verdicts(cart, rows_copy, item_code=code)
+			self.assertEqual(verdicts, dict.fromkeys(verdicts, False), code)
+
+	def _assert_tag_fails_closed(self, rule):
+		"""Cart-wide / history rules: the tag blocks at qty 1, below the line's own min_qty."""
+		self._assert_tag(rule, 1, blocked=True)
+
+	def test_cumulative_bxgy_tag_fails_closed(self):
+		# Past invoices count towards min_qty: the line alone cannot tell.
+		self._assert_tag_fails_closed(self._bxgy(is_cumulative=1, valid_from=add_days(nowdate(), -30), valid_upto=add_days(nowdate(), 30)))
+
+	def test_apply_rule_on_other_tag_fails_closed(self):
+		rule = self._bxgy()
+		frappe.db.set_value("Pricing Rule", rule, {"apply_rule_on_other": "Item Code", "other_item_code": ITEM_A})
+		frappe.clear_document_cache("Pricing Rule", rule)
+		self._assert_tag_fails_closed(rule)
+
+	def test_client_verdict_never_unblocks(self):
+		# M2 / M3: an empty fnf_blocked_by_scheme from the client is no verdict.
+		rule = self._bxgy()
+		line = dict(self._stale_line(rule, 2), fnf_blocked_by_scheme="")
+		self.assertFalse(self._fnf_only_line(rule, 2)["applies"])
+		resp = apply_friends_and_family_discount(
+			customer=self.ctx.customer, items=json.dumps([line]), posting_date=nowdate(), pos_profile=self.ctx.pos_profile
+		)
+		self.assertFalse(resp["items"][0]["applies"])
+		# Unjudged callers: a client verdict (or a forged marker) is ignored, the tag is judged.
+		for extra in ({}, {ff_compatibility.FIELD_JUDGED: "0" * 64}):
+			plan = compute_friends_and_family_discounts(
+				customer=self.ctx.customer, items=[frappe._dict(line, **extra)], posting_date=nowdate()
+			)
+			self.assertEqual(plan["items"][0]["reason"], REASON_SCHEME_NOT_ELIGIBLE, extra)
+
+	def test_coupon_rival_uses_the_shared_judge(self):
+		# M1: capped B1G1 at qty 4 — untagged, yet the line is the scheme's: no F&F rival there.
+		self._bxgy(max_qty=3)
+		coupon = frappe._dict(
+			{"coupon_code": "X", "discount_type": "Percentage", "apply_on": "Net Total", "discount_percentage": 10}
+		)
+		lines = [_line(self.ctx, ITEM_A, qty=4), _line(self.ctx, ITEM_B)]
+		decision = decide_coupon_vs_fnf(
+			{"items": lines}, coupon, customer=self.ctx.customer, pos_profile=self.ctx.pos_profile
+		)
+		self.assertEqual(decision.fnf_lines, 1)
+
+	# ---- Ruling 122: restore the replaced discount, then judge ------------------
+
+	def _fnf_over_price(self, qty):
+		"""ITEM_A x ``qty`` where F&F beat a 5% price rule: F&F stamped, the rule detached,
+		and a server-signed snapshot of it (``posnext_fnf_replaced_discount``)."""
+		px = self._price_rule(ITEM_A, pct=5, title="PRICE5")
+		price = ITEM_PRICES[ITEM_A]
+		line = frappe._dict(_line(self.ctx, ITEM_A, qty=qty))
+		line.update(pricing_rules=px, discount_percentage=5, discount_amount=price * qty * 0.05, rate=price * 0.95)
+		apply_friends_and_family_to_items(
+			[line], customer=self.ctx.customer, posting_date=nowdate(), pos_profile=self.ctx.pos_profile
+		)
+		self.assertEqual(_source(line), FNF)
+		self.assertTrue(line.get("posnext_fnf_replaced_discount"))
+		return {k: v for k, v in dict(line).items() if not k.startswith("_")}
+
+	def _paid_doc(self, sent, rule, free_qty=0, **flags):
+		row = frappe._dict(sent, stock_qty=sent["qty"], name="row1")
+		rows = [row]
+		if free_qty:
+			price = ITEM_PRICES[ITEM_A]
+			rows.append(
+				frappe._dict(
+					item_code=ITEM_A,
+					qty=free_qty,
+					uom="Nos",
+					conversion_factor=1,
+					stock_qty=free_qty,
+					rate=0,
+					price_list_rate=price,
+					discount_percentage=100,
+					discount_amount=price,
+					pricing_rules=rule,
+					is_free_item=1,
+					name="row2",
+				)
+			)
+		doc = self._invoice(rows)
+		doc.conversion_rate = 1
+		doc.flags = frappe._dict(flags)
+		return doc
+
+	def _assert_restored_line_blocked(self, rule, sent, free_qty):
+		resp = apply_friends_and_family_discount(
+			customer=self.ctx.customer,
+			items=json.dumps([sent], default=str),
+			posting_date=nowdate(),
+			pos_profile=self.ctx.pos_profile,
+		)
+		self.assertEqual(resp["items"][0]["reason"], REASON_SCHEME_NOT_ELIGIBLE, "F&F-only call")
+		with self.assertRaises(frappe.ValidationError, msg="paid freeze, online"):
+			apply_friends_and_family_on_invoice(
+				self._paid_doc(sent, rule, free_qty, **{ff_paid.PAYMENT_COLLECTED_FLAG: 1})
+			)
+		doc = self._paid_doc(sent, rule, free_qty, **{ff_paid.OFFLINE_SYNC_FLAG: 1})
+		apply_friends_and_family_on_invoice(doc)
+		found = (doc.flags.get(ff_paid.DISAGREEMENTS_FLAG) or {}).get("entries") or []
+		self.assertIn(ff_paid.COMPATIBILITY, [entry["reason"] for entry in found], "paid freeze, offline")
+		self.assertNotIn("row1", fnf_line_rates(self._paid_doc(sent, rule, free_qty)), "fnf_line_rates")
+
+	def test_restored_snapshot_line_under_bxgy_stays_blocked(self):
+		# N1 (probe_rr3): F&F beat a price rule; a BXGY now covers the line and its free row is on the invoice.
+		sent = self._fnf_over_price(2)
+		self._assert_restored_line_blocked(self._bxgy(), sent, free_qty=1)
+
+	def test_restored_snapshot_line_above_capped_bxgy_stays_blocked(self):
+		# N1 (probe_rr2): capped B1G1 at qty 4 — untagged, only the scope source blocks it.
+		sent = self._fnf_over_price(4)
+		self._assert_restored_line_blocked(self._bxgy(max_qty=3), sent, free_qty=0)
+
+	def test_unsigned_fallback_runs_the_full_judge(self):
+		# A line the judge never saw: the untagged BXGY scope still blocks it.
+		self._bxgy(max_qty=3)
+		line = frappe._dict(_line(self.ctx, ITEM_A, qty=4), item_group=None)
+		line.update(frappe.get_cached_value("Item", ITEM_A, ["item_group", "brand"], as_dict=True))
+		self.assertTrue(gifts.line_blocked_by_scheme(line))
+
+	def test_api_responses_carry_no_verdict_mark(self):
+		rule = self._bxgy()
+		resp = self._apply([(ITEM_A, 2), (ITEM_B, 1)], [rule])
+		for row in [*resp["items"], *(resp.get("free_items") or [])]:
+			self.assertNotIn(ff_compatibility.FIELD_JUDGED, row)
+
+	def test_client_qty_1_2_1_still_works(self):
+		rule = self._bxgy()
+		for qty, fnf in ((1, True), (2, False), (1, True)):
+			resp = self._apply([(ITEM_A, qty), (ITEM_B, 1)], [rule] if qty == 2 else [])
+			line_a = next(i for i in resp["items"] if i["item_code"] == ITEM_A and not i.get("is_free_item"))
+			self.assertEqual(_source(line_a) == FNF, fnf, f"qty {qty}")
+			self.assertEqual(bool(resp.get("free_items")), not fnf, f"qty {qty}")
+
+	# ---- Ruling 124: reruns judged with the doc; fnf_line_rates on server dates ----
+
+	def _other_customer(self):
+		name = f"{PREFIX}OTHER_CUSTOMER"
+		if not frappe.db.exists("Customer", name):
+			group = frappe.db.get_value("Customer Group", {"is_group": 0}, "name")
+			territory = frappe.db.get_value("Territory", {"is_group": 0}, "name")
+			frappe.get_doc(
+				{
+					"doctype": "Customer",
+					"customer_name": name,
+					"customer_group": group,
+					"territory": territory,
+				}
+			).insert(ignore_permissions=True)
+		return frappe.db.get_value("Customer", {"customer_name": name}, "name")
+
+	def _foreign_bxgy_and_gift(self):
+		"""probe_rr4 P6/P7: a gift on ITEM_B (→ ITEM_C) and a BXGY on ITEM_B for another customer only."""
+		_make_rule(
+			f"{PREFIX}FOREIGN_B",
+			apply_on="Item Code",
+			items=[{"item_code": ITEM_B}],
+			price_or_product_discount="Product",
+			rate_or_discount="Discount Percentage",
+			same_item=1,
+			min_qty=1,
+			free_qty=1,
+			free_item_uom="Nos",
+			free_item_rate=0,
+			applicable_for="Customer",
+			customer=self._other_customer(),
+		)
+		return self._gift(trigger=ITEM_B)
+
+	def test_gift_drop_rerun_keeps_fnf_on_apply_offers(self):
+		# NB1 P6: the dropped gift re-prices the line; the rerun judges with the doc.
+		gift = self._foreign_bxgy_and_gift()
+		resp = self._apply([(ITEM_B, 1)], [gift])
+		line_b = next(i for i in resp["items"] if i["item_code"] == ITEM_B and not i.get("is_free_item"))
+		self.assertEqual(_source(line_b), FNF)
+		self.assertAlmostEqual(flt(line_b.get("rate")), ITEM_PRICES[ITEM_B] * 0.7, places=2)
+		self.assertFalse([f for f in resp.get("free_items") or [] if f.get("item_code") == ITEM_C])
+
+	def test_gift_drop_rerun_keeps_fnf_on_invoice_validate(self):
+		# NB1 P7: unpaid invoice, ITEM_B tagged with the gift + its ITEM_C free row.
+		gift = self._foreign_bxgy_and_gift()
+		doc = self._invoice([self._row(ITEM_B, 1, gift), self._row(ITEM_C, 1, gift, free=True)])
+		apply_friends_and_family_on_invoice(doc)
+		line_b = self._paid(doc, ITEM_B)
+		self.assertEqual(_source(line_b), FNF)
+		self.assertEqual(flt(line_b.discount_percentage), 30)
+
+	def test_fnf_line_rates_judges_bxgy_on_server_dates(self):
+		# A back-dated invoice must not dodge a BXGY that is valid today.
+		rule = self._bxgy()
+		doc = self._invoice([frappe._dict(self._row(ITEM_A, 2, rule), name="row1")])
+		doc.posting_date = add_days(nowdate(), -5)
+		self.assertNotIn("row1", fnf_line_rates(doc))
+
+	# ---- Ruling 125: fnf_line_rates reads creation from the database; any blocking day wins ----
+
+	def _rates_doc(self, rule, posting, creation=None):
+		"""probe_rr6: ITEM_A x2 tagged with ``rule`` + its free row; an unsaved name."""
+		price = ITEM_PRICES[ITEM_A]
+		row = frappe._dict(self._row(ITEM_A, 2, rule), name="row1", stock_qty=2)
+		free = frappe._dict(self._row(ITEM_A, 1, rule, free=True), name="row2", price_list_rate=price)
+		doc = self._invoice([row, free])
+		doc.update(name=f"{PREFIX}UNSAVED", posting_date=posting, conversion_rate=1)
+		if creation:
+			doc.creation = creation
+		return doc
+
+	def _rates(self, doc, stored=None, now=None):
+		"""``fnf_line_rates`` with the database ``creation`` = ``stored`` and the clock at ``now``."""
+		with patch.object(ff_apply, "_stored_creation", return_value=get_datetime(stored) if stored else None):
+			if now is None:
+				return fnf_line_rates(doc)
+			with patch.object(schedule, "now_datetime", return_value=get_datetime(now)):
+				return fnf_line_rates(doc)
+
+	def test_fnf_line_rates_ignores_a_client_creation(self):
+		# probe_rr6 A-C, G: a BXGY valid only from today blocks whatever the doc claims.
+		rule = self._bxgy(valid_from=nowdate())
+		back = add_days(nowdate(), -5)
+		self.assertEqual(fnf_line_rates(self._rates_doc(rule, back)), {}, "A back-dated posting")
+		self.assertEqual(fnf_line_rates(self._rates_doc(rule, back, f"{back} 10:00:00")), {}, "B both dates forged")
+		self.assertEqual(fnf_line_rates(self._rates_doc(rule, nowdate(), f"{back} 10:00:00")), {}, "C creation forged")
+		honest = f"{nowdate()} 09:00:00"
+		self.assertEqual(self._rates(self._rates_doc(rule, nowdate(), honest), stored=honest), {}, "honest creation")
+
+	def test_fnf_line_rates_control_always_valid_bxgy(self):
+		# probe_rr6 D.
+		back = add_days(nowdate(), -5)
+		rule = self._bxgy(valid_from=add_days(nowdate(), -30))
+		self.assertEqual(fnf_line_rates(self._rates_doc(rule, back, f"{back} 10:00:00")), {})
+
+	def test_fnf_line_rates_blocked_on_the_stored_creation_day(self):
+		# probe_rr6 E: valid when the invoice was stored (yesterday), expired today: one day blocks.
+		yesterday = add_days(nowdate(), -1)
+		rule = self._bxgy(valid_from=add_days(nowdate(), -10), valid_upto=yesterday)
+		stored = f"{yesterday} 10:00:00"
+		self.assertEqual(self._rates(self._rates_doc(rule, yesterday, stored), stored=stored), {})
+
+	def test_fnf_line_rates_happy_hour_judged_now(self):
+		# Draft stored at 13:00, BXGY live 14:00-16:00 today, judged at 15:00: blocked.
+		if not schedule.schedule_fields_available():
+			self.skipTest("Pricing Rule schedule fields missing")
+		rule = self._bxgy(valid_from=nowdate(), valid_upto=nowdate())
+		frappe.db.set_value(
+			"Pricing Rule", rule, {schedule.FROM_TIME_FIELD: "14:00:00", schedule.TO_TIME_FIELD: "16:00:00"}
+		)
+		frappe.clear_document_cache("Pricing Rule", rule)
+		stored = f"{nowdate()} 13:00:00"
+		doc = self._rates_doc(rule, nowdate(), stored)
+		self.assertEqual(self._rates(doc, stored=stored, now=f"{nowdate()} 15:00:00"), {})
+		# Control: outside the window on both moments, F&F gives a rate.
+		self.assertIn("row1", self._rates(doc, stored=stored, now=f"{nowdate()} 17:00:00"))
+
+	# ---- Ruling 127: the stored moment blocks only a scheme the invoice carries ----
+
+	def _saved_draft(self, stored):
+		"""A REAL draft Sales Invoice (plain insert) whose stored ``creation`` is ``stored``."""
+		doc = frappe.get_doc(
+			{
+				"doctype": "Sales Invoice",
+				"company": self.ctx.company,
+				"customer": self.ctx.customer,
+				"selling_price_list": self.ctx.price_list,
+				"currency": self.ctx.currency,
+				"posting_date": nowdate(),
+				"ignore_pricing_rule": 1,
+				"items": [
+					{"item_code": ITEM_A, "qty": 2, "rate": ITEM_PRICES[ITEM_A], "warehouse": self.ctx.warehouse}
+				],
+			}
+		).insert(ignore_permissions=True)
+		frappe.db.sql("update `tabSales Invoice` set creation=%s where name=%s", (stored, doc.name))
+		self.assertEqual(cstr(ff_apply._stored_creation(frappe._dict(doctype="Sales Invoice", name=doc.name))), stored)
+		return doc.name
+
+	def _draft_view(self, name, rule=None, tag=False, free=False, creation=None):
+		"""What pos_next passes for the draft: by name, ITEM_A x2 (``rule`` tagged / its free row)."""
+		price = ITEM_PRICES[ITEM_A]
+		rows = [frappe._dict(self._row(ITEM_A, 2, rule if tag else ""), name="row1", stock_qty=2)]
+		if free:
+			rows.append(frappe._dict(self._row(ITEM_A, 1, rule, free=True), name="row2", price_list_rate=price))
+		doc = self._invoice(rows)
+		doc.update(doctype="Sales Invoice", name=name, conversion_rate=1)
+		if creation:
+			doc.creation = creation
+		return doc
+
+	def _real_rates(self, view, now=None):
+		if now is None:
+			return fnf_line_rates(view)
+		with patch.object(schedule, "now_datetime", return_value=get_datetime(now)):
+			return fnf_line_rates(view)
+
+	def test_real_draft_held_past_a_bxgy_end_keeps_fnf(self):
+		# T1: stored yesterday inside a BXGY that ended yesterday; the draft never took it.
+		yesterday = add_days(nowdate(), -1)
+		rule = self._bxgy(valid_from=add_days(nowdate(), -10), valid_upto=yesterday)
+		name = self._saved_draft(f"{yesterday} 10:00:00")
+		self.assertIn("row1", self._real_rates(self._draft_view(name, rule)), "T1 no tag, no free row")
+		# E: the invoice carries the scheme — its free row, or its tag — so the stored moment blocks.
+		self.assertEqual(self._real_rates(self._draft_view(name, rule, tag=True, free=True)), {}, "E free row + tag")
+		self.assertEqual(self._real_rates(self._draft_view(name, rule, free=True)), {}, "free row only")
+		self.assertEqual(self._real_rates(self._draft_view(name, rule, tag=True)), {}, "tag only")
+
+	def test_real_draft_held_past_a_happy_hour_end_keeps_fnf(self):
+		# T2: stored 13:00 inside a 12:00-14:00 window, paid at 15:00; the draft never took it.
+		if not schedule.schedule_fields_available():
+			self.skipTest("Pricing Rule schedule fields missing")
+		rule = self._bxgy(valid_from=nowdate(), valid_upto=nowdate())
+		frappe.db.set_value(
+			"Pricing Rule", rule, {schedule.FROM_TIME_FIELD: "12:00:00", schedule.TO_TIME_FIELD: "14:00:00"}
+		)
+		frappe.clear_document_cache("Pricing Rule", rule)
+		name = self._saved_draft(f"{nowdate()} 13:00:00")
+		later = f"{nowdate()} 15:00:00"
+		self.assertIn("row1", self._real_rates(self._draft_view(name, rule), now=later), "T2")
+		self.assertEqual(self._real_rates(self._draft_view(name, rule, free=True), now=later), {}, "T2 free row")
+		# Live now (window 14:00-16:00): now blocks, carried or not.
+		frappe.db.set_value(
+			"Pricing Rule", rule, {schedule.FROM_TIME_FIELD: "14:00:00", schedule.TO_TIME_FIELD: "16:00:00"}
+		)
+		frappe.clear_document_cache("Pricing Rule", rule)
+		self.assertEqual(self._real_rates(self._draft_view(name, rule), now=later), {}, "happy hour now")
+
+	def test_real_draft_forged_creation_never_unblocks(self):
+		# probe A/B/C on a real draft stored now: a BXGY valid only from today blocks.
+		rule = self._bxgy(valid_from=nowdate())
+		name = self._saved_draft(cstr(now_datetime())[:19])
+		back = f"{add_days(nowdate(), -5)} 10:00:00"
+		self.assertEqual(self._real_rates(self._draft_view(name, creation=back)), {}, "A forged in-memory creation")
+		view = self._draft_view(name, creation=back)
+		view.posting_date = add_days(nowdate(), -5)
+		self.assertEqual(self._real_rates(view), {}, "B both dates forged")
+		self.assertEqual(self._real_rates(self._draft_view(None, creation=back)), {}, "C unsaved")
+		self.assertEqual(self._real_rates(self._draft_view("ACC-SINV-NOPE-99999", creation=back)), {}, "C name not stored")
+		frappe.db.set_value("Pricing Rule", rule, "disable", 1)
+		frappe.clear_document_cache("Pricing Rule", rule)
+		self.assertIn("row1", self._real_rates(self._draft_view(name, creation=back)), "control: BXGY off")
+
+	# ---- Task 8s: Allow Free Gift with F&F covers Buy X Get Y ------------------
+
+	@staticmethod
+	def _cart_paid(resp, item_code):
+		return next(i for i in resp["items"] if i["item_code"] == item_code and not i.get("is_free_item"))
+
+	def _assert_bxgy_line_gets_fnf(self, rule, scan_qty=2):
+		"""Checkbox on: the BXGY line gets F&F on every path and its free row stays."""
+		price = ITEM_PRICES[ITEM_A]
+		resp = self._apply([(ITEM_A, scan_qty), (ITEM_B, 1)], [rule])
+		line_a = self._cart_paid(resp, ITEM_A)
+		self.assertEqual(_source(line_a), FNF, "apply_offers")
+		self.assertAlmostEqual(flt(line_a.get("rate")), price * 0.7, places=2)
+		free_a = [f for f in resp.get("free_items") or [] if f["item_code"] == ITEM_A]
+		self.assertEqual(sum(flt(f.get("qty")) for f in free_a), 1, "the BXGY free row is kept")
+		self.assertIn(rule, resp.get("applied_pricing_rules") or [])
+		self._assert_parity(resp)
+		# The F&F-only call and invoice validate, tagged and untagged (the scope source).
+		self._assert_tag(rule, 2, blocked=False)
+		self.assertTrue(self._fnf_only_line("", 2)["applies"])
+		# The server submit judge (benefit-provider hook) gives the same rate.
+		rates = fnf_line_rates(self._rates_doc(rule, nowdate()))
+		self.assertAlmostEqual(flt(rates.get("row1")), price * 0.7, places=2)
+
+	def test_gift_setting_on_bxgy_line_gets_fnf_and_keeps_free_row(self):
+		self._settings(allow_free_gift_with_ff=1)
+		rule = self._bxgy()
+		self.assertIsNone(gifts.scheme_blocking_kind(rule))
+		self.assertEqual(ff_compatibility.blocking_rule_map(self._invoice([self._row(ITEM_A, 2)])), {})
+		self._assert_bxgy_line_gets_fnf(rule)
+
+	def test_gift_setting_on_same_item_gwp_gets_fnf(self):
+		if not frappe.get_meta("Pricing Rule").has_field("promotion_type"):
+			self.skipTest("Pricing Rule.promotion_type custom field missing")
+		self._settings(allow_free_gift_with_ff=1)
+		rule = self._bxgy()
+		frappe.db.set_value("Pricing Rule", rule, "promotion_type", gifts.PROMOTION_TYPE_GWP)
+		frappe.clear_document_cache("Pricing Rule", rule)
+		self.assertEqual(gifts.classify_gift_rule(rule), gifts.GIFT_KIND_BXGY)
+		self._assert_bxgy_line_gets_fnf(rule)
+
+	def test_gift_setting_on_item_level_still_blocks(self):
+		self._settings(allow_free_gift_with_ff=1)
+		rule = self._item_level("ROUTINE_8S")
+		self._assert_tag(rule, 2, blocked=True)
+		doc = self._invoice([frappe._dict(self._row(ITEM_A, 2, rule), name="row1", stock_qty=2)])
+		self.assertNotIn("row1", fnf_line_rates(doc))
+
+	def test_gift_setting_off_bxgy_still_blocks(self):
+		rule = self._bxgy()
+		self.assertEqual(gifts.scheme_blocking_kind(rule), gifts.SCHEME_KIND_BXGY)
+		self.assertEqual(fnf_line_rates(self._rates_doc(rule, nowdate())), {})
+		resp = self._apply([(ITEM_A, 2), (ITEM_B, 1)], [rule])
+		self.assertNotEqual(_source(self._cart_paid(resp, ITEM_A)), FNF)
+		self.assertEqual(sum(flt(f.get("qty")) for f in resp.get("free_items") or []), 1)
+		self._assert_parity(resp)
+
+	def test_box_off_never_gives_fnf_and_the_free_unit_whatever_a_stale_cache_says(self):
+		"""J1: the box was saved off, and Redis still held an "on" config (a POS request ran
+		between the save and its commit). The cart, the F&F-only call and invoice validate
+		give the BXGY line F&F or the free unit, never both, at every qty."""
+		rule = self._bxgy()
+		cfg = ff_config._build()
+		self.assertIs(cfg.allow_free_gift_with_ff.value, False)
+		frappe.cache().set_value(
+			"ff:effective_config",
+			ff_config.EffectiveConfig(
+				allow_free_gift_with_ff=ff_config.Value(True, "global"),
+				on_cap_breach_at_submit=cfg.on_cap_breach_at_submit,
+				unclassified_promotion_policy=cfg.unclassified_promotion_policy,
+			),
+		)
+		try:
+			for qty in (5, 3, 2):
+				with self.subTest(qty=qty):
+					resp = self._apply([(ITEM_A, qty), (ITEM_B, 1)], [rule])
+					free_units = sum(flt(f.get("qty")) for f in resp.get("free_items") or [] if f["item_code"] == ITEM_A)
+					self.assertEqual(free_units, 1, "the BXGY offer applies")
+					self.assertNotEqual(_source(self._cart_paid(resp, ITEM_A)), FNF, "apply_offers")
+					self.assertEqual(_source(self._cart_paid(resp, ITEM_B)), FNF, "control: plain line")
+					doc = self._invoice(
+						[self._row(ITEM_A, qty, rule), self._row(ITEM_A, 1, rule, free=True), self._row(ITEM_B, 1)]
+					)
+					apply_friends_and_family_on_invoice(doc)
+					self.assertNotEqual(_source(self._paid(doc, ITEM_A)), FNF, "invoice validate")
+		finally:
+			frappe.cache().delete_value("ff:effective_config")
+
+	# ---- A Price "buy one" rule is Buy X Get Y (ported from #24/#25) ------------
+
+	def _buy_one(self):
+		"""Price Discount BXGY: min qty 2, 100% off the cheapest unit, discounted-qty limit 1."""
+		return _make_rule(
+			f"{PREFIX}BUY_ONE",
+			apply_on="Item Code",
+			items=[{"item_code": ITEM_A}],
+			price_or_product_discount="Price",
+			rate_or_discount="Discount Percentage",
+			discount_percentage=100,
+			min_qty=2,
+			apply_discount_on_price="Min",
+			min_or_max_discount_qty_limit=1,
+		)
+
+	def _invoice_a_gets_fnf(self, qty) -> bool:
+		"""Invoice validate on an untagged ITEM_A line (the scope source) + a plain ITEM_B."""
+		doc = self._invoice([self._row(ITEM_A, qty), self._row(ITEM_B, 1)])
+		apply_friends_and_family_on_invoice(doc)
+		self.assertEqual(_source(self._paid(doc, ITEM_B)), FNF)
+		return _source(self._paid(doc, ITEM_A)) == FNF
+
+	def test_price_buy_one_follows_gift_setting(self):
+		# Cart / invoice row parity (_assert_parity) is not checked here: the harness
+		# reads the cart discount_amount as a line total, a Min/Max rule returns it per unit.
+		rule = self._buy_one()
+		doc = self._invoice([self._row(ITEM_A, 2)])
+
+		# Off: blocked like Product BXGY, tagged or not, on every path.
+		self.assertEqual(gifts.scheme_blocking_kind(rule), gifts.SCHEME_KIND_BXGY)
+		self.assertIn(rule, ff_compatibility.blocking_rule_map(doc))
+		self._assert_tag(rule, 2, blocked=True)
+		self.assertFalse(self._invoice_a_gets_fnf(4))
+		self.assertNotIn("row1", fnf_line_rates(self._rates_doc(rule, nowdate())))
+		for selected in ([rule], []):
+			with self.subTest(allow=0, selected=selected):
+				resp = self._apply([(ITEM_A, 4), (ITEM_B, 1)], selected)
+				self.assertNotEqual(_source(self._cart_paid(resp, ITEM_A)), FNF)
+				self.assertEqual(_source(self._cart_paid(resp, ITEM_B)), FNF)
+
+		# On: not blocked; the line competes for F&F under the usual rules.
+		self._settings(allow_free_gift_with_ff=1)
+		self.assertIsNone(gifts.scheme_blocking_kind(rule))
+		self.assertEqual(ff_compatibility.blocking_rule_map(doc), {})
+		self._assert_tag(rule, 2, blocked=False)
+		self.assertTrue(self._invoice_a_gets_fnf(4))
+		# qty 4: one free unit is 25% off the line, F&F is 30%.
+		resp = self._apply([(ITEM_A, 4), (ITEM_B, 1)], [rule])
+		self.assertEqual(_source(self._cart_paid(resp, ITEM_A)), FNF)
+		self.assertEqual(_source(self._cart_paid(resp, ITEM_B)), FNF)
