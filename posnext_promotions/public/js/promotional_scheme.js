@@ -101,6 +101,17 @@ function pn_toggle_gwp_fields(frm) {
 	const is_gwp = frm.doc.promotion_type === PROMOTION_TYPE_GWP;
 
 	frm.toggle_display("price_discount_slabs", !is_gwp);
+	frm.set_df_property(
+		"product_discount_slabs",
+		"description",
+		is_gwp
+			? __(
+					"<b>GWP:</b> <b>Min Qty</b> is the <b>paid</b> quantity only (do not include the free gift). " +
+						"Example: for <b>Buy 2 Get 1 Free</b>, set <b>Min Qty = 2</b> and <b>Free Qty = 1</b>. " +
+						"Leave <b>Max Qty = 0</b> for no upper limit (setting Max Qty = 2 stops the gift when a customer buys 3 paid units)."
+				)
+			: ""
+	);
 
 	const product_grid = frm.fields_dict.product_discount_slabs?.grid;
 	if (!product_grid) {

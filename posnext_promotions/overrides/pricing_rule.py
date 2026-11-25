@@ -55,6 +55,7 @@ ACCUMULATIVE_MODE = "Accumulative"
 CROSS_CART_MODES = (*MIN_MAX_OPTIONS, ACCUMULATIVE_MODE)
 
 PROMOTION_TYPE_ITEM_LEVEL = "Item Level Discount"
+PROMOTION_TYPE_GWP = "GWP"
 PROMOTION_TYPE_GIFT_POOL = "Gift Pool"
 
 
@@ -463,6 +464,59 @@ def validate_gift_pool_scheme(doc, method=None):
 					).format(item_code, item_group),
 					title=_("Gift Pool"),
 				)
+
+
+def validate_gwp_scheme(doc, method=None):
+	"""Authoring guards for GWP slabs: paid min_qty > 0, free_qty > 0, valid max_qty."""
+	if doc.doctype != "Promotional Scheme":
+		return
+	if cstr(doc.get("promotion_type") or "") != PROMOTION_TYPE_GWP:
+		return
+	if doc.get("disable"):
+		return
+
+	slabs = doc.get("product_discount_slabs") or []
+	if not slabs:
+		frappe.throw(
+			_("Add at least one <b>Product Discount</b> row for a GWP scheme."),
+			title=_("Invalid GWP Scheme"),
+		)
+
+	for idx, slab in enumerate(slabs, start=1):
+		min_qty = flt(slab.get("min_qty"))
+		max_qty = flt(slab.get("max_qty"))
+		free_qty = flt(slab.get("free_qty"))
+
+		if min_qty <= 0:
+			frappe.throw(
+				_(
+					"Row #{0}: <b>Min Qty</b> must be greater than 0 for a GWP scheme. "
+					"Enter the <b>paid</b> quantity only (excluding the free gift — e.g. "
+					"set Min Qty = 2 and Free Qty = 1 for Buy 2 Get 1 Free)."
+				).format(idx),
+				title=_("Invalid GWP Quantity"),
+			)
+
+		if free_qty <= 0:
+			frappe.throw(
+				_("Row #{0}: <b>Free Qty</b> must be greater than 0 for a GWP scheme.").format(idx),
+				title=_("Invalid GWP Quantity"),
+			)
+
+		if max_qty < 0:
+			frappe.throw(
+				_("Row #{0}: <b>Max Qty</b> cannot be negative. Leave 0 for no upper limit.").format(idx),
+				title=_("Invalid GWP Quantity"),
+			)
+
+		if max_qty > 0 and max_qty < min_qty:
+			frappe.throw(
+				_(
+					"Row #{0}: <b>Max Qty</b> ({1:g}) cannot be less than <b>Min Qty</b> ({2:g}). "
+					"Leave Max Qty as 0 for no upper limit."
+				).format(idx, max_qty, min_qty),
+				title=_("Invalid GWP Quantity"),
+			)
 
 
 def _resolve_accumulative_slab(doc):
