@@ -13,7 +13,10 @@ from typing import Dict, List, Optional
 
 import frappe
 from frappe import _
+from frappe.query_builder import Order
+from frappe.query_builder.functions import IfNull
 from frappe.utils import cint, cstr, flt, getdate, nowdate
+from frappe.utils.nestedset import get_ancestors_of
 
 from posnext_promotions.promotions.schedule import SCHEDULE_FIELDS, to_client_payload as schedule_payload
 from posnext_promotions.promotions.scope import (
@@ -613,11 +616,13 @@ def get_offers(pos_profile: str) -> list[dict]:
 		offers = []
 
 		# Get offers from promotional schemes
-		scheme_offers = _get_promotional_scheme_offers(profile.company, date)
+		scheme_offers = _get_promotional_scheme_offers(profile.company, date, warehouse=profile.warehouse)
 		offers.extend(scheme_offers)
 
 		# Get standalone pricing rule offers
-		standalone_offers = _get_standalone_pricing_rule_offers(profile.company, date)
+		standalone_offers = _get_standalone_pricing_rule_offers(
+			profile.company, date, warehouse=profile.warehouse
+		)
 		offers.extend(standalone_offers)
 
 		_attach_accumulative_config(offers)
@@ -738,30 +743,59 @@ def _attach_gift_pool_config(offers: list[Offer]) -> None:
 			offer.gift_pool_items = by_scheme[offer.promotional_scheme]
 
 
-def _get_promotional_scheme_offers(company: str, date: str) -> list[Offer]:
+def _active_rule_conditions(pr, company: str, date: str, warehouse: str | None):
+	"""WHERE conditions shared by the offer queries: live, selling rules of the company that are
+	valid today and that apply to a sale made from ``warehouse``."""
+	return (
+		(pr.disable == 0)
+		& (pr.selling == 1)
+		& (pr.company == company)
+		& (pr.valid_from.isnull() | (pr.valid_from <= date))
+		& (pr.valid_upto.isnull() | (pr.valid_upto >= date))
+		& _warehouse_condition(pr, warehouse)
+	)
+
+
+def _warehouse_condition(pr, warehouse: str | None):
+	"""Keep a Pricing Rule only if it can apply to a sale from ``warehouse``.
+
+	Same rule ERPNext's pricing engine uses when the rule is applied: a rule without a warehouse
+	applies everywhere; a rule with one applies to that warehouse and to every warehouse below it
+	(a rule on a group covers its children), so the rule's warehouse must be the profile's
+	warehouse or one of its parent groups. Transaction-level rules are exempt: ERPNext hides the
+	warehouse field on them and never evaluates it, so a stored value is not a restriction.
+	"""
+	unrestricted = (IfNull(pr.warehouse, "") == "") | (pr.apply_on == "Transaction")
+	allowed = [warehouse, *get_ancestors_of("Warehouse", warehouse)] if warehouse else []
+	return unrestricted | pr.warehouse.isin(allowed) if allowed else unrestricted
+
+
+def _get_promotional_scheme_offers(company: str, date: str, warehouse: str | None = None) -> list[Offer]:
 	"""Fetch offers from promotional schemes"""
 
 	# Fetch pricing rules linked to promotional schemes
-	pricing_rules = frappe.db.sql(
-		"""
-		SELECT
-			name, title, apply_on, selling, promotional_scheme,
-			promotional_scheme_id, coupon_code_based, one_time_per_customer,
-			price_or_product_discount, priority, valid_from, valid_upto,
-			promotion_type
-		FROM `tabPricing Rule`
-		WHERE
-			disable = 0
-			AND selling = 1
-			AND promotional_scheme IS NOT NULL
-			AND company = %(company)s
-			AND (valid_from IS NULL OR valid_from <= %(date)s)
-			AND (valid_upto IS NULL OR valid_upto >= %(date)s)
-		ORDER BY priority DESC, name
-	""",
-		{"company": company, "date": date},
-		as_dict=1,
-	)
+	pr = frappe.qb.DocType("Pricing Rule")
+	pricing_rules = (
+		frappe.qb.from_(pr)
+		.select(
+			pr.name,
+			pr.title,
+			pr.apply_on,
+			pr.selling,
+			pr.promotional_scheme,
+			pr.promotional_scheme_id,
+			pr.coupon_code_based,
+			pr.one_time_per_customer,
+			pr.price_or_product_discount,
+			pr.priority,
+			pr.valid_from,
+			pr.valid_upto,
+			pr.promotion_type,
+		)
+		.where(pr.promotional_scheme.isnotnull() & _active_rule_conditions(pr, company, date, warehouse))
+		.orderby(pr.priority, order=Order.desc)
+		.orderby(pr.name)
+	).run(as_dict=True)
 
 	if not pricing_rules:
 		return []
@@ -797,33 +831,46 @@ def _get_promotional_scheme_offers(company: str, date: str) -> list[Offer]:
 	return offers
 
 
-def _get_standalone_pricing_rule_offers(company: str, date: str) -> list[Offer]:
+def _get_standalone_pricing_rule_offers(
+	company: str, date: str, warehouse: str | None = None
+) -> list[Offer]:
 	"""Fetch offers from standalone pricing rules"""
 
 	# Fetch standalone pricing rules (not linked to schemes)
-	pricing_rules = frappe.db.sql(
-		"""
-		SELECT
-			name, title, apply_on, selling,
-			coupon_code_based, one_time_per_customer, price_or_product_discount,
-			rate_or_discount, rate, discount_amount, discount_percentage,
-			apply_discount_on_price, min_or_max_discount_qty_limit,
-			min_qty, max_qty, min_amt, max_amt,
-			priority, valid_from, valid_upto, promotion_type
-		FROM `tabPricing Rule`
-		WHERE
-			disable = 0
-			AND selling = 1
-			AND promotional_scheme IS NULL
-			AND company = %(company)s
-			AND (valid_from IS NULL OR valid_from <= %(date)s)
-			AND (valid_upto IS NULL OR valid_upto >= %(date)s)
-			AND price_or_product_discount = %(discount_type)s
-		ORDER BY priority DESC, name
-	""",
-		{"company": company, "date": date, "discount_type": DiscountType.PRICE},
-		as_dict=1,
-	)
+	pr = frappe.qb.DocType("Pricing Rule")
+	pricing_rules = (
+		frappe.qb.from_(pr)
+		.select(
+			pr.name,
+			pr.title,
+			pr.apply_on,
+			pr.selling,
+			pr.coupon_code_based,
+			pr.one_time_per_customer,
+			pr.price_or_product_discount,
+			pr.rate_or_discount,
+			pr.rate,
+			pr.discount_amount,
+			pr.discount_percentage,
+			pr.apply_discount_on_price,
+			pr.min_or_max_discount_qty_limit,
+			pr.min_qty,
+			pr.max_qty,
+			pr.min_amt,
+			pr.max_amt,
+			pr.priority,
+			pr.valid_from,
+			pr.valid_upto,
+			pr.promotion_type,
+		)
+		.where(
+			pr.promotional_scheme.isnull()
+			& (pr.price_or_product_discount == DiscountType.PRICE)
+			& _active_rule_conditions(pr, company, date, warehouse)
+		)
+		.orderby(pr.priority, order=Order.desc)
+		.orderby(pr.name)
+	).run(as_dict=True)
 
 	if not pricing_rules:
 		return []
@@ -844,14 +891,52 @@ def _get_standalone_pricing_rule_offers(company: str, date: str) -> list[Offer]:
 	return offers
 
 
+def _first_rule_for_item(
+	child_table: str, match, apply_on: str | None, company: str | None, qty: float, date: str, warehouse
+):
+	"""First live selling rule whose ``child_table`` row satisfies ``match`` and whose qty range holds
+	``qty``. ``warehouse`` is applied only when given, so callers that never sent one behave as before."""
+	pr = frappe.qb.DocType("Pricing Rule")
+	child = frappe.qb.DocType(child_table)
+	conditions = (
+		match(child)
+		& (pr.disable == 0)
+		& (pr.selling == 1)
+		& (IfNull(pr.coupon_code_based, 0) == 0)
+		& (pr.valid_from.isnull() | (pr.valid_from <= date))
+		& (pr.valid_upto.isnull() | (pr.valid_upto >= date))
+		& ((IfNull(pr.min_qty, 0) == 0) | (pr.min_qty <= qty))
+		& ((IfNull(pr.max_qty, 0) == 0) | (pr.max_qty >= qty))
+	)
+	if apply_on:
+		conditions &= pr.apply_on == apply_on
+	if company:
+		conditions &= (IfNull(pr.company, "") == "") | (pr.company == company)
+	if warehouse:
+		conditions &= _warehouse_condition(pr, warehouse)
+	rows = (
+		frappe.qb.from_(pr)
+		.inner_join(child)
+		.on((child.parent == pr.name) & (child.parenttype == "Pricing Rule"))
+		.select(pr.name, pr.promotional_scheme, pr.min_qty, pr.max_qty)
+		.where(conditions)
+		.limit(1)
+	).run(as_dict=True)
+	return rows[0] if rows else None
+
+
 @frappe.whitelist()
 def item_has_active_promotion(
-	item_code: str, company: str | None = None, qty: float | None = None
+	item_code: str, company: str | None = None, qty: float | None = None, warehouse: str | None = None
 ) -> dict:
 	"""Check if an item currently qualifies for an active selling promotion.
 
 	Locks manual discounts only when ``qty`` falls within a matching rule's
 	min_qty / max_qty (e.g. Buy 2–5 Get 1). Qty outside that range does not lock.
+
+	``warehouse`` is the warehouse the line is sold from: a rule restricted to another warehouse
+	does not count, the same as in ``get_offers`` and when the offer is applied. Without it every
+	warehouse's rules count (the behaviour before this argument existed).
 	"""
 	if not item_code:
 		return {"has_promotion": False}
@@ -862,113 +947,33 @@ def item_has_active_promotion(
 		return {"has_promotion": False}
 
 	date = nowdate()
-	values: dict = {"item_code": item_code, "date": date}
-	company_filter = ""
-	if company:
-		company_filter = "AND (pr.company IS NULL OR pr.company = '' OR pr.company = %(company)s)"
-		values["company"] = company
-
-	qty_filter = """
-		AND (IFNULL(pr.min_qty, 0) = 0 OR pr.min_qty <= %(qty)s)
-		AND (IFNULL(pr.max_qty, 0) = 0 OR pr.max_qty >= %(qty)s)
-	"""
-	values["qty"] = qty
-
-	# Direct item-code pricing rules (includes rules generated from Promotional Schemes)
-	row = frappe.db.sql(
-		f"""
-		SELECT pr.name, pr.promotional_scheme, pr.min_qty, pr.max_qty
-		FROM `tabPricing Rule` pr
-		INNER JOIN `tabPricing Rule Item Code` pri
-			ON pri.parent = pr.name AND pri.parenttype = 'Pricing Rule'
-		WHERE pri.item_code = %(item_code)s
-			AND pr.disable = 0
-			AND pr.selling = 1
-			AND IFNULL(pr.coupon_code_based, 0) = 0
-			AND (pr.valid_from IS NULL OR pr.valid_from <= %(date)s)
-			AND (pr.valid_upto IS NULL OR pr.valid_upto >= %(date)s)
-			{company_filter}
-			{qty_filter}
-		LIMIT 1
-		""",
-		values,
-		as_dict=1,
-	)
-	if row:
-		return {
-			"has_promotion": True,
-			"pricing_rule": row[0].name,
-			"promotional_scheme": row[0].promotional_scheme,
-			"min_qty": row[0].min_qty,
-			"max_qty": row[0].max_qty,
-		}
-
 	item = frappe.db.get_value("Item", item_code, ["item_group", "brand"], as_dict=1)
-	if not item:
-		return {"has_promotion": False}
 
-	# Item Group rules
-	if item.item_group:
-		values["item_group"] = item.item_group
-		row = frappe.db.sql(
-			f"""
-			SELECT pr.name, pr.promotional_scheme, pr.min_qty, pr.max_qty
-			FROM `tabPricing Rule` pr
-			INNER JOIN `tabPricing Rule Item Group` prg
-				ON prg.parent = pr.name AND prg.parenttype = 'Pricing Rule'
-			WHERE (prg.item_group = %(item_group)s OR prg.item_group = 'All Item Groups')
-				AND pr.disable = 0
-				AND pr.selling = 1
-				AND pr.apply_on = 'Item Group'
-				AND IFNULL(pr.coupon_code_based, 0) = 0
-				AND (pr.valid_from IS NULL OR pr.valid_from <= %(date)s)
-				AND (pr.valid_upto IS NULL OR pr.valid_upto >= %(date)s)
-				{company_filter}
-				{qty_filter}
-			LIMIT 1
-			""",
-			values,
-			as_dict=1,
+	# Direct item-code rules (includes rules generated from Promotional Schemes), then Item Group
+	# rules, then Brand rules. The item-code lookup does not need the Item to exist.
+	lookups = [
+		("Pricing Rule Item Code", lambda c: c.item_code == item_code, None),
+	]
+	if item and item.item_group:
+		lookups.append(
+			(
+				"Pricing Rule Item Group",
+				lambda c: (c.item_group == item.item_group) | (c.item_group == "All Item Groups"),
+				"Item Group",
+			)
 		)
-		if row:
+	if item and item.brand:
+		lookups.append(("Pricing Rule Brand", lambda c: c.brand == item.brand, "Brand"))
+
+	for child_table, match, apply_on in lookups:
+		rule = _first_rule_for_item(child_table, match, apply_on, company, qty, date, warehouse)
+		if rule:
 			return {
 				"has_promotion": True,
-				"pricing_rule": row[0].name,
-				"promotional_scheme": row[0].promotional_scheme,
-				"min_qty": row[0].min_qty,
-				"max_qty": row[0].max_qty,
-			}
-
-	# Brand rules
-	if item.brand:
-		values["brand"] = item.brand
-		row = frappe.db.sql(
-			f"""
-			SELECT pr.name, pr.promotional_scheme, pr.min_qty, pr.max_qty
-			FROM `tabPricing Rule` pr
-			INNER JOIN `tabPricing Rule Brand` prb
-				ON prb.parent = pr.name AND prb.parenttype = 'Pricing Rule'
-			WHERE prb.brand = %(brand)s
-				AND pr.disable = 0
-				AND pr.selling = 1
-				AND pr.apply_on = 'Brand'
-				AND IFNULL(pr.coupon_code_based, 0) = 0
-				AND (pr.valid_from IS NULL OR pr.valid_from <= %(date)s)
-				AND (pr.valid_upto IS NULL OR pr.valid_upto >= %(date)s)
-				{company_filter}
-				{qty_filter}
-			LIMIT 1
-			""",
-			values,
-			as_dict=1,
-		)
-		if row:
-			return {
-				"has_promotion": True,
-				"pricing_rule": row[0].name,
-				"promotional_scheme": row[0].promotional_scheme,
-				"min_qty": row[0].min_qty,
-				"max_qty": row[0].max_qty,
+				"pricing_rule": rule.name,
+				"promotional_scheme": rule.promotional_scheme,
+				"min_qty": rule.min_qty,
+				"max_qty": rule.max_qty,
 			}
 
 	return {"has_promotion": False}
